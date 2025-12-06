@@ -2,38 +2,42 @@
 //!
 //! [Eth Beacon Node API]: https://ethereum.github.io/beacon-APIs/
 
-use std::{collections::HashSet, sync::Arc};
+use core::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, ensure, Error as AnyhowError, Result};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, KeepAlive},
-        IntoResponse as _, Response, Sse,
+        sse::{Event as ServerSentEvent, KeepAlive},
+        IntoResponse, Response, Sse,
     },
     Json,
 };
+use binary_utils::TracingHandle;
 use block_producer::{BlockBuildOptions, BlockProducer, ProposerData, ValidatorBlindedBlock};
-use bls::{
-    traits::{CachedPublicKey as _, SignatureBytes as _},
-    PublicKeyBytes, SignatureBytes,
-};
+use bls::{traits::SignatureBytes as _, PublicKeyBytes, SignatureBytes};
 use builder_api::unphased::containers::SignedValidatorRegistrationV1;
 use enum_iterator::Sequence as _;
 use eth1_api::{ApiController, Eth1Api};
-use eth2_libp2p::PeerId;
-use fork_choice_control::{ForkChoiceContext, ForkTip, Wait};
+use eth2_libp2p::{GossipId, PeerId};
+use fork_choice_control::{Event, EventChannels, ForkChoiceContext, ForkTip, Topic, Wait};
+use fork_choice_store::{AttestationItem, AttestationOrigin};
 use futures::{
-    channel::mpsc::UnboundedSender,
-    stream::{FuturesOrdered, FuturesUnordered, Stream, StreamExt as _},
+    channel::{mpsc::UnboundedSender, oneshot::Receiver as OneshotReceiver},
+    stream::{FuturesOrdered, Stream, StreamExt as _},
 };
 use genesis::AnchorCheckpointProvider;
 use helper_functions::{accessors, misc};
-use http_api_utils::{BlockId, EventChannels, StateId, Topic};
+use http_api_utils::{BlockId, StateId};
 use itertools::{izip, Either, Itertools as _};
+use kzg_utils::eip_4844::compute_blob_kzg_proof;
 use liveness_tracker::ApiToLiveness;
-use log::{debug, info, warn};
+use logging::{debug_with_peers, info_with_peers, warn_with_peers};
 use operation_pools::{
     convert_to_electra_attestation, AttestationAggPool, BlsToExecutionChangePool, Origin,
     PoolAdditionOutcome, SyncCommitteeAggPool,
@@ -46,16 +50,22 @@ use prometheus_metrics::Metrics;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::{As, DisplayFromStr};
-use ssz::{ContiguousList, DynamicList, Ssz, SszHash as _};
+use ssz::{ByteVector, ContiguousList, ContiguousVector, DynamicList, Hc, Ssz, SszHash as _};
 use std_ext::ArcExt as _;
 use tap::Pipe as _;
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio::time::timeout;
+use tokio_stream::wrappers::BroadcastStream;
+use tracing::instrument;
 use try_from_iterator::TryFromIterator as _;
 use typenum::Unsigned as _;
 use types::{
     altair::{
-        containers::{SignedContributionAndProof, SyncCommitteeContribution, SyncCommitteeMessage},
-        primitives::SubcommitteeIndex,
+        consts::SyncCommitteeSubnetCount,
+        containers::{
+            SignedContributionAndProof, SyncCommittee, SyncCommitteeContribution,
+            SyncCommitteeMessage,
+        },
+        primitives::{SubcommitteeIndex, SyncCommitteePeriod},
     },
     capella::containers::{SignedBlsToExecutionChange, Withdrawal},
     combined::{
@@ -65,14 +75,18 @@ use types::{
     config::Config as ChainConfig,
     deneb::{
         containers::{BlobIdentifier, BlobSidecar},
-        primitives::BlobIndex,
+        primitives::{Blob, BlobIndex, KzgCommitment, VersionedHash},
+    },
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar, MatrixEntry},
+        primitives::ColumnIndex,
     },
     nonstandard::{
-        BlockRewards, Phase, RelativeEpoch, ValidationOutcome, WithBlobsAndMev, WithStatus,
-        WEI_IN_GWEI,
+        BlockRewards, KzgProofs, Phase, RelativeEpoch, ValidationOutcome, WithBlobsAndMev,
+        WithStatus, WEI_IN_GWEI,
     },
     phase0::{
-        consts::GENESIS_SLOT,
+        consts::{TargetAggregatorsPerCommittee, GENESIS_SLOT},
         containers::{
             AttestationData, AttesterSlashing as Phase0AttesterSlashing, Checkpoint, Fork,
             ProposerSlashing, SignedBeaconBlockHeader, SignedVoluntaryExit, Validator,
@@ -83,16 +97,22 @@ use types::{
         },
     },
     preset::{Preset, SyncSubcommitteeSize},
-    traits::{BeaconBlock as _, BeaconState as _, SignedBeaconBlock as _},
+    traits::{
+        BeaconBlock as _, BeaconState as _, BlockBodyWithBlobKzgCommitments, SignedBeaconBlock as _,
+    },
 };
 use validator::{ApiToValidator, ValidatorConfig};
 
 use crate::{
     block_id,
     error::{Error, IndexedError},
-    extractors::{EthJson, EthJsonOrSsz, EthPath, EthQuery},
+    extractors::{EthJson, EthJsonOrSsz, EthJsonOrSszWithOptionalPhase, EthPath, EthQuery},
     full_config::FullConfig,
-    misc::{APIBlock, BroadcastValidation, SignedAPIBlock, SyncedStatus},
+    misc::{
+        APIBlock, BroadcastValidation, SignedAPIBlock, SignedAPIBlockPhaseDeserializer,
+        SignedAggregateAndProofListFromPhaseDeserializer, SignedBlindedBeaconPhaseDeserializer,
+        SingleApiAttestation, SingleApiAttestationListPhaseDeserializer, SyncedStatus,
+    },
     response::{EthResponse, JsonOrSsz},
     state_id,
     validator_status::{
@@ -105,6 +125,18 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct BlobSidecarsQuery {
     indices: Option<Vec<BlobIndex>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobsQuery {
+    versioned_hashes: Option<Vec<VersionedHash>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataColumnSidecarsQuery {
+    indices: Option<Vec<ColumnIndex>>,
 }
 
 #[derive(Deserialize)]
@@ -213,6 +245,18 @@ pub struct ExpectedWithdrawalsQuery {
 #[serde(deny_unknown_fields)]
 pub struct PublishBlockQuery {
     broadcast_validation: Option<BroadcastValidation>,
+}
+
+#[derive(Deserialize)]
+pub struct LogLevelRequest {
+    target: String,
+    level: String,
+}
+
+#[derive(Deserialize)]
+pub struct TraceLevelRequest {
+    target: Option<String>,
+    level: String,
 }
 
 #[expect(clippy::struct_field_names)]
@@ -461,7 +505,9 @@ pub async fn expected_withdrawals<P: Preset, W: Wait>(
     let state = (state.slot() > GENESIS_SLOT)
         .then(|| {
             let block_root = accessors::latest_block_root(&state);
-            controller.preprocessed_state_post_block(block_root, proposal_slot)
+            tokio::task::block_in_place(|| {
+                controller.preprocessed_state_post_block_blocking(block_root, proposal_slot)
+            })
         })
         .transpose()?
         .unwrap_or(state);
@@ -591,7 +637,7 @@ pub async fn state_validator_identities<P: Preset, W: Wait>(
         .filter_map(|(index, validator)| {
             if !ids.is_empty() {
                 let validator_index = ValidatorId::ValidatorIndex(index);
-                let validator_pubkey = ValidatorId::PublicKey(*validator.pubkey.as_bytes());
+                let validator_pubkey = ValidatorId::PublicKey(validator.pubkey);
 
                 let allowed_by_id =
                     ids.contains(&validator_index) || ids.contains(&validator_pubkey);
@@ -603,7 +649,7 @@ pub async fn state_validator_identities<P: Preset, W: Wait>(
 
             Some(StateValidatorIdentityResponse {
                 index,
-                pubkey: validator.pubkey.to_bytes(),
+                pubkey: validator.pubkey,
                 activation_epoch: validator.activation_epoch,
             })
         });
@@ -655,17 +701,46 @@ pub async fn state_validator<P: Preset, W: Wait>(
 }
 
 /// `GET /eth/v1/beacon/states/{state_id}/validator_balances`
-pub async fn state_validator_balances<P: Preset, W: Wait>(
+pub async fn get_state_validator_balances<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
     State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
     EthPath(state_id): EthPath<StateId>,
     EthQuery(query): EthQuery<ValidatorIdQuery>,
 ) -> Result<EthResponse<Vec<StateValidatorBalanceResponse>>, Error> {
+    state_validator_balances(
+        &controller,
+        &anchor_checkpoint_provider,
+        state_id,
+        &query.id,
+    )
+}
+
+/// `POST /eth/v1/beacon/states/{state_id}/validator_balances`
+pub async fn post_state_validator_balances<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
+    EthPath(state_id): EthPath<StateId>,
+    EthJson(validator_ids): EthJson<Vec<ValidatorId>>,
+) -> Result<EthResponse<Vec<StateValidatorBalanceResponse>>, Error> {
+    state_validator_balances(
+        &controller,
+        &anchor_checkpoint_provider,
+        state_id,
+        &validator_ids,
+    )
+}
+
+fn state_validator_balances<P: Preset, W: Wait>(
+    controller: &ApiController<P, W>,
+    anchor_checkpoint_provider: &AnchorCheckpointProvider<P>,
+    state_id: StateId,
+    validator_ids: &[ValidatorId],
+) -> Result<EthResponse<Vec<StateValidatorBalanceResponse>>, Error> {
     let WithStatus {
         value: state,
         status,
         finalized,
-    } = state_id::state(&state_id, &controller, &anchor_checkpoint_provider)?;
+    } = state_id::state(&state_id, controller, anchor_checkpoint_provider)?;
 
     let balances = izip!(
         0..,
@@ -673,10 +748,10 @@ pub async fn state_validator_balances<P: Preset, W: Wait>(
         state.balances().into_iter().copied(),
     )
     .filter(|(index, validator, _)| {
-        query.id.is_empty()
-            || query.id.iter().any(|validator_id| match validator_id {
+        validator_ids.is_empty()
+            || validator_ids.iter().any(|validator_id| match validator_id {
                 ValidatorId::ValidatorIndex(validator_index) => index == validator_index,
-                ValidatorId::PublicKey(pubkey) => validator.pubkey.as_bytes() == pubkey,
+                ValidatorId::PublicKey(pubkey) => &validator.pubkey == pubkey,
             })
     })
     .map(|(index, _, balance)| StateValidatorBalanceResponse { index, balance })
@@ -722,10 +797,14 @@ pub async fn state_committees<P: Preset, W: Wait>(
     {
         let start_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
 
-        state = controller
-            .state_at_slot(start_slot)?
-            .ok_or(Error::StateNotFound)?
-            .value;
+        state = tokio::task::spawn_blocking(move || {
+            controller
+                .state_at_slot_blocking(start_slot)?
+                .ok_or(Error::StateNotFound)?
+                .value
+                .pipe(Ok::<_, AnyhowError>)
+        })
+        .await??;
     }
 
     let relative_epoch = accessors::relative_epoch(&state, epoch)?;
@@ -791,7 +870,7 @@ pub async fn state_sync_committees<P: Preset, W: Wait>(
     let validator_indices = committee
         .pubkeys
         .iter()
-        .filter_map(|pubkey| accessors::index_of_public_key(state, pubkey.to_bytes()))
+        .filter_map(|pubkey| accessors::index_of_public_key(state, pubkey))
         .collect_vec();
 
     let validators = validator_indices.clone();
@@ -809,6 +888,54 @@ pub async fn state_sync_committees<P: Preset, W: Wait>(
         .execution_optimistic(status.is_optimistic())
         .finalized(finalized)
         .into_response())
+}
+
+/// `GET /eth/v1/beacon/states/{state_id}/proposer_lookahead`
+pub async fn state_proposer_lookahead<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
+    EthPath(state_id): EthPath<StateId>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let WithStatus {
+        value: state,
+        status,
+        finalized,
+    } = state_id::state(&state_id, &controller, &anchor_checkpoint_provider)?;
+
+    let version = state.phase();
+    let proposer_lookahead = state.proposer_lookahead().ok_or(Error::StatePreFulu)?;
+
+    Ok(EthResponse::json_or_ssz(proposer_lookahead, &headers)?
+        .execution_optimistic(status.is_optimistic())
+        .finalized(finalized)
+        .version(version)
+        .into_response())
+}
+
+/// `GET /eth/v1/beacon/states/{state_id}/pending_consolidations`
+pub async fn state_pending_consolidations<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
+    EthPath(state_id): EthPath<StateId>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let WithStatus {
+        value: state,
+        status,
+        finalized,
+    } = state_id::state(&state_id, &controller, &anchor_checkpoint_provider)?;
+
+    let version = state.phase();
+    let state = state.post_electra().ok_or(Error::StatePreElectra)?;
+
+    Ok(
+        EthResponse::json_or_ssz(state.pending_consolidations(), &headers)?
+            .execution_optimistic(status.is_optimistic())
+            .finalized(finalized)
+            .version(version)
+            .into_response(),
+    )
 }
 
 /// `GET /eth/v1/beacon/states/{state_id}/pending_deposits`
@@ -883,7 +1010,7 @@ pub async fn state_randao<P: Preset, W: Wait>(
 
     if difference > P::EpochsPerHistoricalVector::U64 {
         return Err(Error::EpochOutOfRangeForStateRandao);
-    };
+    }
 
     let randao = accessors::get_randao_mix(&state, epoch);
     let response = StateRandaoResponse { randao };
@@ -1079,9 +1206,35 @@ pub async fn block_attestations_v2<P: Preset, W: Wait>(
         .pipe(Ok)
 }
 
+/// `GET /eth/v1/beacon/blinded_blocks/{block_id}`
+pub async fn blinded_block<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
+    EthPath(block_id): EthPath<BlockId>,
+    headers: HeaderMap,
+) -> Result<EthResponse<SignedBlindedBeaconBlock<P>, (), JsonOrSsz>, Error> {
+    let WithStatus {
+        value: block,
+        status,
+        finalized,
+    } = block_id::block(block_id, &controller, &anchor_checkpoint_provider)?;
+
+    let signed_blinded_block: SignedBlindedBeaconBlock<P> = Arc::unwrap_or_clone(block)
+        .try_into()
+        .map_err(AnyhowError::new)?;
+
+    let version = signed_blinded_block.phase();
+
+    Ok(EthResponse::json_or_ssz(signed_blinded_block, &headers)?
+        .execution_optimistic(status.is_optimistic())
+        .finalized(finalized)
+        .version(version))
+}
+
 /// `GET /eth/v1/beacon/blob_sidecars/{block_id}`
 pub async fn blob_sidecars<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(metrics): State<Option<Arc<Metrics>>>,
     State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
     EthPath(block_id): EthPath<BlockId>,
     EthQuery(query): EthQuery<BlobSidecarsQuery>,
@@ -1095,7 +1248,8 @@ pub async fn blob_sidecars<P: Preset, W: Wait>(
 
     let version = block.phase();
     let block_root = block.message().hash_tree_root();
-    let max_blobs_per_block = version.max_blobs_per_block(controller.chain_config());
+    let epoch = misc::compute_epoch_at_slot::<P>(block.message().slot());
+    let max_blobs_per_block = controller.chain_config().max_blobs_per_block(epoch);
 
     let blob_identifiers = query
         .indices
@@ -1107,9 +1261,47 @@ pub async fn blob_sidecars<P: Preset, W: Wait>(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let blob_sidecars = controller.blob_sidecars_by_ids(blob_identifiers)?;
-    let blob_sidecars = DynamicList::try_from_iter_with_maximum(
-        blob_sidecars.into_iter(),
+    let blob_sidecars = if version.is_peerdas_activated() {
+        let Some(kzg_commitments) = block
+            .message()
+            .body()
+            .with_blob_kzg_commitments()
+            .map(BlockBodyWithBlobKzgCommitments::blob_kzg_commitments)
+        else {
+            return Ok(EthResponse::json_or_ssz(DynamicList::empty(), &headers)?
+                .execution_optimistic(status.is_optimistic())
+                .finalized(finalized));
+        };
+
+        let blobs = construct_blobs_from_data_column_sidecars(
+            controller.clone_arc(),
+            block.clone_arc(),
+            block_root,
+            metrics.as_ref(),
+        )
+        .await?;
+
+        let (blobs, kzg_commitments): (Vec<Blob<P>>, Vec<KzgCommitment>) =
+            izip!(0.., blobs, kzg_commitments)
+                .filter_map(|(index, blob, kzg_commitment)| {
+                    blob_identifiers
+                        .contains(&BlobIdentifier { block_root, index })
+                        .then_some((blob, kzg_commitment))
+                })
+                .unzip();
+
+        construct_blob_sidecars_from_blobs_and_commitments(
+            controller.clone_arc(),
+            &block,
+            blobs,
+            kzg_commitments,
+        )?
+    } else {
+        controller.blob_sidecars_by_ids(blob_identifiers)?
+    };
+
+    let blob_sidecars = DynamicList::from_vec(
+        blob_sidecars,
         usize::try_from(max_blobs_per_block).map_err(AnyhowError::new)?,
     )
     .map_err(AnyhowError::new)?;
@@ -1120,32 +1312,190 @@ pub async fn blob_sidecars<P: Preset, W: Wait>(
         .version(version))
 }
 
+/// `GET /eth/v1/beacon/blobs/{block_id}`
+pub async fn blobs<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(metrics): State<Option<Arc<Metrics>>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
+    EthPath(block_id): EthPath<BlockId>,
+    EthQuery(query): EthQuery<BlobsQuery>,
+    headers: HeaderMap,
+) -> Result<EthResponse<DynamicList<Blob<P>>, (), JsonOrSsz>, Error> {
+    let WithStatus {
+        value: block,
+        status,
+        finalized,
+    } = block_id::block(block_id, &controller, &anchor_checkpoint_provider)?;
+
+    let version = block.phase();
+    let block_root = block.message().hash_tree_root();
+    let epoch = misc::compute_epoch_at_slot::<P>(block.message().slot());
+    let max_blobs_per_block = controller.chain_config().max_blobs_per_block(epoch);
+
+    let requested_indices = if let Some(versioned_hashes) = query.versioned_hashes {
+        let Some(kzg_commitments) = block
+            .message()
+            .body()
+            .with_blob_kzg_commitments()
+            .map(BlockBodyWithBlobKzgCommitments::blob_kzg_commitments)
+        else {
+            return Ok(EthResponse::json_or_ssz(DynamicList::empty(), &headers)?
+                .execution_optimistic(status.is_optimistic())
+                .finalized(finalized));
+        };
+
+        let block_versioned_hashes = kzg_commitments
+            .iter()
+            .copied()
+            .map(misc::kzg_commitment_to_versioned_hash)
+            .collect::<Vec<_>>();
+
+        let mut indices = BTreeSet::new();
+
+        for versioned_hash in versioned_hashes {
+            let index = block_versioned_hashes
+                .iter()
+                .position(|block_versioned_hash| *block_versioned_hash == versioned_hash)
+                .ok_or(Error::VersionedHashNotInBlock { versioned_hash })?;
+
+            indices.insert(u64::try_from(index).expect("position should fit in u64"));
+        }
+
+        Some(indices)
+    } else {
+        None
+    };
+
+    let blobs = if version.is_peerdas_activated() {
+        let blobs = construct_blobs_from_data_column_sidecars(
+            controller.clone_arc(),
+            block,
+            block_root,
+            metrics.as_ref(),
+        )
+        .await?;
+
+        if let Some(indices) = requested_indices {
+            blobs
+                .into_iter()
+                .zip(0..)
+                .filter_map(|(blob, index)| indices.contains(&index).then_some(blob))
+                .collect::<Vec<_>>()
+        } else {
+            blobs
+        }
+    } else {
+        let blob_identifiers = requested_indices
+            .unwrap_or_else(|| (0..max_blobs_per_block).collect())
+            .into_iter()
+            .map(|index| BlobIdentifier { block_root, index })
+            .collect::<Vec<_>>();
+
+        controller
+            .blob_sidecars_by_ids(blob_identifiers)?
+            .into_iter()
+            .map(|blob_sidecar| blob_sidecar.blob.clone())
+            .collect()
+    };
+
+    let blobs = DynamicList::from_vec(
+        blobs,
+        usize::try_from(max_blobs_per_block).map_err(AnyhowError::new)?,
+    )
+    .map_err(AnyhowError::new)?;
+
+    Ok(EthResponse::json_or_ssz(blobs, &headers)?
+        .execution_optimistic(status.is_optimistic())
+        .finalized(finalized))
+}
+
 /// `POST /eth/v1/beacon/blocks`
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api"
+    ),
+    name = "http_api",
+    skip_all,
+)]
 pub async fn publish_block<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(metrics): State<Option<Arc<Metrics>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
-    EthJsonOrSsz(signed_api_block): EthJsonOrSsz<Box<SignedAPIBlock<P>>>,
+    EthJsonOrSszWithOptionalPhase(signed_api_block, _): EthJsonOrSszWithOptionalPhase<
+        Box<SignedAPIBlock<P>>,
+        SignedAPIBlockPhaseDeserializer<P>,
+    >,
 ) -> Result<StatusCode, Error> {
     let (signed_beacon_block, proofs, blobs) = signed_api_block.split();
+    let slot = signed_beacon_block.to_header().message.slot;
 
-    let blob_sidecars =
-        misc::construct_blob_sidecars(&signed_beacon_block, blobs.into_iter(), proofs.into_iter())?;
+    if controller
+        .chain_config()
+        .phase_at_slot::<P>(slot)
+        .is_peerdas_activated()
+    {
+        let signed_beacon_block = Arc::new(signed_beacon_block);
 
-    publish_signed_block(
-        Arc::new(signed_beacon_block),
-        blob_sidecars,
-        controller,
-        api_to_p2p_tx,
-    )
-    .await
+        let data_column_sidecars = construct_data_column_sidecars_from_blobs(
+            controller.clone_arc(),
+            signed_beacon_block.clone_arc(),
+            blobs,
+            proofs,
+            metrics,
+        )
+        .await?;
+
+        // this is a temporary measure until `/eth/v1/beacon/blocks` is removed as it is no longer
+        // possible to deserialize `SignedApiBlock` without phase header correctly as the contents
+        // are identical between Electra and Fulu
+        let signed_beacon_block = Arc::unwrap_or_clone(signed_beacon_block).upgrade();
+
+        publish_signed_block_with_data_column_sidecar(
+            Arc::new(signed_beacon_block),
+            data_column_sidecars,
+            controller,
+            api_to_p2p_tx,
+        )
+        .await
+    } else {
+        let blob_sidecars = misc::construct_blob_sidecars(
+            &signed_beacon_block,
+            blobs.unwrap_or_default().into_iter(),
+            proofs.unwrap_or_else(KzgProofs::empty_deneb).into_iter(),
+        )?;
+
+        publish_signed_block(
+            Arc::new(signed_beacon_block),
+            blob_sidecars,
+            controller,
+            api_to_p2p_tx,
+        )
+        .await
+    }
 }
 
 /// `POST /eth/v1/beacon/blinded_blocks`
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api",
+        block_slot = %signed_blinded_block.message().slot()
+    ),
+    name = "http_api",
+    skip_all,
+)]
 pub async fn publish_blinded_block<P: Preset, W: Wait>(
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
     State(controller): State<ApiController<P, W>>,
+    State(metrics): State<Option<Arc<Metrics>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
-    EthJsonOrSsz(signed_blinded_block): EthJsonOrSsz<Box<SignedBlindedBeaconBlock<P>>>,
+    EthJsonOrSszWithOptionalPhase(signed_blinded_block, _): EthJsonOrSszWithOptionalPhase<
+        Box<SignedBlindedBeaconBlock<P>>,
+        SignedBlindedBeaconPhaseDeserializer<P>,
+    >,
 ) -> Result<StatusCode, Error> {
     let execution_payload = block_producer
         .publish_signed_blinded_block(&signed_blinded_block)
@@ -1156,29 +1506,55 @@ pub async fn publish_blinded_block<P: Preset, W: Wait>(
         proofs,
         blobs,
         ..
-    } = execution_payload.ok_or(Error::ExecutionPayloadNotAvailable)?;
+    } = execution_payload
+        .ok_or(Error::ExecutionPayloadNotAvailable)?
+        .result;
 
     let (message, signature) = signed_blinded_block.split();
-
     let signed_beacon_block = message
         .with_execution_payload(execution_payload)
         .map_err(AnyhowError::new)?
         .with_signature(signature)
         .pipe(Arc::new);
 
-    let blob_sidecars = misc::construct_blob_sidecars(
-        &signed_beacon_block,
-        blobs.unwrap_or_default().into_iter(),
-        proofs.unwrap_or_default().into_iter(),
-    )?;
+    let slot = signed_beacon_block.to_header().message.slot;
 
-    publish_signed_block(
-        signed_beacon_block,
-        blob_sidecars,
-        controller,
-        api_to_p2p_tx,
-    )
-    .await
+    if controller
+        .chain_config()
+        .phase_at_slot::<P>(slot)
+        .is_peerdas_activated()
+    {
+        let data_column_sidecars = construct_data_column_sidecars_from_blobs(
+            controller.clone_arc(),
+            signed_beacon_block.clone_arc(),
+            blobs,
+            proofs,
+            metrics,
+        )
+        .await?;
+
+        publish_signed_block_with_data_column_sidecar(
+            signed_beacon_block,
+            data_column_sidecars,
+            controller,
+            api_to_p2p_tx,
+        )
+        .await
+    } else {
+        let blob_sidecars = misc::construct_blob_sidecars(
+            &signed_beacon_block,
+            blobs.unwrap_or_default().into_iter(),
+            proofs.unwrap_or_else(KzgProofs::empty_deneb).into_iter(),
+        )?;
+
+        publish_signed_block(
+            signed_beacon_block,
+            blob_sidecars,
+            controller,
+            api_to_p2p_tx,
+        )
+        .await
+    }
 }
 
 /// `POST /eth/v2/beacon/blinded_blocks`
@@ -1187,7 +1563,10 @@ pub async fn publish_blinded_block_v2<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthQuery(query): EthQuery<PublishBlockQuery>,
-    EthJsonOrSsz(signed_blinded_block): EthJsonOrSsz<Box<SignedBlindedBeaconBlock<P>>>,
+    EthJsonOrSsz(signed_blinded_block, _): EthJsonOrSsz<
+        Box<SignedBlindedBeaconBlock<P>>,
+        SignedBlindedBeaconPhaseDeserializer<P>,
+    >,
 ) -> Result<StatusCode, Error> {
     let execution_payload = block_producer
         .publish_signed_blinded_block(&signed_blinded_block)
@@ -1198,7 +1577,9 @@ pub async fn publish_blinded_block_v2<P: Preset, W: Wait>(
         proofs,
         blobs,
         ..
-    } = execution_payload.ok_or(Error::ExecutionPayloadNotAvailable)?;
+    } = execution_payload
+        .ok_or(Error::ExecutionPayloadNotAvailable)?
+        .result;
 
     let (message, signature) = signed_blinded_block.split();
 
@@ -1211,7 +1592,7 @@ pub async fn publish_blinded_block_v2<P: Preset, W: Wait>(
     let blob_sidecars = misc::construct_blob_sidecars(
         &signed_beacon_block,
         blobs.unwrap_or_default().into_iter(),
-        proofs.unwrap_or_default().into_iter(),
+        proofs.unwrap_or_else(KzgProofs::empty_deneb).into_iter(),
     )?;
 
     publish_signed_block_v2(
@@ -1227,23 +1608,57 @@ pub async fn publish_blinded_block_v2<P: Preset, W: Wait>(
 /// `POST /eth/v2/beacon/blocks`
 pub async fn publish_block_v2<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(metrics): State<Option<Arc<Metrics>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthQuery(query): EthQuery<PublishBlockQuery>,
-    EthJsonOrSsz(signed_api_block): EthJsonOrSsz<Box<SignedAPIBlock<P>>>,
+    EthJsonOrSsz(signed_api_block, _): EthJsonOrSsz<
+        Box<SignedAPIBlock<P>>,
+        SignedAPIBlockPhaseDeserializer<P>,
+    >,
 ) -> Result<StatusCode, Error> {
     let (signed_beacon_block, proofs, blobs) = signed_api_block.split();
+    let slot = signed_beacon_block.to_header().message.slot;
 
-    let blob_sidecars =
-        misc::construct_blob_sidecars(&signed_beacon_block, blobs.into_iter(), proofs.into_iter())?;
+    if controller
+        .chain_config()
+        .phase_at_slot::<P>(slot)
+        .is_peerdas_activated()
+    {
+        let signed_beacon_block = Arc::new(signed_beacon_block);
 
-    publish_signed_block_v2(
-        Arc::new(signed_beacon_block),
-        blob_sidecars,
-        query.broadcast_validation.unwrap_or_default(),
-        controller,
-        api_to_p2p_tx,
-    )
-    .await
+        let data_column_sidecars = construct_data_column_sidecars_from_blobs(
+            controller.clone_arc(),
+            signed_beacon_block.clone_arc(),
+            blobs,
+            proofs,
+            metrics,
+        )
+        .await?;
+
+        publish_signed_block_v2_with_data_column_sidecar(
+            signed_beacon_block,
+            data_column_sidecars,
+            query.broadcast_validation.unwrap_or_default(),
+            controller,
+            api_to_p2p_tx,
+        )
+        .await
+    } else {
+        let blob_sidecars = misc::construct_blob_sidecars(
+            &signed_beacon_block,
+            blobs.unwrap_or_default().into_iter(),
+            proofs.unwrap_or_else(KzgProofs::empty_deneb).into_iter(),
+        )?;
+
+        publish_signed_block_v2(
+            Arc::new(signed_beacon_block),
+            blob_sidecars,
+            query.broadcast_validation.unwrap_or_default(),
+            controller,
+            api_to_p2p_tx,
+        )
+        .await
+    }
 }
 
 /// `GET /eth/v1/beacon/rewards/blocks/{block_id}`
@@ -1263,13 +1678,16 @@ pub async fn block_rewards<P: Preset, W: Wait>(
 
     let block_rewards = (block_slot > GENESIS_SLOT)
         .then(|| {
-            let parent_root = block.parent_root();
+            tokio::task::block_in_place(|| {
+                let parent_root = block.parent_root();
 
-            let state = controller.preprocessed_state_post_block(parent_root, block_slot)?;
+                let state =
+                    controller.preprocessed_state_post_block_blocking(parent_root, block_slot)?;
 
-            controller
-                .block_processor()
-                .process_trusted_block_with_report(state, &block)
+                controller
+                    .block_processor()
+                    .process_trusted_block_with_report(state, &block)
+            })
         })
         .transpose()?
         .and_then(|(_, rewards)| rewards)
@@ -1321,14 +1739,21 @@ pub async fn sync_committee_rewards<P: Preset, W: Wait>(
 
     let parent_root = block.message().parent_root();
 
-    let mut state = controller.preprocessed_state_post_block(parent_root, block_slot)?;
+    let (state, sync_committee_deltas) = tokio::task::spawn_blocking(move || {
+        let mut state =
+            controller.preprocessed_state_post_block_blocking(parent_root, block_slot)?;
 
-    let sync_committee_deltas = transition_functions::combined::state_transition_for_report(
-        &chain_config,
-        state.make_mut(),
-        &block,
-    )?
-    .sync_committee_deltas;
+        let sync_committee_deltas = transition_functions::combined::state_transition_for_report(
+            &chain_config,
+            controller.pubkey_cache(),
+            state.make_mut(),
+            &block,
+        )?
+        .sync_committee_deltas;
+
+        Ok::<_, AnyhowError>((state, sync_committee_deltas))
+    })
+    .await??;
 
     let response = if validator_ids.is_empty() {
         sync_committee_deltas.into_iter().pipe(Either::Left)
@@ -1394,7 +1819,7 @@ pub async fn pool_attestations_v2<P: Preset, W: Wait>(
 /// `POST /eth/v1/beacon/pool/proposer_slashings`
 pub async fn submit_pool_proposer_slashing<P: Preset, W: Wait>(
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
-    State(event_channels): State<Arc<EventChannels>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthJson(proposer_slashing): EthJson<Box<ProposerSlashing>>,
 ) -> Result<(), Error> {
@@ -1403,7 +1828,7 @@ pub async fn submit_pool_proposer_slashing<P: Preset, W: Wait>(
         .await?;
 
     if outcome.is_publishable() {
-        event_channels.send_proposer_slashing_event(&proposer_slashing);
+        event_channels.send_proposer_slashing_event(*proposer_slashing);
         ApiToP2p::PublishProposerSlashing(proposer_slashing).send(&api_to_p2p_tx);
     }
 
@@ -1426,7 +1851,7 @@ pub async fn pool_proposer_slashings<P: Preset, W: Wait>(
 /// `POST /eth/v1/beacon/pool/voluntary_exits`
 pub async fn submit_pool_voluntary_exit<P: Preset, W: Wait>(
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
-    State(event_channels): State<Arc<EventChannels>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthJson(signed_voluntary_exit): EthJson<Box<SignedVoluntaryExit>>,
 ) -> Result<(), Error> {
@@ -1435,7 +1860,7 @@ pub async fn submit_pool_voluntary_exit<P: Preset, W: Wait>(
         .await?;
 
     if outcome.is_publishable() {
-        event_channels.send_voluntary_exit_event(&signed_voluntary_exit);
+        event_channels.send_voluntary_exit_event(*signed_voluntary_exit);
         ApiToP2p::PublishVoluntaryExit(signed_voluntary_exit).send(&api_to_p2p_tx);
     }
 
@@ -1458,7 +1883,7 @@ pub async fn pool_voluntary_exits<P: Preset, W: Wait>(
 /// `POST /eth/v1/beacon/pool/attester_slashings`
 pub async fn submit_pool_attester_slashing<P: Preset, W: Wait>(
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
-    State(event_channels): State<Arc<EventChannels>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthJson(attester_slashing): EthJson<Box<Phase0AttesterSlashing<P>>>,
 ) -> Result<(), Error> {
@@ -1469,7 +1894,7 @@ pub async fn submit_pool_attester_slashing<P: Preset, W: Wait>(
         .await?;
 
     if outcome.is_publishable() {
-        event_channels.send_attester_slashing_event(&attester_slashing);
+        event_channels.send_attester_slashing_event(attester_slashing.clone());
         ApiToP2p::PublishAttesterSlashing(attester_slashing).send(&api_to_p2p_tx);
     }
 
@@ -1483,7 +1908,7 @@ pub async fn submit_pool_attester_slashing<P: Preset, W: Wait>(
 /// `POST /eth/v2/beacon/pool/attester_slashings`
 pub async fn submit_pool_attester_slashing_v2<P: Preset, W: Wait>(
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
-    State(event_channels): State<Arc<EventChannels>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthJson(attester_slashing): EthJson<Box<AttesterSlashing<P>>>,
 ) -> Result<(), Error> {
@@ -1492,7 +1917,7 @@ pub async fn submit_pool_attester_slashing_v2<P: Preset, W: Wait>(
         .await?;
 
     if outcome.is_publishable() {
-        event_channels.send_attester_slashing_event(&attester_slashing);
+        event_channels.send_attester_slashing_event(attester_slashing.clone());
         ApiToP2p::PublishAttesterSlashing(attester_slashing).send(&api_to_p2p_tx);
     }
 
@@ -1531,7 +1956,7 @@ pub async fn pool_attester_slashings_v2<P: Preset, W: Wait>(
                 .map(|slashing| AttesterSlashing::Phase0(slashing))
                 .collect()
         }
-        Phase::Electra => slashings
+        Phase::Electra | Phase::Fulu => slashings
             .into_iter()
             .filter_map(AttesterSlashing::post_electra)
             .map(|slashing| AttesterSlashing::Electra(slashing))
@@ -1542,21 +1967,49 @@ pub async fn pool_attester_slashings_v2<P: Preset, W: Wait>(
 }
 
 /// `POST /eth/v1/beacon/pool/attestations`
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api",
+    ),
+    name = "http_api",
+    skip_all
+)]
 pub async fn submit_pool_attestations<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthJson(attestations): EthJson<Vec<Arc<Attestation<P>>>>,
 ) -> Result<(), Error> {
-    submit_attestations_to_pool(controller, api_to_p2p_tx, attestations).await
+    submit_attestations_to_pool(
+        controller,
+        event_channels,
+        api_to_p2p_tx,
+        attestations.into_iter(),
+    )
+    .await
 }
 
 /// `POST /eth/v2/beacon/pool/attestations`
 pub async fn submit_pool_attestations_v2<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
-    EthJson(attestations): EthJson<Vec<Arc<Attestation<P>>>>,
+    EthJsonOrSsz(attestations, _): EthJsonOrSsz<
+        ContiguousList<SingleApiAttestation<P>, P::MaxAttestersPerSlot>,
+        SingleApiAttestationListPhaseDeserializer<P>,
+    >,
 ) -> Result<(), Error> {
-    submit_attestations_to_pool(controller, api_to_p2p_tx, attestations).await
+    submit_attestations_to_pool(
+        controller,
+        event_channels,
+        api_to_p2p_tx,
+        attestations
+            .into_iter()
+            .map(|attestation| Arc::new(attestation.into())),
+    )
+    .await
 }
 
 /// `POST /eth/v1/beacon/pool/sync_committees`
@@ -1566,7 +2019,7 @@ pub async fn submit_pool_sync_committees<P: Preset, W: Wait>(
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
     EthJson(json_vec): EthJson<Vec<Value>>,
 ) -> Result<(), Error> {
-    let state = controller.preprocessed_state_at_current_slot()?;
+    let state = controller.preprocessed_state_at_current_slot().await?;
 
     let Some(state) = state.post_altair() else {
         return Ok(());
@@ -1612,7 +2065,7 @@ pub async fn submit_pool_sync_committees<P: Preset, W: Wait>(
             }
             Ok(ValidationOutcome::Ignore(_)) => {}
             Err(error) => {
-                debug!(
+                debug_with_peers!(
                     "external sync committee message rejected \
                      (error: {error}, message: {message:?}, subnet_id: {subnet_id})",
                 );
@@ -1725,6 +2178,81 @@ pub async fn debug_fork_choice<P: Preset, W: Wait>(
     Json(controller.fork_choice_context())
 }
 
+/// `GET /eth/v1/debug/beacon/data_column_sidecars/{block_id}`
+pub async fn debug_beacon_data_column_sidecars<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
+    EthPath(block_id): EthPath<BlockId>,
+    EthQuery(query): EthQuery<DataColumnSidecarsQuery>,
+    headers: HeaderMap,
+) -> Result<EthResponse<DynamicList<Arc<DataColumnSidecar<P>>>, (), JsonOrSsz>, Error> {
+    let block_with_status =
+        match block_id::block(block_id, &controller, &anchor_checkpoint_provider) {
+            Ok(block) => block,
+            Err(error) => {
+                if matches!(error, Error::BlockNotFound) {
+                    if let BlockId::Root(block_root) = block_id {
+                        // For debug purposes return any data column sidecars by block root
+                        // even if block does not exist in fork choice
+                        let data_column_sidecars =
+                            controller.data_column_sidecars_by_root(block_root)?;
+
+                        if data_column_sidecars.is_empty() {
+                            return Err(Error::BlockNotFound);
+                        }
+
+                        let data_column_sidecars =
+                            DynamicList::from_vec(data_column_sidecars, P::NumberOfColumns::USIZE)
+                                .map_err(AnyhowError::new)?;
+
+                        return Ok(EthResponse::json_or_ssz(data_column_sidecars, &headers)?
+                            .execution_optimistic(true)
+                            .finalized(false));
+                    }
+                }
+
+                return Err(error);
+            }
+        };
+
+    let WithStatus {
+        value: block,
+        status,
+        finalized,
+    } = block_with_status;
+
+    let version = block.phase();
+    let block_root = block.message().hash_tree_root();
+
+    if !version.is_peerdas_activated() {
+        return Err(Error::BlockPreFulu);
+    }
+
+    let data_column_identifiers = query
+        .indices
+        .unwrap_or_else(|| (0..P::NumberOfColumns::U64).collect())
+        .into_iter()
+        .map(|index| {
+            ensure!(
+                index < P::NumberOfColumns::U64,
+                Error::InvalidColumnIndex(index)
+            );
+            Ok(DataColumnIdentifier { block_root, index })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let data_column_sidecars = controller.data_column_sidecars_by_ids(data_column_identifiers)?;
+
+    let data_column_sidecars =
+        DynamicList::from_vec(data_column_sidecars, P::NumberOfColumns::USIZE)
+            .map_err(AnyhowError::new)?;
+
+    Ok(EthResponse::json_or_ssz(data_column_sidecars, &headers)?
+        .execution_optimistic(status.is_optimistic())
+        .finalized(finalized)
+        .version(version))
+}
+
 /// `GET /eth/v2/debug/beacon/states/{state_id}`
 pub async fn beacon_state<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
@@ -1754,10 +2282,10 @@ pub async fn beacon_heads<P: Preset, W: Wait>(
 }
 
 /// `GET /eth/v1/events`
-pub async fn beacon_events(
-    State(event_channels): State<Arc<EventChannels>>,
+pub async fn beacon_events<P: Preset>(
+    State(event_channels): State<Arc<EventChannels<P>>>,
     EthQuery(events): EthQuery<EventsQuery>,
-) -> Result<Sse<impl Stream<Item = Result<Event, BroadcastStreamRecvError>>>, Error> {
+) -> Result<Sse<impl Stream<Item = Result<ServerSentEvent>>>, Error> {
     let EventsQuery { topics } = events;
 
     if topics.is_empty() {
@@ -1769,6 +2297,28 @@ pub async fn beacon_events(
         .map(|topic| event_channels.receiver_for(topic))
         .map(BroadcastStream::new)
         .pipe(futures::stream::select_all)
+        .map(|event| {
+            let event = event?;
+            let topic = event.topic();
+            let ssevent = ServerSentEvent::default().event(topic);
+
+            match event {
+                Event::Attestation(data) => ssevent.json_data(data),
+                Event::AttesterSlashing(data) => ssevent.json_data(data),
+                Event::BlobSidecar(data) => ssevent.json_data(data),
+                Event::Block(data) => ssevent.json_data(data),
+                Event::BlsToExecutionChange(data) => ssevent.json_data(data),
+                Event::ChainReorg(data) => ssevent.json_data(data),
+                Event::ContributionAndProof(data) => ssevent.json_data(data),
+                Event::DataColumnSidecar(data) => ssevent.json_data(data),
+                Event::FinalizedCheckpoint(data) => ssevent.json_data(data),
+                Event::Head(data) => ssevent.json_data(data),
+                Event::PayloadAttributes(data) => ssevent.json_data(data),
+                Event::ProposerSlashing(data) => ssevent.json_data(data),
+                Event::VoluntaryExit(data) => ssevent.json_data(data),
+            }
+            .map_err(Into::into)
+        })
         .pipe(Sse::new)
         .keep_alive(KeepAlive::default())
         .pipe(Ok)
@@ -1852,9 +2402,11 @@ pub async fn node_syncing_status<P: Preset, W: Wait>(
 
     EthResponse::json(NodeSyncingResponse {
         head_slot,
-        sync_distance: is_synced
-            .then_some(0)
-            .unwrap_or_else(|| controller.slot() - head_slot),
+        sync_distance: if is_synced {
+            0
+        } else {
+            controller.slot() - head_slot
+        },
         is_syncing: !(is_synced && is_back_synced),
         is_optimistic: snapshot.is_optimistic(),
         el_offline,
@@ -1879,6 +2431,7 @@ pub async fn node_health<P: Preset, W: Wait>(
 /// `POST /eth/v1/validator/duties/attester/{epoch}`
 pub async fn validator_attester_duties<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
     EthPath(epoch): EthPath<Epoch>,
     EthJson(validator_indices): EthJson<Vec<ValidatorIndex>>,
 ) -> Result<EthResponse<Vec<ValidatorAttesterDutyResponse>>, Error> {
@@ -1886,10 +2439,16 @@ pub async fn validator_attester_duties<P: Preset, W: Wait>(
 
     let (state, relative_epoch) = match accessors::relative_epoch(&head_state.value, epoch) {
         Ok(relative_epoch) => (head_state, relative_epoch),
-        Err(_) => (
-            controller.preprocessed_state_at_epoch(epoch)?,
-            RelativeEpoch::Current,
-        ),
+        Err(_) => {
+            let start_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
+            let state_with_status = state_id::state(
+                &StateId::Slot(start_slot),
+                &controller,
+                &anchor_checkpoint_provider,
+            )?;
+
+            (state_with_status, RelativeEpoch::Current)
+        }
     };
 
     let WithStatus {
@@ -1922,7 +2481,7 @@ pub async fn validator_attester_duties<P: Preset, W: Wait>(
                         .enumerate()
                         .filter(|(_, validator_index)| indices.contains(validator_index))
                         .map(move |(validator_committee_index, validator_index)| {
-                            let pubkey = accessors::public_key(state, validator_index)?.to_bytes();
+                            let pubkey = *accessors::public_key(state, validator_index)?;
 
                             Ok(ValidatorAttesterDutyResponse {
                                 committee_index,
@@ -1948,22 +2507,45 @@ pub async fn validator_attester_duties<P: Preset, W: Wait>(
 
 /// `GET /eth/v1/validator/duties/proposer/{epoch}`
 pub async fn validator_proposer_duties<P: Preset, W: Wait>(
+    State(chain_config): State<Arc<ChainConfig>>,
     State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
     EthPath(epoch): EthPath<Epoch>,
 ) -> Result<EthResponse<Vec<ValidatorProposerDutyResponse>>, Error> {
-    let WithStatus {
-        value: state,
-        status,
-        // `duties` responses are not supposed to contain a `finalized` field.
-        finalized: _,
-    } = controller.preprocessed_state_at_epoch(epoch)?;
+    let start_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
+    let head = controller.head();
+
+    let (state, status) = if start_slot >= head.value.slot() {
+        let block_root = controller.head().value.block_root;
+        // `state_id::state` allows only a limited range of empty slots to be processed
+        let state = controller
+            .preprocessed_state_for_block_production(block_root, start_slot)
+            .await?;
+
+        (state, head.status)
+    } else {
+        let WithStatus {
+            value: state,
+            status,
+            // `duties` responses are not supposed to contain a `finalized` field.
+            finalized: _,
+        } = state_id::state(
+            &StateId::Slot(start_slot),
+            &controller,
+            &anchor_checkpoint_provider,
+        )?;
+
+        (state, status)
+    };
 
     let dependent_root = controller.dependent_root(&state, epoch)?;
 
     let response = misc::slots_in_epoch::<P>(epoch)
         .map(|slot| {
-            let validator_index = accessors::get_beacon_proposer_index_at_slot(&state, slot)?;
-            let pubkey = accessors::public_key(&state, validator_index)?.to_bytes();
+            let validator_index =
+                accessors::get_beacon_proposer_index_at_slot(&chain_config, &state, slot)?;
+
+            let pubkey = *accessors::public_key(&state, validator_index)?;
 
             Ok(ValidatorProposerDutyResponse {
                 pubkey,
@@ -1987,44 +2569,49 @@ pub async fn validator_proposer_duties<P: Preset, W: Wait>(
 //                      [Altair Honest Validator specification]: https://github.com/ethereum/consensus-specs/blob/0b76c8367ed19014d104e3fbd4718e73f459a748/specs/altair/validator.md#sync-committee-subnet-stability
 /// `POST /eth/v1/validator/duties/sync/{epoch}`
 pub async fn validator_sync_committee_duties<P: Preset, W: Wait>(
+    State(chain_config): State<Arc<ChainConfig>>,
     State(controller): State<ApiController<P, W>>,
     State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
     EthPath(epoch): EthPath<Epoch>,
     EthJson(validator_indices): EthJson<Vec<ValidatorIndex>>,
 ) -> Result<EthResponse<Vec<ValidatorSyncDutyResponse>>, Error> {
-    let start_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
-
-    let WithStatus {
-        value: state,
-        status,
-        // `duties` responses are not supposed to contain a `finalized` field.
-        finalized: _,
-    } = state_id::state(
-        &StateId::Slot(start_slot),
-        &controller,
-        &anchor_checkpoint_provider,
-    )?;
-
-    let Some(state) = state.post_altair() else {
-        return Ok(EthResponse::json(vec![]).execution_optimistic(status.is_optimistic()));
-    };
+    if chain_config.phase_at_epoch(epoch) < Phase::Altair {
+        return Ok(EthResponse::json(vec![]).execution_optimistic(false));
+    }
 
     let requested_period = misc::sync_committee_period::<P>(epoch);
-    let state_epoch = misc::compute_epoch_at_slot::<P>(state.slot());
-    let state_period = misc::sync_committee_period::<P>(state_epoch);
+    let head_state = controller.head_state();
 
-    let committee = if requested_period == state_period {
-        state.current_sync_committee()
-    } else if requested_period == state_period + 1 {
-        state.next_sync_committee()
+    let (
+        WithStatus {
+            value: state,
+            status,
+            // `duties` responses are not supposed to contain a `finalized` field.
+            finalized: _,
+        },
+        committee,
+    ) = if let Some(committee) = state_sync_committee(&head_state.value, requested_period) {
+        (head_state, committee)
     } else {
-        return Err(Error::EpochNotInSyncCommitteePeriod);
+        let start_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
+
+        let state = state_id::state(
+            &StateId::Slot(start_slot),
+            &controller,
+            &anchor_checkpoint_provider,
+        )?;
+
+        if let Some(committee) = state_sync_committee(&state.value, requested_period) {
+            (state, committee)
+        } else {
+            return Err(Error::EpochNotInSyncCommitteePeriod);
+        }
     };
 
     let duties = validator_indices
         .into_iter()
         .map(|validator_index| {
-            let validator_pubkey = accessors::public_key(state, validator_index)?;
+            let validator_pubkey = accessors::public_key(&state, validator_index)?;
 
             let validator_sync_committee_indices = committee
                 .pubkeys
@@ -2038,7 +2625,7 @@ pub async fn validator_sync_committee_duties<P: Preset, W: Wait>(
             }
 
             Ok(Some(ValidatorSyncDutyResponse {
-                pubkey: validator_pubkey.to_bytes(),
+                pubkey: *validator_pubkey,
                 validator_index,
                 validator_sync_committee_indices,
             }))
@@ -2047,6 +2634,23 @@ pub async fn validator_sync_committee_duties<P: Preset, W: Wait>(
         .collect::<Result<_>>()?;
 
     Ok(EthResponse::json(duties).execution_optimistic(status.is_optimistic()))
+}
+
+fn state_sync_committee<P: Preset>(
+    beacon_state: &BeaconState<P>,
+    requested_period: SyncCommitteePeriod,
+) -> Option<Arc<Hc<SyncCommittee<P>>>> {
+    let state = beacon_state.post_altair()?;
+    let state_epoch = misc::compute_epoch_at_slot::<P>(state.slot());
+    let state_period = misc::sync_committee_period::<P>(state_epoch);
+
+    if requested_period == state_period {
+        return Some(state.current_sync_committee().clone_arc());
+    } else if requested_period == state_period + 1 {
+        return Some(state.next_sync_committee().clone_arc());
+    }
+
+    None
 }
 
 /// `GET /eth/v1/validator/aggregate_attestation`
@@ -2093,7 +2697,8 @@ pub async fn validator_aggregate_attestation_v2<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
     State(attestation_agg_pool): State<Arc<AttestationAggPool<P, W>>>,
     EthQuery(query): EthQuery<AggregateAttestationV2Query>,
-) -> Result<EthResponse<Attestation<P>>, Error> {
+    headers: HeaderMap,
+) -> Result<EthResponse<Attestation<P>, (), JsonOrSsz>, Error> {
     let AggregateAttestationV2Query {
         attestation_data_root,
         committee_index,
@@ -2127,13 +2732,25 @@ pub async fn validator_aggregate_attestation_v2<P: Preset, W: Wait>(
         convert_to_electra_attestation(attestation).map(Attestation::Electra)?
     };
 
-    Ok(EthResponse::json(attestation).version(phase))
+    Ok(EthResponse::json_or_ssz(attestation, &headers)?.version(phase))
 }
 
 /// `GET /eth/v1/validator/blinded_blocks/{slot}`
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api",
+        slot = %slot
+    ),
+    name = "http_api",
+    skip_all,
+)]
 pub async fn validator_blinded_block<P: Preset, W: Wait>(
+    State(chain_config): State<Arc<ChainConfig>>,
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
     State(controller): State<ApiController<P, W>>,
+    State(validator_config): State<Arc<ValidatorConfig>>,
     EthPath(slot): EthPath<Slot>,
     EthQuery(query): EthQuery<ValidatorBlockQuery>,
 ) -> Result<EthResponse<ValidatorBlindedBlock<P>>, Error> {
@@ -2148,15 +2765,19 @@ pub async fn validator_blinded_block<P: Preset, W: Wait>(
     }
 
     let block_root = controller.head().value.block_root;
-    let beacon_state = controller.preprocessed_state_post_block(block_root, slot)?;
+    let beacon_state = controller
+        .preprocessed_state_for_block_production(block_root, slot)
+        .await?;
 
-    let Ok(proposer_index) = accessors::get_beacon_proposer_index(&beacon_state) else {
+    let Ok(proposer_index) = accessors::get_beacon_proposer_index(&chain_config, &beacon_state)
+    else {
         // accessors::get_beacon_proposer_index can only fail if head state has no active validators.
-        warn!("failed to produce blinded beacon block: head state has no active validators");
+        warn_with_peers!(
+            "failed to produce blinded beacon block: head state has no active validators"
+        );
         return Err(Error::UnableToProduceBlindedBlock);
     };
 
-    let graffiti = graffiti.unwrap_or_default();
     let public_key = accessors::public_key(&beacon_state, proposer_index)?;
 
     let block_build_context = block_producer.new_build_context(
@@ -2165,13 +2786,14 @@ pub async fn validator_blinded_block<P: Preset, W: Wait>(
         proposer_index,
         BlockBuildOptions {
             graffiti,
+            disable_blockprint_graffiti: validator_config.disable_blockprint_graffiti,
             skip_randao_verification,
             ..BlockBuildOptions::default()
         },
     );
 
     let execution_payload_header_handle =
-        block_build_context.get_execution_payload_header(public_key.to_bytes());
+        block_build_context.get_execution_payload_header(*public_key);
 
     let local_execution_payload_handle = block_build_context.get_local_execution_payload();
 
@@ -2193,9 +2815,22 @@ pub async fn validator_blinded_block<P: Preset, W: Wait>(
 }
 
 /// `GET /eth/v2/validator/blocks/{slot}`
+#[expect(clippy::type_complexity)]
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api",
+        slot = %slot
+    ),
+    name = "http_api",
+    skip_all,
+)]
 pub async fn validator_block<P: Preset, W: Wait>(
+    State(chain_config): State<Arc<ChainConfig>>,
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
     State(controller): State<ApiController<P, W>>,
+    State(validator_config): State<Arc<ValidatorConfig>>,
     EthPath(slot): EthPath<Slot>,
     EthQuery(query): EthQuery<ValidatorBlockQuery>,
     headers: HeaderMap,
@@ -2211,9 +2846,10 @@ pub async fn validator_block<P: Preset, W: Wait>(
     }
 
     let block_root = controller.head().value.block_root;
-    let beacon_state = controller.preprocessed_state_post_block(block_root, slot)?;
-    let proposer_index = accessors::get_beacon_proposer_index(&beacon_state)?;
-    let graffiti = graffiti.unwrap_or_default();
+    let beacon_state = controller
+        .preprocessed_state_for_block_production(block_root, slot)
+        .await?;
+    let proposer_index = accessors::get_beacon_proposer_index(&chain_config, &beacon_state)?;
 
     let block_build_context = block_producer.new_build_context(
         beacon_state.clone_arc(),
@@ -2221,6 +2857,7 @@ pub async fn validator_block<P: Preset, W: Wait>(
         proposer_index,
         BlockBuildOptions {
             graffiti,
+            disable_blockprint_graffiti: validator_config.disable_blockprint_graffiti,
             skip_randao_verification,
             ..BlockBuildOptions::default()
         },
@@ -2240,8 +2877,10 @@ pub async fn validator_block<P: Preset, W: Wait>(
 
 /// `GET /eth/v3/validator/blocks/{slot}`
 pub async fn validator_block_v3<P: Preset, W: Wait>(
+    State(chain_config): State<Arc<ChainConfig>>,
     State(block_producer): State<Arc<BlockProducer<P, W>>>,
     State(controller): State<ApiController<P, W>>,
+    State(validator_config): State<Arc<ValidatorConfig>>,
     EthPath(slot): EthPath<Slot>,
     EthQuery(query): EthQuery<ValidatorBlockQueryV3>,
     headers: HeaderMap,
@@ -2258,16 +2897,24 @@ pub async fn validator_block_v3<P: Preset, W: Wait>(
     }
 
     let block_root = controller.head().value.block_root;
-    let beacon_state = controller.preprocessed_state_post_block(block_root, slot)?;
+    let beacon_state = controller
+        .preprocessed_state_for_block_production(block_root, slot)
+        .await?;
 
-    let Ok(proposer_index) = accessors::get_beacon_proposer_index(&beacon_state) else {
+    let Ok(proposer_index) = accessors::get_beacon_proposer_index(&chain_config, &beacon_state)
+    else {
         // accessors::get_beacon_proposer_index can only fail if head state has no active validators.
-        warn!("failed to produce blinded beacon block: head state has no active validators");
+        warn_with_peers!(
+            "failed to produce blinded beacon block: head state has no active validators"
+        );
         return Err(Error::UnableToProduceBeaconBlock);
     };
 
-    let graffiti = graffiti.unwrap_or_default();
     let public_key = accessors::public_key(&beacon_state, proposer_index)?;
+
+    let builder_boost_factor = builder_boost_factor
+        .map(Uint256::from_u64)
+        .unwrap_or(validator_config.default_builder_boost_factor);
 
     let block_build_context = block_producer.new_build_context(
         beacon_state.clone_arc(),
@@ -2275,13 +2922,14 @@ pub async fn validator_block_v3<P: Preset, W: Wait>(
         proposer_index,
         BlockBuildOptions {
             graffiti,
+            disable_blockprint_graffiti: validator_config.disable_blockprint_graffiti,
             skip_randao_verification,
             builder_boost_factor,
         },
     );
 
     let execution_payload_header_handle =
-        block_build_context.get_execution_payload_header(public_key.to_bytes());
+        block_build_context.get_execution_payload_header(*public_key);
 
     let local_execution_payload_handle = block_build_context.get_local_execution_payload();
 
@@ -2298,25 +2946,14 @@ pub async fn validator_block_v3<P: Preset, W: Wait>(
     let version = validator_block.value.phase();
     let blinded = validator_block.value.is_blinded();
 
-    // 'Uplift' validator block to signed beacon block for consensus reward calculation
-    let signed_beacon_block = match validator_block.value.clone() {
-        ValidatorBlindedBlock::BeaconBlock(beacon_block) => beacon_block.with_zero_signature(),
-        ValidatorBlindedBlock::BlindedBeaconBlock {
-            blinded_block,
-            execution_payload,
-        } => blinded_block
-            .with_execution_payload(*execution_payload)
-            .map_err(AnyhowError::new)?
-            .with_zero_signature(),
-    };
-
     let consensus_block_value = block_rewards
         .map(|rewards| Uint256::from_u64(rewards.total) * WEI_IN_GWEI)
         .or_else(|| {
-            warn!(
-                "unable to calculate block rewards for validator block {:?} at slot {slot}",
-                signed_beacon_block.message().hash_tree_root(),
+            warn_with_peers!(
+                "unable to calculate block rewards for validator block (blinded: {blinded}) \
+                at slot {slot}",
             );
+
             None
         });
 
@@ -2328,18 +2965,41 @@ pub async fn validator_block_v3<P: Preset, W: Wait>(
 }
 
 /// `GET /eth/v1/validator/attestation_data`
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api",
+        slot = %query.slot,
+        committee_index = %query.committee_index
+    ),
+    name = "http_api",
+    skip_all,
+)]
 pub async fn validator_attestation_data<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(event_channels): State<Arc<EventChannels<P>>>,
     State(metrics): State<Option<Arc<Metrics>>>,
     State(validator_config): State<Arc<ValidatorConfig>>,
     EthQuery(query): EthQuery<AttestationDataQuery>,
-) -> Result<EthResponse<AttestationData>, Error> {
+    headers: HeaderMap,
+) -> Result<EthResponse<AttestationData, (), JsonOrSsz>, Error> {
+    const BLOCK_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
     let _timer = metrics.map(|metrics| metrics.validator_api_attestation_data_times.start_timer());
 
     let AttestationDataQuery {
         committee_index,
         slot,
     } = query;
+
+    let phase_at_slot = controller.chain_config().phase_at_slot::<P>(slot);
+
+    let committee_index = if phase_at_slot < Phase::Electra {
+        committee_index
+    } else {
+        0
+    };
 
     let WithStatus {
         value: head,
@@ -2368,9 +3028,8 @@ pub async fn validator_attestation_data<P: Preset, W: Wait>(
 
     let block_root;
     let mut state;
-    let is_optimistic;
 
-    if slot < head_slot {
+    let is_optimistic = if slot < head_slot {
         // Search for the latest canonical block before or at slot.
         let block = controller
             .block_by_slot(slot)?
@@ -2380,24 +3039,44 @@ pub async fn validator_attestation_data<P: Preset, W: Wait>(
         state = controller
             .state_before_or_at_slot(block_root, slot)
             .ok_or(Error::StateNotFound)?;
-        is_optimistic = block.status.is_optimistic();
+        block.status.is_optimistic()
     } else {
         block_root = head.block_root;
         state = controller.state_by_chain_link(&head);
-        is_optimistic = status.is_optimistic();
+        status.is_optimistic()
     };
 
     if is_optimistic {
-        return Err(Error::HeadIsOptimistic);
+        if let Err(error) = timeout(BLOCK_EVENT_WAIT_TIMEOUT, async {
+            loop {
+                let block_event = match event_channels.receiver_for(Topic::Block).recv().await {
+                    Ok(Event::Block(block_event)) => block_event,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        debug_with_peers!("error receiving block event: {error:?}");
+                        continue;
+                    }
+                };
+
+                if block_event.block == block_root && !block_event.execution_optimistic {
+                    break;
+                }
+            }
+        })
+        .await
+        {
+            debug_with_peers!("timeout while waiting for block event: {error:?}");
+            return Err(Error::HeadIsOptimistic);
+        }
     }
 
     if state.slot() < slot {
         state = tokio::task::spawn_blocking(move || {
-            controller.preprocessed_state_post_block(block_root, slot)
+            controller.preprocessed_state_post_block_blocking(block_root, slot)
         })
         .await?
         .map_err(Error::UnableToProduceAttestation)?;
-    };
+    }
 
     let target = Checkpoint {
         epoch: requested_epoch,
@@ -2412,16 +3091,17 @@ pub async fn validator_attestation_data<P: Preset, W: Wait>(
         target,
     };
 
-    Ok(EthResponse::json(attestation_data))
+    EthResponse::json_or_ssz(attestation_data, &headers)
 }
 
 /// `POST /eth/v1/validator/beacon_committee_subscriptions`
 pub async fn validator_subscribe_to_beacon_committee<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
+    State(anchor_checkpoint_provider): State<AnchorCheckpointProvider<P>>,
     State(subnet_service_tx): State<UnboundedSender<ToSubnetService>>,
     EthJson(subscriptions): EthJson<Vec<BeaconCommitteeSubscription>>,
 ) -> Result<(), Error> {
-    let state = controller.preprocessed_state_at_current_slot()?;
+    let current_state = controller.preprocessed_state_at_current_slot().await?;
     let (sender, receiver) = futures::channel::oneshot::channel();
 
     subscriptions.iter().try_for_each(|subscription| {
@@ -2432,7 +3112,21 @@ pub async fn validator_subscribe_to_beacon_committee<P: Preset, W: Wait>(
         } = *subscription;
 
         let epoch = misc::compute_epoch_at_slot::<P>(slot);
-        let relative_epoch = accessors::relative_epoch(&state, epoch)?;
+
+        let (state, relative_epoch) = match accessors::relative_epoch(&current_state, epoch) {
+            Ok(relative_epoch) => (current_state.clone_arc(), relative_epoch),
+            Err(_) => {
+                let start_slot = misc::compute_start_slot_at_epoch::<P>(epoch);
+                let state_with_status = state_id::state(
+                    &StateId::Slot(start_slot),
+                    &controller,
+                    &anchor_checkpoint_provider,
+                )?;
+
+                (state_with_status.value, RelativeEpoch::Current)
+            }
+        };
+
         let computed = accessors::get_committee_count_per_slot(&state, relative_epoch);
         let requested = committees_at_slot;
 
@@ -2488,6 +3182,13 @@ pub async fn validator_sync_committee_contribution<P: Preset, W: Wait>(
         subcommittee_index,
     } = query;
 
+    if subcommittee_index >= SyncCommitteeSubnetCount::U64 {
+        return Err(Error::SubcommitteeIndexNotInRange {
+            subcommittee_index,
+            range: 0..SyncCommitteeSubnetCount::U64,
+        });
+    }
+
     let data = sync_committee_agg_pool
         .best_subcommittee_contribution(slot, beacon_block_root, subcommittee_index)
         .await;
@@ -2496,6 +3197,24 @@ pub async fn validator_sync_committee_contribution<P: Preset, W: Wait>(
 }
 
 /// `POST /eth/v1/validator/aggregate_and_proofs`
+///
+/// This deviates from [the specification] by returning errors as [`IndexedError`].
+/// Lighthouse does the same thing.
+///
+/// [the specification]: https://ethereum.github.io/beacon-APIs/
+// We box aggregates to reduce the size of various enums.
+// It's probably faster to deserialize them directly into `Vec<Box<_>>`.
+pub async fn validator_publish_aggregate_and_proofs_v1<P: Preset, W: Wait>(
+    State(controller): State<ApiController<P, W>>,
+    State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
+    EthJsonOrSszWithOptionalPhase(aggregate_and_proofs, _): EthJsonOrSszWithOptionalPhase<
+        ContiguousList<Arc<SignedAggregateAndProof<P>>, TargetAggregatorsPerCommittee>,
+        SignedAggregateAndProofListFromPhaseDeserializer<P>,
+    >,
+) -> Result<(), Error> {
+    validator_publish_aggregate_and_proofs(&controller, &api_to_p2p_tx, aggregate_and_proofs).await
+}
+
 /// `POST /eth/v2/validator/aggregate_and_proofs`
 ///
 /// This deviates from [the specification] by returning errors as [`IndexedError`].
@@ -2504,10 +3223,24 @@ pub async fn validator_sync_committee_contribution<P: Preset, W: Wait>(
 /// [the specification]: https://ethereum.github.io/beacon-APIs/
 // We box aggregates to reduce the size of various enums.
 // It's probably faster to deserialize them directly into `Vec<Box<_>>`.
-pub async fn validator_publish_aggregate_and_proofs<P: Preset, W: Wait>(
+pub async fn validator_publish_aggregate_and_proofs_v2<P: Preset, W: Wait>(
     State(controller): State<ApiController<P, W>>,
     State(api_to_p2p_tx): State<UnboundedSender<ApiToP2p<P>>>,
-    EthJson(aggregate_and_proofs): EthJson<Vec<Arc<SignedAggregateAndProof<P>>>>,
+    EthJsonOrSsz(aggregate_and_proofs, _): EthJsonOrSsz<
+        ContiguousList<Arc<SignedAggregateAndProof<P>>, TargetAggregatorsPerCommittee>,
+        SignedAggregateAndProofListFromPhaseDeserializer<P>,
+    >,
+) -> Result<(), Error> {
+    validator_publish_aggregate_and_proofs(&controller, &api_to_p2p_tx, aggregate_and_proofs).await
+}
+
+async fn validator_publish_aggregate_and_proofs<P: Preset, W: Wait>(
+    controller: &ApiController<P, W>,
+    api_to_p2p_tx: &UnboundedSender<ApiToP2p<P>>,
+    aggregate_and_proofs: ContiguousList<
+        Arc<SignedAggregateAndProof<P>>,
+        TargetAggregatorsPerCommittee,
+    >,
 ) -> Result<(), Error> {
     let (successes, failures): (Vec<_>, Vec<_>) = aggregate_and_proofs
         .into_iter()
@@ -2539,7 +3272,7 @@ pub async fn validator_publish_aggregate_and_proofs<P: Preset, W: Wait>(
     // By this point votes from accepted aggregates have already been included in fork choice.
     for (aggregate_and_proof, validation_outcome) in successes {
         if validation_outcome == ValidationOutcome::Accept {
-            ApiToP2p::PublishAggregateAndProof(aggregate_and_proof).send(&api_to_p2p_tx);
+            ApiToP2p::PublishAggregateAndProof(aggregate_and_proof).send(api_to_p2p_tx);
         }
     }
 
@@ -2603,21 +3336,35 @@ pub async fn validator_register_validator<P: Preset>(
     State(api_to_validator_tx): State<UnboundedSender<ApiToValidator<P>>>,
     EthJson(registrations): EthJson<Vec<SignedValidatorRegistrationV1>>,
 ) -> Result<(), Error> {
-    let (sender, receiver) = futures::channel::oneshot::channel();
-    ApiToValidator::SignedValidatorRegistrations(sender, registrations).send(&api_to_validator_tx);
+    // Decompress signatures in blocking task to avoid blocking tokio executor
+    let (validator_registrations, errors): (Vec<_>, Vec<_>) =
+        tokio::task::spawn_blocking(move || {
+            registrations
+                .into_iter()
+                .enumerate()
+                .map(|(index, registration)| {
+                    let SignedValidatorRegistrationV1 { message, signature } = registration;
 
-    let failures = receiver.await?;
+                    match signature.try_into() {
+                        Ok(signature) => Ok((message, signature)),
+                        Err(error) => Err((index, AnyhowError::new(error))),
+                    }
+                })
+                .partition_result()
+        })
+        .await?;
 
-    if !failures.is_empty() {
-        return Err(Error::InvalidValidatorSignatures(
-            failures
+    if errors.is_empty() {
+        ApiToValidator::ValidatorRegistrations(validator_registrations).send(&api_to_validator_tx);
+        Ok(())
+    } else {
+        Err(Error::InvalidValidatorSignatures(
+            errors
                 .into_iter()
                 .map(|(index, error)| IndexedError { index, error })
                 .collect_vec(),
-        ));
+        ))
     }
-
-    Ok(())
 }
 
 /// `POST /eth/v1/validator/liveness/{epoch}`
@@ -2628,7 +3375,7 @@ pub async fn validator_liveness<P: Preset, W: Wait>(
     EthJson(validators): EthJson<Vec<ValidatorIndex>>,
 ) -> Result<EthResponse<Vec<ValidatorLivenessResponse>>, Error> {
     let api_to_liveness_tx = api_to_liveness_tx.ok_or(Error::LivenessTrackingNotEnabled)?;
-    let state = controller.preprocessed_state_at_current_slot()?;
+    let state = controller.preprocessed_state_at_current_slot().await?;
 
     accessors::attestation_epoch(&state, epoch).map_err(Error::InvalidEpoch)?;
 
@@ -2653,6 +3400,76 @@ pub async fn validator_beacon_committee_selections() -> Error {
 /// `POST /eth/v1/validator/sync_committee_selections`
 pub async fn validator_sync_committee_selections() -> Error {
     Error::EndpointNotImplemented
+}
+
+/// `POST /eth/v2/debug/tracing/log_level`
+pub async fn post_log_level(
+    State(handle): State<Option<TracingHandle>>,
+    Json(req): Json<LogLevelRequest>,
+) -> impl IntoResponse {
+    let directive_str = format!("{}={}", req.target, req.level);
+
+    match directive_str.parse() {
+        Ok(directive) => {
+            if let Some(handle) = handle {
+                if let Err(e) = handle.modify_log(|filter| {
+                    let old = core::mem::take(filter);
+                    *filter = old.add_directive(directive);
+                }) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to reload filter: {e}"),
+                    );
+                }
+                (StatusCode::OK, "log level updated".to_owned())
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tracing not available".to_owned(),
+                )
+            }
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("invalid directive: {e}")),
+    }
+}
+
+/// `POST /eth/v2/debug/tracing/trace_level`
+pub async fn post_trace_level(
+    State(handle): State<Option<TracingHandle>>,
+    Json(req): Json<TraceLevelRequest>,
+) -> impl IntoResponse {
+    let TraceLevelRequest { target, level } = req;
+
+    let directive_str = target
+        .map(|target| format!("{target}={level}"))
+        .unwrap_or(level);
+
+    match directive_str.parse() {
+        Ok(directive) => {
+            if let Some(handle) = handle {
+                match handle.modify_trace(|filter| {
+                    let old = core::mem::take(filter);
+                    *filter = old.add_directive(directive);
+                }) {
+                    Ok(Some(())) => (StatusCode::OK, "trace level updated".to_owned()),
+                    Ok(None) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "telemetry not available".to_owned(),
+                    ),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to reload filter: {e}"),
+                    ),
+                }
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tracing not available".to_owned(),
+                )
+            }
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("invalid directive: {e}")),
+    }
 }
 
 fn state_validators<P: Preset, W: Wait>(
@@ -2683,7 +3500,7 @@ fn state_validators<P: Preset, W: Wait>(
     .filter(|(index, validator, _)| {
         if !ids.is_empty() {
             let validator_index = ValidatorId::ValidatorIndex(*index);
-            let validator_pubkey = ValidatorId::PublicKey(*validator.pubkey.as_bytes());
+            let validator_pubkey = ValidatorId::PublicKey(validator.pubkey);
 
             let allowed_by_id = ids.contains(&validator_index) || ids.contains(&validator_pubkey);
 
@@ -2719,6 +3536,16 @@ fn state_validators<P: Preset, W: Wait>(
         .finalized(finalized))
 }
 
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api",
+        block_root = %block.message().hash_tree_root()
+    ),
+    name = "http_api",
+    skip_all,
+)]
 async fn publish_signed_block<P: Preset, W: Wait>(
     block: Arc<SignedBeaconBlock<P>>,
     blob_sidecars: Vec<BlobSidecar<P>>,
@@ -2726,8 +3553,7 @@ async fn publish_signed_block<P: Preset, W: Wait>(
     api_to_p2p_tx: UnboundedSender<ApiToP2p<P>>,
 ) -> Result<StatusCode, Error> {
     let blob_sidecars = blob_sidecars.into_iter().map(Arc::new).collect_vec();
-
-    submit_blob_sidecars(controller.clone_arc(), &blob_sidecars).await?;
+    let blob_sidecars = submit_blob_sidecars(controller.clone_arc(), blob_sidecars).await?;
 
     if let Some(status_code) = publish_beacon_block_with_gossip_checks(
         controller.clone_arc(),
@@ -2751,15 +3577,21 @@ async fn publish_signed_block<P: Preset, W: Wait>(
             // Vouch submits blocks it constructs to all beacon nodes it is connected to.
             // The blocks often reach our application through gossip faster than through the API.
             let block_root = block.message().hash_tree_root();
-            info!("block received through HTTP API was ignored (block root: {block_root:?})");
+            info_with_peers!(
+                "block received through HTTP API was ignored (block root: {block_root:?})"
+            );
             StatusCode::ACCEPTED
         }
         Ok(None) => {
-            warn!("received no block validation response for HTTP API (block: {block:?})");
+            warn_with_peers!(
+                "received no block validation response for HTTP API (block: {block:?})"
+            );
             StatusCode::ACCEPTED
         }
         Err(error) => {
-            warn!("received invalid block through HTTP API (block: {block:?}, error: {error})");
+            warn_with_peers!(
+                "received invalid block through HTTP API (block: {block:?}, error: {error})"
+            );
             StatusCode::ACCEPTED
         }
     };
@@ -2781,15 +3613,58 @@ async fn publish_beacon_block_with_gossip_checks<P: Preset, W: Wait>(
         Ok(Some(ValidationOutcome::Accept)) => {
             publish_block_to_network(block, blob_sidecars, api_to_p2p_tx);
         }
-        Ok(Some(ValidationOutcome::Ignore(true))) => {
-            publish_block_to_network(block, blob_sidecars, api_to_p2p_tx);
+        Ok(Some(ValidationOutcome::Ignore(publishable))) => {
+            if publishable {
+                publish_block_to_network(block, blob_sidecars, api_to_p2p_tx);
+            }
+
             return Ok(Some(StatusCode::ACCEPTED));
         }
-        Ok(Some(ValidationOutcome::Ignore(false))) => {
+        Ok(None) => {
+            warn_with_peers!(
+                "received no block validation response for gossip validation via HTTP API \
+                (block: {block:?})"
+            );
+
             return Err(Error::UnableToPublishBlock);
         }
+        Err(error) => return Err(Error::InvalidBlock(error)),
+    }
+
+    Ok(None)
+}
+
+async fn publish_beacon_block_with_gossip_checks_data_column_sidecars<P: Preset, W: Wait>(
+    controller: ApiController<P, W>,
+    block: Arc<SignedBeaconBlock<P>>,
+    data_column_sidecars: &[Arc<DataColumnSidecar<P>>],
+    api_to_p2p_tx: &UnboundedSender<ApiToP2p<P>>,
+) -> Result<Option<StatusCode>, Error> {
+    let (sender, mut receiver) = futures::channel::mpsc::channel(1);
+
+    controller.on_api_block_for_gossip(block.clone_arc(), sender);
+
+    match receiver.next().await.transpose() {
+        Ok(Some(ValidationOutcome::Accept)) => {
+            publish_block_to_network_with_data_column_sidecars(
+                block,
+                data_column_sidecars,
+                api_to_p2p_tx,
+            );
+        }
+        Ok(Some(ValidationOutcome::Ignore(publishable))) => {
+            if publishable {
+                publish_block_to_network_with_data_column_sidecars(
+                    block,
+                    data_column_sidecars,
+                    api_to_p2p_tx,
+                );
+            }
+
+            return Ok(Some(StatusCode::ACCEPTED));
+        }
         Ok(None) => {
-            warn!(
+            warn_with_peers!(
                 "received no block validation response for gossip validation via HTTP API \
                 (block: {block:?})"
             );
@@ -2814,6 +3689,75 @@ fn publish_block_to_network<P: Preset>(
     ApiToP2p::PublishBeaconBlock(block).send(api_to_p2p_tx);
 }
 
+fn publish_block_to_network_with_data_column_sidecars<P: Preset>(
+    block: Arc<SignedBeaconBlock<P>>,
+    data_column_sidecars: &[Arc<DataColumnSidecar<P>>],
+    api_to_p2p_tx: &UnboundedSender<ApiToP2p<P>>,
+) {
+    for data_column_sidecar in data_column_sidecars {
+        ApiToP2p::PublishDataColumnSidecar(data_column_sidecar.clone_arc()).send(api_to_p2p_tx);
+    }
+
+    ApiToP2p::PublishBeaconBlock(block).send(api_to_p2p_tx);
+}
+
+// TODO(feature/fulu): merge with `publish_signed_block`
+async fn publish_signed_block_with_data_column_sidecar<P: Preset, W: Wait>(
+    block: Arc<SignedBeaconBlock<P>>,
+    data_column_sidecars: Vec<Arc<DataColumnSidecar<P>>>,
+    controller: ApiController<P, W>,
+    api_to_p2p_tx: UnboundedSender<ApiToP2p<P>>,
+) -> Result<StatusCode, Error> {
+    let data_column_sidecars =
+        submit_data_column_sidecars(controller.clone_arc(), data_column_sidecars).await?;
+
+    if let Some(status_code) = publish_beacon_block_with_gossip_checks_data_column_sidecars(
+        controller.clone_arc(),
+        block.clone_arc(),
+        &data_column_sidecars,
+        &api_to_p2p_tx,
+    )
+    .await?
+    {
+        return Ok(status_code);
+    }
+
+    let (sender, mut receiver) = futures::channel::mpsc::channel(1);
+
+    controller.on_api_block(block.clone_arc(), sender);
+
+    let status_code = match receiver.next().await.transpose() {
+        Ok(Some(ValidationOutcome::Accept)) => StatusCode::OK,
+        Ok(Some(ValidationOutcome::Ignore(_))) => {
+            // We log only the root with `info!` because this is not an exceptional case.
+            // Vouch submits blocks it constructs to all beacon nodes it is connected to.
+            // The blocks often reach our application through gossip faster than through the API.
+            let block_root = block.message().hash_tree_root();
+
+            info_with_peers!(
+                "block received through HTTP API was ignored (block root: {block_root:?})"
+            );
+
+            StatusCode::ACCEPTED
+        }
+        Ok(None) => {
+            warn_with_peers!(
+                "received no block validation response for HTTP API (block: {block:?})"
+            );
+
+            StatusCode::ACCEPTED
+        }
+        Err(error) => {
+            warn_with_peers!(
+                "received invalid block through HTTP API (block: {block:?}, error: {error})"
+            );
+            StatusCode::ACCEPTED
+        }
+    };
+
+    Ok(status_code)
+}
+
 async fn publish_signed_block_v2<P: Preset, W: Wait>(
     block: Arc<SignedBeaconBlock<P>>,
     blob_sidecars: Vec<BlobSidecar<P>>,
@@ -2822,8 +3766,7 @@ async fn publish_signed_block_v2<P: Preset, W: Wait>(
     api_to_p2p_tx: UnboundedSender<ApiToP2p<P>>,
 ) -> Result<StatusCode, Error> {
     let blob_sidecars = blob_sidecars.into_iter().map(Arc::new).collect_vec();
-
-    submit_blob_sidecars(controller.clone_arc(), &blob_sidecars).await?;
+    let blob_sidecars = submit_blob_sidecars(controller.clone_arc(), blob_sidecars).await?;
 
     if broadcast_validation == BroadcastValidation::Gossip {
         if let Some(status_code) = publish_beacon_block_with_gossip_checks(
@@ -2852,8 +3795,10 @@ async fn publish_signed_block_v2<P: Preset, W: Wait>(
                         StatusCode::OK
                     }
                     BroadcastValidation::ConsensusAndEquivocation => {
-                        if controller.exibits_equivocation(&block) {
-                            return Err(Error::InvalidBlock(anyhow!("block exibits equivocation")));
+                        if controller.exhibits_equivocation(&block) {
+                            return Err(Error::InvalidBlock(anyhow!(
+                                "block exhibits equivocation"
+                            )));
                         }
 
                         publish_block_to_network(block, &blob_sidecars, &api_to_p2p_tx);
@@ -2866,23 +3811,22 @@ async fn publish_signed_block_v2<P: Preset, W: Wait>(
                     // The blocks often reach our application through gossip faster than through the API.
                     let block_root = block.message().hash_tree_root();
 
-                    info!(
+                    info_with_peers!(
                         "block received through HTTP API was ignored (block root: {block_root:?})"
                     );
 
-                    if broadcast_validation == BroadcastValidation::Gossip {
-                        StatusCode::ACCEPTED
-                    } else if publishable {
+                    if broadcast_validation != BroadcastValidation::Gossip && publishable {
                         publish_block_to_network(block, &blob_sidecars, &api_to_p2p_tx);
-                        StatusCode::ACCEPTED
-                    } else {
-                        return Err(Error::UnableToPublishBlock);
                     }
+
+                    StatusCode::ACCEPTED
                 }
             }
         }
         Ok(None) => {
-            warn!("received no block validation response for HTTP API (block: {block:?})");
+            warn_with_peers!(
+                "received no block validation response for HTTP API (block: {block:?})"
+            );
 
             if broadcast_validation == BroadcastValidation::Gossip {
                 StatusCode::ACCEPTED
@@ -2891,8 +3835,113 @@ async fn publish_signed_block_v2<P: Preset, W: Wait>(
             }
         }
         Err(error) => {
-            warn!("received invalid block through HTTP API (block: {block:?}, error: {error})");
+            warn_with_peers!(
+                "received invalid block through HTTP API (block: {block:?}, error: {error})"
+            );
 
+            if broadcast_validation == BroadcastValidation::Gossip {
+                StatusCode::ACCEPTED
+            } else {
+                return Err(Error::InvalidBlock(error));
+            }
+        }
+    };
+
+    Ok(status_code)
+}
+
+// TODO(feature/fulu): merge with `publish_signed_block_v2`
+async fn publish_signed_block_v2_with_data_column_sidecar<P: Preset, W: Wait>(
+    block: Arc<SignedBeaconBlock<P>>,
+    data_column_sidecars: Vec<Arc<DataColumnSidecar<P>>>,
+    broadcast_validation: BroadcastValidation,
+    controller: ApiController<P, W>,
+    api_to_p2p_tx: UnboundedSender<ApiToP2p<P>>,
+) -> Result<StatusCode, Error> {
+    let data_column_sidecars =
+        submit_data_column_sidecars(controller.clone_arc(), data_column_sidecars).await?;
+
+    if broadcast_validation == BroadcastValidation::Gossip {
+        if let Some(status_code) = publish_beacon_block_with_gossip_checks_data_column_sidecars(
+            controller.clone_arc(),
+            block.clone_arc(),
+            &data_column_sidecars,
+            &api_to_p2p_tx,
+        )
+        .await?
+        {
+            return Ok(status_code);
+        }
+    }
+
+    let (sender, mut receiver) = futures::channel::mpsc::channel(1);
+
+    controller.on_api_block(block.clone_arc(), sender);
+
+    let status_code = match receiver.next().await.transpose() {
+        Ok(Some(accept_or_ignore_status)) => {
+            match accept_or_ignore_status {
+                ValidationOutcome::Accept => match broadcast_validation {
+                    BroadcastValidation::Gossip => StatusCode::OK,
+                    BroadcastValidation::Consensus => {
+                        publish_block_to_network_with_data_column_sidecars(
+                            block,
+                            &data_column_sidecars,
+                            &api_to_p2p_tx,
+                        );
+                        StatusCode::OK
+                    }
+                    BroadcastValidation::ConsensusAndEquivocation => {
+                        if controller.exhibits_equivocation(&block) {
+                            return Err(Error::InvalidBlock(anyhow!(
+                                "block exhibits equivocation"
+                            )));
+                        }
+
+                        publish_block_to_network_with_data_column_sidecars(
+                            block,
+                            &data_column_sidecars,
+                            &api_to_p2p_tx,
+                        );
+                        StatusCode::OK
+                    }
+                },
+                ValidationOutcome::Ignore(publishable) => {
+                    // We log only the root with `info!` because this is not an exceptional case.
+                    // Vouch submits blocks it constructs to all beacon nodes it is connected to.
+                    // The blocks often reach our application through gossip faster than through the API.
+                    let block_root = block.message().hash_tree_root();
+
+                    info_with_peers!(
+                        "block received through HTTP API was ignored (block root: {block_root:?})"
+                    );
+
+                    if broadcast_validation != BroadcastValidation::Gossip && publishable {
+                        publish_block_to_network_with_data_column_sidecars(
+                            block,
+                            &data_column_sidecars,
+                            &api_to_p2p_tx,
+                        );
+                    }
+
+                    StatusCode::ACCEPTED
+                }
+            }
+        }
+        Ok(None) => {
+            warn_with_peers!(
+                "received no block validation response for HTTP API (block: {block:?})"
+            );
+            if broadcast_validation == BroadcastValidation::Gossip {
+                StatusCode::ACCEPTED
+            } else {
+                return Err(Error::UnableToPublishBlock);
+            }
+        }
+        Err(error) => {
+            warn_with_peers!(
+                "received invalid block through HTTP API (block: {block:?}, error: {error})"
+            );
             if broadcast_validation == BroadcastValidation::Gossip {
                 StatusCode::ACCEPTED
             } else {
@@ -2939,57 +3988,85 @@ async fn get_pool_attestations<P: Preset, W: Wait>(
         .collect()
 }
 
-async fn submit_attestation_to_pool<P: Preset, W: Wait>(
-    controller: ApiController<P, W>,
-    index: usize,
+async fn wait_for_validation<P: Preset>(
     attestation: Arc<Attestation<P>>,
-    target_state: Option<Arc<BeaconState<P>>>,
+    index: usize,
+    subnet_id: SubnetId,
+    receiver: OneshotReceiver<Result<ValidationOutcome>>,
 ) -> Result<(Arc<Attestation<P>>, SubnetId, ValidationOutcome), IndexedError> {
     let run = async {
-        let AttestationData {
-            slot,
-            beacon_block_root,
-            target,
-            ..
-        } = attestation.data();
-
-        ensure!(
-            controller.block_by_root(beacon_block_root)?.is_some(),
-            Error::MatchingAttestationHeadBlockNotFound,
-        );
-
-        let target_state = target_state.ok_or(Error::TargetStateNotFound)?;
-
-        let relative_epoch = accessors::relative_epoch(&target_state, target.epoch)
-            .map_err(|_| Error::TargetStateNotFound)?;
-
-        let committees_per_slot =
-            accessors::get_committee_count_per_slot(&target_state, relative_epoch);
-
-        let committee_index = misc::committee_index(&attestation);
-
-        let subnet_id =
-            misc::compute_subnet_for_attestation::<P>(committees_per_slot, slot, committee_index)?;
-
-        let (sender, receiver) = futures::channel::oneshot::channel();
-
-        controller.on_api_singular_attestation(attestation.clone_arc(), subnet_id, sender);
-
         let validation_outcome = receiver.await??;
-
         Ok((attestation, subnet_id, validation_outcome))
     };
 
     run.await.map_err(|error| IndexedError { index, error })
 }
 
+#[expect(clippy::type_complexity)]
+fn build_attestation_item<P: Preset, W: Wait>(
+    controller: &ApiController<P, W>,
+    index: usize,
+    attestation: Arc<Attestation<P>>,
+    target_state: Option<Arc<BeaconState<P>>>,
+) -> Result<(
+    AttestationItem<P, GossipId>,
+    usize,
+    SubnetId,
+    OneshotReceiver<Result<ValidationOutcome>>,
+)> {
+    let AttestationData {
+        slot,
+        beacon_block_root,
+        target,
+        ..
+    } = attestation.data();
+
+    ensure!(
+        controller.block_by_root(beacon_block_root)?.is_some(),
+        Error::MatchingAttestationHeadBlockNotFound,
+    );
+
+    let target_state = target_state.ok_or(Error::TargetStateNotFound)?;
+
+    let relative_epoch = accessors::relative_epoch(&target_state, target.epoch)
+        .map_err(|_| Error::TargetStateNotFound)?;
+
+    let committees_per_slot =
+        accessors::get_committee_count_per_slot(&target_state, relative_epoch);
+
+    let committee_index = misc::committee_index(&attestation);
+
+    let subnet_id =
+        misc::compute_subnet_for_attestation::<P>(committees_per_slot, slot, committee_index)?;
+
+    let (sender, receiver) = futures::channel::oneshot::channel();
+
+    Ok((
+        AttestationItem::unverified(attestation, AttestationOrigin::Api(subnet_id, sender)),
+        index,
+        subnet_id,
+        receiver,
+    ))
+}
+
+#[instrument(
+    parent = None,
+    level = "trace",
+    fields(
+        service = "http_api"
+    ),
+    name = "http_api",
+    skip_all,
+)]
 async fn submit_attestations_to_pool<P: Preset, W: Wait>(
     controller: ApiController<P, W>,
+    event_channels: Arc<EventChannels<P>>,
     api_to_p2p_tx: UnboundedSender<ApiToP2p<P>>,
-    attestations: Vec<Arc<Attestation<P>>>,
+    attestations: impl Iterator<Item = Arc<Attestation<P>>>,
 ) -> Result<(), Error> {
+    const MISSING_BLOCKS_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
     let grouped_by_target = attestations
-        .into_iter()
         .enumerate()
         .chunk_by(|(_, attestation)| attestation.data().target);
 
@@ -2998,26 +4075,41 @@ async fn submit_attestations_to_pool<P: Preset, W: Wait>(
         .map(|(target, attestations)| (target, attestations.collect_vec()))
         .unzip();
 
-    let (successes, failures): (Vec<_>, Vec<_>) = targets
+    wait_for_missing_blocks_with_timeout(
+        &controller,
+        &event_channels,
+        target_attestations
+            .iter()
+            .flatten()
+            .map(|(_, attestation)| attestation.data().beacon_block_root),
+        MISSING_BLOCKS_WAIT_TIMEOUT,
+    )
+    .await?;
+
+    let state = controller.preprocessed_state_at_current_slot().await?;
+
+    let (prevalidated, mut failures): (Vec<_>, Vec<_>) = targets
         .into_iter()
         .map(|target| {
-            if controller.head_block_root().value == target.root {
-                let state = controller.preprocessed_state_at_current_slot()?;
-
-                if accessors::get_current_epoch(&state) == target.epoch {
-                    return Ok(state);
-                }
+            if controller.head_block_root().value == target.root
+                && accessors::get_current_epoch(&state) == target.epoch
+            {
+                return Ok(state.clone_arc());
             }
 
-            controller
-                .checkpoint_state(target)?
-                .ok_or(Error::TargetStateNotFound)
+            tokio::task::block_in_place(|| {
+                controller
+                    .checkpoint_state_blocking(target)?
+                    .ok_or(Error::TargetStateNotFound)
+            })
         })
         .zip(target_attestations)
         .flat_map(|(target_state_result, attestations)| {
             let target_state = target_state_result
                 .map_err(|error| {
-                    warn!("attestations submitted to beacon node were rejected: {error}");
+                    warn_with_peers!(
+                        "attestations submitted to beacon node were rejected: {error}"
+                    );
                     error
                 })
                 .ok();
@@ -3025,14 +4117,30 @@ async fn submit_attestations_to_pool<P: Preset, W: Wait>(
             let controller = controller.clone_arc();
 
             attestations.into_iter().map(move |(index, attestation)| {
-                submit_attestation_to_pool(
-                    controller.clone_arc(),
-                    index,
-                    attestation,
-                    target_state.clone(),
-                )
+                build_attestation_item(&controller, index, attestation, target_state.clone())
+                    .map_err(|error| IndexedError { index, error })
             })
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .partition_result();
+
+    let (attestation_items, receivers): (Vec<_>, Vec<_>) = prevalidated
+        .into_iter()
+        .map(|(attestation_item, index, subnet_id, receiver)| {
+            let attestation = attestation_item.item.clone_arc();
+
+            (
+                attestation_item,
+                wait_for_validation(attestation, index, subnet_id, receiver),
+            )
+        })
+        .unzip();
+
+    controller.on_api_singular_attestation_batch(attestation_items);
+
+    let (successes, mut validation_failures): (Vec<_>, Vec<_>) = receivers
+        .into_iter()
         .collect::<FuturesOrdered<_>>()
         .collect::<Vec<_>>()
         .await
@@ -3049,6 +4157,9 @@ async fn submit_attestations_to_pool<P: Preset, W: Wait>(
             ApiToP2p::PublishSingularAttestation(attestation, subnet_id).send(&api_to_p2p_tx);
         }
     }
+
+    // extend prevalidation failures with received failed validations
+    failures.append(&mut validation_failures);
 
     if !failures.is_empty() {
         return Err(Error::InvalidAttestations(failures));
@@ -3070,30 +4181,232 @@ async fn submit_blob_sidecar<P: Preset, W: Wait>(
 
 async fn submit_blob_sidecars<P: Preset, W: Wait>(
     controller: ApiController<P, W>,
-    blob_sidecars: &[Arc<BlobSidecar<P>>],
-) -> Result<(), Error> {
+    blob_sidecars: Vec<Arc<BlobSidecar<P>>>,
+) -> Result<Vec<Arc<BlobSidecar<P>>>, Error> {
     let blob_sidecar_results: Result<Vec<_>> = blob_sidecars
         .iter()
         .map(|blob_sidecar| submit_blob_sidecar(controller.clone_arc(), blob_sidecar.clone_arc()))
-        .collect::<FuturesUnordered<_>>()
+        .collect::<FuturesOrdered<_>>()
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect();
 
     match blob_sidecar_results {
-        Ok(results) => {
-            if results
-                .iter()
-                .any(|outcome| *outcome == ValidationOutcome::Ignore(false))
-            {
-                return Err(Error::UnableToPublishBlock);
+        Ok(results) => Ok(blob_sidecars
+            .into_iter()
+            .zip(results.into_iter())
+            .filter_map(|(blob_sidecar, outcome)| {
+                (outcome != ValidationOutcome::Ignore(false)).then_some(blob_sidecar)
+            })
+            .collect::<Vec<_>>()),
+        Err(error) => Err(Error::InvalidBlobSidecar(error)),
+    }
+}
+
+async fn submit_data_column_sidecar<P: Preset, W: Wait>(
+    controller: ApiController<P, W>,
+    data_column_sidecar: Arc<DataColumnSidecar<P>>,
+) -> Result<ValidationOutcome> {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+
+    controller.on_api_data_column_sidecar(data_column_sidecar.clone_arc(), Some(sender));
+
+    receiver.await?
+}
+
+async fn submit_data_column_sidecars<P: Preset, W: Wait>(
+    controller: ApiController<P, W>,
+    data_column_sidecars: Vec<Arc<DataColumnSidecar<P>>>,
+) -> Result<Vec<Arc<DataColumnSidecar<P>>>, Error> {
+    let results: Result<Vec<_>> = data_column_sidecars
+        .iter()
+        .map(|data_column_sidecar| {
+            submit_data_column_sidecar(controller.clone_arc(), data_column_sidecar.clone_arc())
+        })
+        .collect::<FuturesOrdered<_>>()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect();
+
+    match results {
+        Ok(results) => Ok(data_column_sidecars
+            .into_iter()
+            .zip(results.into_iter())
+            .filter_map(|(data_column_sidecar, outcome)| {
+                (outcome != ValidationOutcome::Ignore(false)).then_some(data_column_sidecar)
+            })
+            .collect::<Vec<_>>()),
+        Err(error) => Err(Error::InvalidDataColumnSidecar(error)),
+    }
+}
+
+async fn wait_for_missing_blocks_with_timeout<P: Preset, W: Wait>(
+    controller: &ApiController<P, W>,
+    event_channels: &EventChannels<P>,
+    block_roots: impl IntoIterator<Item = H256>,
+    wait_duration: Duration,
+) -> Result<()> {
+    let mut missing_blocks = block_roots
+        .into_iter()
+        .unique()
+        .map(|root| Ok::<_, AnyhowError>((root, controller.block_by_root(root)?.is_none())))
+        .process_results(|iter| {
+            iter.filter(|(_, is_missing)| *is_missing)
+                .map(|(root, _)| root)
+                .collect::<HashSet<_>>()
+        })?;
+
+    if !missing_blocks.is_empty() {
+        if let Err(error) = timeout(wait_duration, async {
+            loop {
+                if missing_blocks.is_empty() {
+                    break;
+                }
+
+                let block_event = match event_channels.receiver_for(Topic::Block).recv().await {
+                    Ok(Event::Block(block_event)) => block_event,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        debug_with_peers!("error receiving block event: {error:?}");
+                        continue;
+                    }
+                };
+
+                missing_blocks.remove(&block_event.block);
             }
+        })
+        .await
+        {
+            debug_with_peers!("timeout while waiting for block events: {error:?}");
         }
-        Err(error) => return Err(Error::InvalidBlock(error)),
     }
 
     Ok(())
+}
+
+async fn construct_blobs_from_data_column_sidecars<P: Preset, W: Wait>(
+    controller: ApiController<P, W>,
+    block: Arc<SignedBeaconBlock<P>>,
+    block_root: H256,
+    metrics: Option<&Arc<Metrics>>,
+) -> Result<Vec<Blob<P>>> {
+    let metrics = metrics.cloned();
+
+    tokio::task::spawn_blocking(move || {
+        let mut data_column_sidecars = controller.data_column_sidecars_by_root(block_root)?;
+
+        if data_column_sidecars.len() * 2 < P::NumberOfColumns::USIZE {
+            return Ok(vec![]);
+        }
+
+        let half_columns = P::NumberOfColumns::U64.saturating_div(2);
+
+        if (0..half_columns).any(|index| {
+            !data_column_sidecars
+                .iter()
+                .any(|sidecar| sidecar.index == index)
+        }) {
+            let partial_matrix = data_column_sidecars
+                .iter()
+                .flat_map(|sidecar| misc::compute_matrix_for_data_column_sidecar(sidecar))
+                .collect::<Vec<_>>();
+
+            let reconstruction_timer = metrics
+                .as_ref()
+                .map(|metrics| metrics.columns_reconstruction_time.start_timer());
+
+            let full_matrix =
+                eip_7594::recover_matrix(&partial_matrix, controller.store_config().kzg_backend)?;
+
+            prometheus_metrics::stop_and_record(reconstruction_timer);
+
+            let _timer = metrics
+                .as_ref()
+                .map(|metrics| metrics.data_column_sidecar_computation.start_timer());
+
+            let cells_and_kzg_proofs = eip_7594::construct_cells_and_kzg_proofs(full_matrix)?;
+
+            data_column_sidecars =
+                eip_7594::construct_data_column_sidecars(&block, &cells_and_kzg_proofs)?;
+        }
+
+        let mut blobs_matrix_map = BTreeMap::<BlobIndex, Vec<MatrixEntry<P>>>::new();
+        for matrix in data_column_sidecars
+            .into_iter()
+            .take_while(|sidecar| (0..half_columns).contains(&sidecar.index))
+            .flat_map(|sidecar| misc::compute_matrix_for_data_column_sidecar(&sidecar).into_iter())
+        {
+            blobs_matrix_map
+                .entry(matrix.row_index)
+                .or_default()
+                .push(matrix);
+        }
+
+        blobs_matrix_map
+            .into_values()
+            .map(|entries| {
+                ContiguousVector::try_from_iter(
+                    entries
+                        .into_iter()
+                        .flat_map(|entry| entry.cell.as_bytes().to_vec().into_iter()),
+                )
+                .map(ByteVector::from)
+                .map(Blob::<P>::from)
+                .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .await?
+}
+
+fn construct_blob_sidecars_from_blobs_and_commitments<P: Preset, W: Wait>(
+    controller: ApiController<P, W>,
+    block: &SignedBeaconBlock<P>,
+    blobs: Vec<Blob<P>>,
+    kzg_commitments: Vec<KzgCommitment>,
+) -> Result<Vec<Arc<BlobSidecar<P>>>> {
+    tokio::task::block_in_place(move || {
+        let blob_proofs = blobs
+            .iter()
+            .zip(kzg_commitments.into_iter())
+            .map(|(blob, commitment)| {
+                compute_blob_kzg_proof::<P>(blob, commitment, controller.store_config().kzg_backend)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        misc::construct_blob_sidecars(block, blobs, blob_proofs)
+            .map(|blob_sidecars| blob_sidecars.into_iter().map(Arc::new).collect::<Vec<_>>())
+    })
+}
+
+async fn construct_data_column_sidecars_from_blobs<P: Preset, W: Wait>(
+    controller: ApiController<P, W>,
+    signed_beacon_block: Arc<SignedBeaconBlock<P>>,
+    blobs: Option<ContiguousList<Blob<P>, <P as Preset>::MaxBlobCommitmentsPerBlock>>,
+    proofs: Option<KzgProofs<P>>,
+    metrics: Option<Arc<Metrics>>,
+) -> Result<Vec<Arc<DataColumnSidecar<P>>>> {
+    tokio::task::spawn_blocking(move || {
+        let timer = metrics
+            .as_ref()
+            .map(|metrics| metrics.data_column_sidecar_computation.start_timer());
+
+        let cells_and_kzg_proofs = eip_7594::try_convert_to_cells_and_kzg_proofs::<P>(
+            blobs.unwrap_or_default().as_ref(),
+            proofs.unwrap_or_else(KzgProofs::empty_fulu).as_ref(),
+            controller.store_config().kzg_backend,
+        )?;
+
+        let data_column_sidecars =
+            eip_7594::construct_data_column_sidecars(&signed_beacon_block, &cells_and_kzg_proofs)?;
+
+        prometheus_metrics::stop_and_record(timer);
+
+        Ok(data_column_sidecars)
+    })
+    .await?
 }
 
 #[cfg(test)]

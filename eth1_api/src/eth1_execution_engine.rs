@@ -3,24 +3,23 @@ use std::sync::Arc;
 use anyhow::Result;
 use derive_more::Constructor;
 use either::Either;
-use eth2_libp2p::PeerId;
 use execution_engine::{
-    ExecutionEngine, ExecutionServiceMessage, PayloadAttributes, PayloadId, PayloadStatusV1,
+    EngineGetBlobsParams, ExecutionEngine, ExecutionServiceMessage, PayloadAttributes, PayloadId,
+    PayloadStatusV1,
 };
 use futures::channel::{mpsc::UnboundedSender, oneshot::Sender};
-use log::{info, warn};
+use logging::{info_with_peers, warn_with_peers};
 use tokio::runtime::{Builder, Handle};
 use types::{
-    combined::{ExecutionPayload, ExecutionPayloadParams, SignedBeaconBlock},
+    combined::{ExecutionPayload, ExecutionPayloadParams},
     config::Config,
-    deneb::containers::BlobIdentifier,
     nonstandard::{Phase, TimedPowBlock, WithBlobsAndMev},
     phase0::primitives::{ExecutionBlockHash, H256},
     preset::Preset,
 };
 use web3::types::U64;
 
-use crate::eth1_api::Eth1Api;
+use crate::{eth1_api::Eth1Api, WithClientVersions};
 
 #[derive(Constructor)]
 pub struct Eth1ExecutionEngine<P: Preset> {
@@ -40,18 +39,8 @@ impl<P: Preset> ExecutionEngine<P> for Eth1ExecutionEngine<P> {
         ExecutionServiceMessage::ExchangeCapabilities.send(&self.execution_service_tx);
     }
 
-    fn get_blobs(
-        &self,
-        block: Arc<SignedBeaconBlock<P>>,
-        blob_identifiers: Vec<BlobIdentifier>,
-        peer_id: Option<PeerId>,
-    ) {
-        ExecutionServiceMessage::GetBlobs {
-            block,
-            blob_identifiers,
-            peer_id,
-        }
-        .send(&self.execution_service_tx);
+    fn get_blobs(&self, params: EngineGetBlobsParams<P>) {
+        ExecutionServiceMessage::GetBlobs(params).send(&self.execution_service_tx);
     }
 
     fn notify_forkchoice_updated(
@@ -126,15 +115,15 @@ impl<P: Preset> ExecutionEngine<P> for Eth1ExecutionEngine<P> {
 
         match result {
             Ok(Some(pow_block)) => {
-                info!("request for Eth1 block {block_hash:?} returned {pow_block:?}");
+                info_with_peers!("request for Eth1 block {block_hash:?} returned {pow_block:?}");
                 Some(pow_block.into())
             }
             Ok(None) => {
-                warn!("Eth1 block {block_hash:?} not found");
+                warn_with_peers!("Eth1 block {block_hash:?} not found");
                 None
             }
             Err(error) => {
-                warn!("request for Eth1 block {block_hash:?} failed: {error:?}");
+                warn_with_peers!("request for Eth1 block {block_hash:?} failed: {error:?}");
                 None
             }
         }
@@ -149,7 +138,7 @@ impl<P: Preset> Eth1ExecutionEngine<P> {
     pub async fn get_execution_payload(
         &self,
         payload_id: PayloadId,
-    ) -> Result<WithBlobsAndMev<ExecutionPayload<P>, P>> {
+    ) -> Result<WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>> {
         self.eth1_api.get_payload::<P>(payload_id).await
     }
 

@@ -1,9 +1,9 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use anyhow::{Error, Result};
+use anyhow::{bail, Error, Result};
 use bls::{traits::SecretKey as _, PublicKeyBytes, SecretKey};
 use eip_2335::Keystore;
-use log::{info, warn};
+use logging::{info_with_peers, warn_with_peers};
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use signer::KeyOrigin;
 use std_ext::ArcExt;
@@ -87,21 +87,42 @@ impl Validators {
             .map(|(keystore_path, password_path)| {
                 let password = Zeroizing::new(fs_err::read(password_path)?);
                 let normalized_password = eip_2335::normalize_password(password.as_slice())?;
-                let keystore_bytes = Zeroizing::new(fs_err::read(keystore_path)?);
-                let keystore = serde_json::from_slice::<Keystore>(keystore_bytes.as_slice())?;
-                Ok((keystore, normalized_password))
+                let keystore_bytes = Zeroizing::new(fs_err::read(&keystore_path)?);
+                let Ok(keystore) = serde_json::from_slice::<Keystore>(keystore_bytes.as_slice())
+                else {
+                    if keystore_path.file_name().is_some_and(|filename| {
+                        filename.to_string_lossy().starts_with("deposit_data")
+                    }) {
+                        warn_with_peers!(
+                            "Ignoring loading {} file because it's not a valid keystore file. \
+                            Keystore can only contain valid keystore files. \
+                            Please make sure that keystore dir does not contain deposit_data* file",
+                            keystore_path.display()
+                        );
+                    } else {
+                        bail!(
+                            "Failed to load a keystore from file {}",
+                            keystore_path.display()
+                        );
+                    }
+
+                    return Ok(None);
+                };
+
+                Ok(Some((keystore, normalized_password)))
             })
             .collect::<Result<Vec<_>>>()?;
 
         // Collect all passwords for decrypting the cache.
         let passwords = keystores_with_passwords
             .iter()
+            .flatten()
             .map(|(keystore, normalized_password)| (keystore.uuid(), normalized_password.clone()))
             .collect();
 
         if let Some(cache) = validator_key_cache.as_mut() {
             if let Err(error) = cache.load(passwords) {
-                warn!(
+                warn_with_peers!(
                     "Unable to load validator key cache: {error:?}; \
                      Validator key cache will be reset",
                 );
@@ -110,6 +131,7 @@ impl Validators {
 
         let keypairs = keystores_with_passwords
             .into_par_iter()
+            .flatten()
             .map(|(keystore, normalized_password)| {
                 let uuid = keystore.uuid();
 
@@ -125,7 +147,7 @@ impl Validators {
 
                         let public_key = secret_key.to_public_key().into();
 
-                        info!("decrypted validator key {public_key:?}");
+                        info_with_peers!("decrypted validator key {public_key:?}");
 
                         Ok((public_key, secret_key))
                     })?;

@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use genesis::AnchorCheckpointProvider;
-use log::info;
+use logging::info_with_peers;
+use pubkey_cache::PubkeyCache;
 use ssz::{SszHash as _, SszRead, SszWrite as _};
 use std_ext::ArcExt as _;
 use thiserror::Error;
@@ -21,6 +22,7 @@ enum Error {
 }
 
 pub fn export_state_and_blocks<P: Preset>(
+    pubkey_cache: &PubkeyCache,
     storage: &Storage<P>,
     from_slot: Slot,
     to_slot: Slot,
@@ -38,6 +40,7 @@ pub fn export_state_and_blocks<P: Preset>(
                     if let Some((block, _)) = storage.finalized_block_by_slot(current_slot)? {
                         combined::untrusted_state_transition(
                             storage.config(),
+                            pubkey_cache,
                             temporary_state.make_mut(),
                             &block,
                         )?;
@@ -47,6 +50,7 @@ pub fn export_state_and_blocks<P: Preset>(
                 if temporary_state.slot() < state_slot {
                     combined::process_slots(
                         storage.config(),
+                        pubkey_cache,
                         temporary_state.make_mut(),
                         state_slot,
                     )?;
@@ -85,6 +89,7 @@ pub fn export_state_and_blocks<P: Preset>(
 
 pub fn replay_blocks<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     input_dir: &Path,
     from_slot: Slot,
     to_slot: Slot,
@@ -99,12 +104,12 @@ pub fn replay_blocks<P: Preset>(
     for current_slot in (from_slot + 1)..=to_slot {
         let block_file_prefix = format!("beacon_block_slot_{current_slot:06}_root_");
         if let Some(block) = from_prefixed_file(config, input_dir, &block_file_prefix)? {
-            combined::untrusted_state_transition(config, &mut state, &block)?;
+            combined::untrusted_state_transition(config, pubkey_cache, &mut state, &block)?;
         }
     }
 
     if state.slot() < to_slot {
-        combined::process_slots(config, &mut state, to_slot)?;
+        combined::process_slots(config, pubkey_cache, &mut state, to_slot)?;
     }
 
     let last_state_file_prefix = format!("beacon_state_slot_{to_slot:06}_root_");
@@ -143,7 +148,7 @@ fn find_file(input_dir: &Path, file_prefix: &str) -> Result<Option<PathBuf>> {
         });
 
     if path.is_none() {
-        info!("unable to locate file with prefix {file_prefix}, skipping");
+        info_with_peers!("unable to locate file with prefix {file_prefix}, skipping");
     }
 
     Ok(path)

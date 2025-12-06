@@ -3,11 +3,12 @@ use core::{
     ops::{Div as _, Index as _},
 };
 
-use anyhow::{ensure, Error as AnyhowError, Result};
+use anyhow::{ensure, Result};
 use arithmetic::U64Ext as _;
 use bit_field::BitField as _;
-use bls::{traits::CachedPublicKey as _, SignatureBytes};
+use bls::SignatureBytes;
 use itertools::Itertools as _;
+use pubkey_cache::PubkeyCache;
 use ssz::SszHash as _;
 use tap::TryConv as _;
 use typenum::Unsigned as _;
@@ -17,16 +18,15 @@ use types::{
     config::Config,
     deneb::{containers::BlobSidecar, primitives::BlobIndex},
     electra::consts::COMPOUNDING_WITHDRAWAL_PREFIX,
+    fulu::containers::DataColumnSidecar,
     phase0::{
-        consts::{
-            ETH1_ADDRESS_WITHDRAWAL_PREFIX, FAR_FUTURE_EPOCH, TARGET_AGGREGATORS_PER_COMMITTEE,
-        },
+        consts::{TargetAggregatorsPerCommittee, ETH1_ADDRESS_WITHDRAWAL_PREFIX, FAR_FUTURE_EPOCH},
         containers::{AttestationData, Validator},
         primitives::{CommitteeIndex, Epoch, Slot, H256},
     },
     preset::Preset,
     traits::{
-        BeaconState, IndexedAttestation, PostBellatrixBeaconBlockBody, PostBellatrixBeaconState,
+        BeaconState, BlockBodyWithExecutionPayload, IndexedAttestation, PostBellatrixBeaconState,
     },
 };
 
@@ -84,24 +84,41 @@ pub fn is_slashable_attestation_data(data_1: AttestationData, data_2: Attestatio
 // When calling directly, use `SingleVerifier` or call `finalize` manually.
 pub fn validate_constructed_indexed_attestation<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     indexed_attestation: &impl IndexedAttestation<P>,
     verifier: impl Verifier,
 ) -> Result<()> {
-    validate_indexed_attestation(config, state, indexed_attestation, verifier, false)
+    validate_indexed_attestation(
+        config,
+        pubkey_cache,
+        state,
+        indexed_attestation,
+        verifier,
+        false,
+    )
 }
 
 pub fn validate_received_indexed_attestation<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     indexed_attestation: &impl IndexedAttestation<P>,
     verifier: impl Verifier,
 ) -> Result<()> {
-    validate_indexed_attestation(config, state, indexed_attestation, verifier, true)
+    validate_indexed_attestation(
+        config,
+        pubkey_cache,
+        state,
+        indexed_attestation,
+        verifier,
+        true,
+    )
 }
 
 fn validate_indexed_attestation<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     indexed_attestation: &impl IndexedAttestation<P>,
     mut verifier: impl Verifier,
@@ -128,9 +145,7 @@ fn validate_indexed_attestation<P: Preset>(
         indexed_attestation
             .attesting_indices()
             .map(|validator_index| {
-                accessors::public_key(state, validator_index)?
-                    .decompress()
-                    .map_err(AnyhowError::new)
+                pubkey_cache.get_or_insert(*accessors::public_key(state, validator_index)?)
             }),
         |public_keys| {
             verifier.verify_aggregate(
@@ -161,11 +176,11 @@ pub fn is_aggregator<P: Preset>(
     let modulo = committee
         .len()
         .try_conv::<u64>()?
-        .div(TARGET_AGGREGATORS_PER_COMMITTEE)
+        .div(TargetAggregatorsPerCommittee::U64)
         .try_into()
         .unwrap_or(NonZeroU64::MIN);
 
-    Ok(dividend.is_multiple_of(modulo))
+    Ok(dividend.is_multiple_of(modulo.into()))
 }
 
 /// <https://github.com/ethereum/consensus-specs/blob/v1.1.0/specs/altair/validator.md#aggregation-selection>
@@ -183,7 +198,7 @@ pub fn is_sync_committee_aggregator<P: Preset>(signature: SignatureBytes) -> boo
         .try_into()
         .unwrap_or(NonZeroU64::MIN);
 
-    dividend.is_multiple_of(modulo)
+    dividend.is_multiple_of(modulo.into())
 }
 
 /// [`is_valid_merkle_branch`](https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.5/specs/phase0/beacon-chain.md#is_valid_merkle_branch)
@@ -224,6 +239,21 @@ pub fn is_valid_blob_sidecar_inclusion_proof<P: Preset>(blob_sidecar: &BlobSidec
     )
 }
 
+#[must_use]
+pub fn is_valid_data_column_sidecar_inclusion_proof<P: Preset>(
+    data_column_sidecar: &DataColumnSidecar<P>,
+) -> bool {
+    // Fields in BeaconBlockBody before blob KZG commitments
+    let index_at_commitment_depth = 11;
+
+    is_valid_merkle_branch(
+        data_column_sidecar.kzg_commitments.hash_tree_root(),
+        data_column_sidecar.kzg_commitments_inclusion_proof,
+        index_at_commitment_depth,
+        data_column_sidecar.signed_block_header.message.body_root,
+    )
+}
+
 /// <https://github.com/ethereum/consensus-specs/blob/f7da1a38347155589f5e0403ad3290ffb77f4da6/specs/phase0/beacon-chain.md#helpers>
 #[must_use]
 pub fn is_in_inactivity_leak<P: Preset>(state: &impl BeaconState<P>) -> bool {
@@ -242,7 +272,7 @@ pub fn is_merge_transition_complete<P: Preset>(
 #[must_use]
 pub fn is_merge_transition_block<P: Preset>(
     state: &CombinedBeaconState<P>,
-    body: &(impl PostBellatrixBeaconBlockBody<P> + ?Sized),
+    body: &(impl BlockBodyWithExecutionPayload<P> + ?Sized),
 ) -> bool {
     state.post_bellatrix().is_some_and(|state| {
         !is_merge_transition_complete(state) && !body.execution_payload().is_default_payload()
@@ -259,7 +289,7 @@ pub fn is_merge_transition_block<P: Preset>(
 #[must_use]
 pub fn is_execution_enabled<P: Preset>(
     state: &(impl PostBellatrixBeaconState<P> + ?Sized),
-    body: &(impl PostBellatrixBeaconBlockBody<P> + ?Sized),
+    body: &(impl BlockBodyWithExecutionPayload<P> + ?Sized),
 ) -> bool {
     is_merge_transition_complete(state) || !body.execution_payload().is_default_payload()
 }
@@ -275,7 +305,8 @@ pub fn has_eth1_withdrawal_credential(validator: &Validator) -> bool {
         .starts_with(ETH1_ADDRESS_WITHDRAWAL_PREFIX)
 }
 
-const fn index_at_commitment_depth<P: Preset>(commitment_index: BlobIndex) -> u64 {
+#[must_use]
+pub const fn index_at_commitment_depth<P: Preset>(commitment_index: BlobIndex) -> u64 {
     // When using the minimal preset, `commitment_index` should be in the range `0..16`.
     // 16 is the value of `MAX_BLOB_COMMITMENTS_PER_BLOCK`.
     //
@@ -374,6 +405,10 @@ mod spec_tests {
         capella::containers::BeaconBlockBody as CapellaBeaconBlockBody,
         deneb::containers::BeaconBlockBody as DenebBeaconBlockBody,
         electra::containers::BeaconBlockBody as ElectraBeaconBlockBody,
+        fulu::{
+            containers::{BeaconBlockBody as FuluBeaconBlockBody, DataColumnSidecar},
+            primitives::ColumnIndex,
+        },
         nonstandard::Phase,
         phase0::containers::SignedBeaconBlockHeader,
         preset::{Mainnet, Minimal},
@@ -418,6 +453,8 @@ mod spec_tests {
         ["consensus-spec-tests/tests/minimal/deneb/light_client/single_merkle_proof/BeaconBlockBody/*/"]   [deneb_minimal_beacon_block_body]   [DenebBeaconBlockBody<Minimal>];
         ["consensus-spec-tests/tests/mainnet/electra/light_client/single_merkle_proof/BeaconBlockBody/*/"] [electra_mainnet_beacon_block_body] [ElectraBeaconBlockBody<Mainnet>];
         ["consensus-spec-tests/tests/minimal/electra/light_client/single_merkle_proof/BeaconBlockBody/*/"] [electra_minimal_beacon_block_body] [ElectraBeaconBlockBody<Minimal>];
+        ["consensus-spec-tests/tests/mainnet/fulu/light_client/single_merkle_proof/BeaconBlockBody/*/"]    [fulu_mainnet_beacon_block_body]    [FuluBeaconBlockBody<Mainnet>];
+        ["consensus-spec-tests/tests/minimal/fulu/light_client/single_merkle_proof/BeaconBlockBody/*/"]    [fulu_minimal_beacon_block_body]    [FuluBeaconBlockBody<Minimal>];
     )]
     #[test_resources(glob)]
     fn function_name(case: Case) {
@@ -425,9 +462,9 @@ mod spec_tests {
     }
 
     #[duplicate_item(
-        glob                                                                                              function_name                              preset;
-        ["consensus-spec-tests/tests/mainnet/deneb/merkle_proof/single_merkle_proof/BeaconBlockBody/*"]   [deneb_mainnet_beacon_block_body_proofs]   [Mainnet];
-        ["consensus-spec-tests/tests/minimal/deneb/merkle_proof/single_merkle_proof/BeaconBlockBody/*"]   [deneb_minimal_beacon_block_body_proofs]   [Minimal];
+        glob                                                                                                                  function_name                            preset;
+        ["consensus-spec-tests/tests/mainnet/deneb/merkle_proof/single_merkle_proof/BeaconBlockBody/*"]                       [deneb_mainnet_beacon_block_body_proofs] [Mainnet];
+        ["consensus-spec-tests/tests/minimal/deneb/merkle_proof/single_merkle_proof/BeaconBlockBody/*"]                       [deneb_minimal_beacon_block_body_proofs] [Minimal];
     )]
     #[test_resources(glob)]
     fn function_name(case: Case) {
@@ -516,6 +553,50 @@ mod spec_tests {
         assert_eq!(proof.as_slice(), branch);
     }
 
+    #[duplicate_item(
+        glob                                                                                                                function_name                                  preset;
+        ["consensus-spec-tests/tests/mainnet/fulu/merkle_proof/single_merkle_proof/BeaconBlockBody/blob_kzg_commitments_*"] [fulu_kzg_commitments_inclusion_proof_mainnet] [Mainnet];
+        ["consensus-spec-tests/tests/minimal/fulu/merkle_proof/single_merkle_proof/BeaconBlockBody/blob_kzg_commitments_*"] [fulu_kzg_commitments_inclusion_proof_minimal] [Minimal];
+    )]
+    #[test_resources(glob)]
+    fn function_name(case: Case) {
+        let Proof {
+            leaf,
+            leaf_index,
+            branch,
+        } = case.yaml("proof");
+
+        // Unlike the name suggests, `leaf_index` is actually a generalized index.
+        // `is_valid_merkle_branch` expects an index that includes only leaves.
+        let commitment_index = leaf_index % <preset as Preset>::MaxBlobCommitmentsPerBlock::U64;
+        let index_at_commitment_depth = index_at_commitment_depth::<preset>(commitment_index);
+        // vs
+        // let index_at_leaf_depth = leaf_index - leaf_index.prev_power_of_two();
+
+        let block_body = case.ssz_default::<FuluBeaconBlockBody<preset>>("object");
+
+        // > Check that `is_valid_merkle_branch` confirms `leaf` at `leaf_index` to verify
+        // > against `has_tree_root(state)` and `proof`.
+        assert!(is_valid_merkle_branch(
+            leaf,
+            branch.iter().copied(),
+            index_at_commitment_depth,
+            block_body.hash_tree_root(),
+        ));
+
+        // Reuse `merkle_proof` test cases to test `is_valid_data_column_sidecar_inclusion_proof`.
+        assert!(is_valid_data_column_sidecar_inclusion_proof(
+            &incomplete_data_column_sidecar(commitment_index, &block_body, branch.iter().copied())
+                .expect("data column sidecar should be constructed successfully")
+        ));
+
+        // > If the implementation supports generating merkle proofs, check that the
+        // > self-generated proof matches the `proof` provided with the test.
+        let proof = misc::kzg_commitments_inclusion_proof(&block_body);
+
+        assert_eq!(proof.as_slice(), branch);
+    }
+
     fn run_light_client_case<C, T: SszRead<C> + SszHash>(context: &C, case: Case) {
         let Proof {
             leaf,
@@ -580,6 +661,23 @@ mod spec_tests {
             signed_block_header,
             kzg_commitment_inclusion_proof: ContiguousVector::try_from_iter(inclusion_proof)?,
             ..BlobSidecar::default()
+        })
+    }
+
+    fn incomplete_data_column_sidecar<P: Preset>(
+        column_index: ColumnIndex,
+        body: &FuluBeaconBlockBody<P>,
+        inclusion_proof: impl IntoIterator<Item = H256>,
+    ) -> Result<DataColumnSidecar<P>> {
+        let mut signed_block_header = SignedBeaconBlockHeader::default();
+        signed_block_header.message.body_root = body.hash_tree_root();
+
+        Ok(DataColumnSidecar {
+            index: column_index,
+            kzg_commitments: body.blob_kzg_commitments.clone(),
+            signed_block_header,
+            kzg_commitments_inclusion_proof: ContiguousVector::try_from_iter(inclusion_proof)?,
+            ..DataColumnSidecar::default()
         })
     }
 }
@@ -828,6 +926,7 @@ mod extra_tests {
 
     #[test]
     fn validate_received_indexed_attestation_index_set_not_sorted() {
+        let pubkey_cache = PubkeyCache::default();
         let state = Phase0BeaconState::<Mainnet>::default();
 
         let attestation = IndexedAttestation {
@@ -837,6 +936,7 @@ mod extra_tests {
 
         validate_received_indexed_attestation(
             &Config::mainnet(),
+            &pubkey_cache,
             &state,
             &attestation,
             SingleVerifier,
@@ -846,6 +946,7 @@ mod extra_tests {
 
     #[test]
     fn validate_received_indexed_attestation_nonexistent_validators() {
+        let pubkey_cache = PubkeyCache::default();
         let state = Phase0BeaconState::<Mainnet>::default();
 
         let attestation = IndexedAttestation {
@@ -855,6 +956,7 @@ mod extra_tests {
 
         validate_received_indexed_attestation(
             &Config::mainnet(),
+            &pubkey_cache,
             &state,
             &attestation,
             SingleVerifier,
@@ -864,6 +966,7 @@ mod extra_tests {
 
     #[test]
     fn validate_received_indexed_attestation_invalid_signature() {
+        let pubkey_cache = PubkeyCache::default();
         let state = Phase0BeaconState::<Mainnet> {
             validators: [
                 inactive_validator(),
@@ -882,6 +985,7 @@ mod extra_tests {
 
         validate_received_indexed_attestation(
             &Config::mainnet(),
+            &pubkey_cache,
             &state,
             &attestation,
             SingleVerifier,
@@ -891,6 +995,7 @@ mod extra_tests {
 
     #[test]
     fn validate_received_indexed_attestation_valid_signature() -> Result<()> {
+        let pubkey_cache = PubkeyCache::default();
         let config = Config::mainnet();
 
         let secret_key_1 = b"????????????????????????????????"
@@ -934,7 +1039,13 @@ mod extra_tests {
             signature: aggregate_signature.into(),
         };
 
-        validate_received_indexed_attestation(&config, &state, &attestation, SingleVerifier)
+        validate_received_indexed_attestation(
+            &config,
+            &pubkey_cache,
+            &state,
+            &attestation,
+            SingleVerifier,
+        )
     }
 
     fn inactive_validator() -> Validator {

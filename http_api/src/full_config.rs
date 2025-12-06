@@ -25,17 +25,17 @@ use types::{
     phase0::{
         consts::{
             AttestationSubnetCount, DepositContractTreeDepth, JustificationBitsLength,
-            ATTESTATION_PROPAGATION_SLOT_RANGE, BASE_REWARDS_PER_EPOCH, BLS_WITHDRAWAL_PREFIX,
-            DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-            DOMAIN_DEPOSIT, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
-            ETH1_ADDRESS_WITHDRAWAL_PREFIX, FAR_FUTURE_EPOCH, GENESIS_EPOCH, GENESIS_SLOT,
-            INTERVALS_PER_SLOT, TARGET_AGGREGATORS_PER_COMMITTEE,
+            TargetAggregatorsPerCommittee, ATTESTATION_PROPAGATION_SLOT_RANGE,
+            BASE_REWARDS_PER_EPOCH, BLS_WITHDRAWAL_PREFIX, DOMAIN_AGGREGATE_AND_PROOF,
+            DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_DEPOSIT, DOMAIN_RANDAO,
+            DOMAIN_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT, ETH1_ADDRESS_WITHDRAWAL_PREFIX,
+            FAR_FUTURE_EPOCH, GENESIS_EPOCH, GENESIS_SLOT, INTERVALS_PER_SLOT,
         },
         primitives::{DomainType, Epoch, NodeId, Slot},
     },
     preset::{
-        AltairPreset, BellatrixPreset, CapellaPreset, DenebPreset, ElectraPreset, Phase0Preset,
-        Preset,
+        AltairPreset, BellatrixPreset, CapellaPreset, DenebPreset, ElectraPreset, FuluPreset,
+        Phase0Preset, Preset,
     },
 };
 
@@ -55,6 +55,8 @@ pub struct FullConfig {
     deneb_preset: DenebPreset,
     #[serde(flatten)]
     electra_preset: ElectraPreset,
+    #[serde(flatten)]
+    fulu_preset: FuluPreset,
     #[serde(flatten)]
     config: Arc<Config>,
 
@@ -174,6 +176,7 @@ impl FullConfig {
             capella_preset: CapellaPreset::new::<P>(),
             deneb_preset: DenebPreset::new::<P>(),
             electra_preset: ElectraPreset::new::<P>(),
+            fulu_preset: FuluPreset::new::<P>(),
             config,
 
             // Phase 0 miscellaneous beacon chain constants
@@ -207,7 +210,7 @@ impl FullConfig {
             node_id_bits: NodeId::BITS,
 
             // Phase 0 honest validator constants
-            target_aggregators_per_committee: TARGET_AGGREGATORS_PER_COMMITTEE,
+            target_aggregators_per_committee: TargetAggregatorsPerCommittee::non_zero(),
 
             // Altair participation flag indices
             timely_head_flag_index: TIMELY_HEAD_FLAG_INDEX,

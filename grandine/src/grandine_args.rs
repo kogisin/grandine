@@ -13,6 +13,7 @@ use core::{
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{ensure, Result};
+use binary_utils::TelemetryConfig;
 use bls::PublicKeyBytes;
 use builder_api::{
     BuilderApiFormat, BuilderConfig, DEFAULT_BUILDER_MAX_SKIPPED_SLOTS,
@@ -30,14 +31,14 @@ use eth2_libp2p::{
     PeerIdSerialized,
 };
 use features::Feature;
-use fork_choice_control::{StorageMode, DEFAULT_ARCHIVAL_EPOCH_INTERVAL};
+use fork_choice_control::{StorageMode, DEFAULT_ARCHIVAL_EPOCH_INTERVAL, DEFAULT_MAX_EVENTS};
 use fork_choice_store::{StoreConfig, DEFAULT_CACHE_LOCK_TIMEOUT_MILLIS};
-use grandine_version::{APPLICATION_NAME, APPLICATION_NAME_AND_VERSION, APPLICATION_VERSION};
+use grandine_version::{APPLICATION_NAME, APPLICATION_VERSION};
+use helper_functions::misc;
 use http_api::HttpApiConfig;
-use http_api_utils::DEFAULT_MAX_EVENTS;
 use itertools::{EitherOrBoth, Itertools as _};
 use kzg_utils::{KzgBackend, DEFAULT_KZG_BACKEND};
-use log::warn;
+use logging::{info_with_peers, warn_with_peers};
 use metrics::{MetricsServerConfig, MetricsServiceConfig};
 use p2p::{Enr, Multiaddr, NetworkConfig};
 use prometheus_metrics::{Metrics, METRICS};
@@ -53,9 +54,11 @@ use serde_json::Value;
 use signer::Web3SignerConfig;
 use slasher::SlasherConfig;
 use slashing_protection::DEFAULT_SLASHING_PROTECTION_HISTORY_LIMIT;
+use ssz::Uint256;
 use std_ext::ArcExt as _;
 use thiserror::Error;
 use tower_http::cors::AllowOrigin;
+use tracing::Level;
 use types::{
     bellatrix::primitives::{Difficulty, Gas},
     config::Config as ChainConfig,
@@ -109,8 +112,14 @@ pub struct GrandineArgs {
     #[clap(flatten)]
     validator_api_options: ValidatorApiOptions,
 
-    #[clap(long, value_parser = parse_graffiti, default_value = APPLICATION_NAME_AND_VERSION)]
+    /// Default block graffiti. Blockprint graffiti will be appended when sufficient space is available.
+    /// See `--disable-blockprint-graffiti` to disable this behavior.
+    #[clap(long, value_parser = misc::parse_graffiti)]
     graffiti: Vec<H256>,
+
+    /// Disable appending blockprint graffiti. If specified, no blockprint graffiti will be appended.
+    #[clap(long)]
+    disable_blockprint_graffiti: bool,
 
     /// List of optional runtime features to enable
     #[clap(long, value_delimiter = ',')]
@@ -158,6 +167,10 @@ struct ChainOptions {
     #[clap(long, value_name = "YAML_FILE")]
     verify_electra_preset_file: Option<PathBuf>,
 
+    /// Verify that Fulu variables in preset match YAML_FILE
+    #[clap(long, value_name = "YAML_FILE")]
+    verify_fulu_preset_file: Option<PathBuf>,
+
     /// Verify that configuration matches YAML_FILE
     #[clap(long, value_name = "YAML_FILE")]
     verify_configuration_file: Option<PathBuf>,
@@ -189,6 +202,10 @@ struct ChainOptions {
 
 #[derive(Args)]
 struct HttpApiOptions {
+    /// Run Grandine without HTTP API server.
+    #[clap(long, default_value_t = false)]
+    disable_http_api: bool,
+
     /// HTTP API address
     #[clap(long, default_value_t = HttpApiConfig::default().address.ip())]
     http_address: IpAddr,
@@ -207,26 +224,31 @@ struct HttpApiOptions {
     timeout: u64,
 }
 
-impl From<HttpApiOptions> for HttpApiConfig {
+impl From<HttpApiOptions> for Option<HttpApiConfig> {
     fn from(http_api_options: HttpApiOptions) -> Self {
         let HttpApiOptions {
+            disable_http_api,
             http_address,
             http_port,
             http_allowed_origins,
             timeout,
         } = http_api_options;
 
-        let Self {
+        if disable_http_api {
+            return None;
+        }
+
+        let HttpApiConfig {
             address,
             allow_origin,
             ..
-        } = Self::with_address(http_address, http_port);
+        } = HttpApiConfig::with_address(http_address, http_port);
 
-        Self {
+        Some(HttpApiConfig {
             address,
             allow_origin: headers_to_allow_origin(http_allowed_origins).unwrap_or(allow_origin),
             timeout: Some(Duration::from_millis(timeout)),
-        }
+        })
     }
 }
 
@@ -325,6 +347,10 @@ struct BeaconNodeOptions {
     #[clap(long)]
     state_slot: Option<Slot>,
 
+    /// Subscribe to all data column subnets
+    #[clap(long)]
+    subscribe_all_data_column_subnets: bool,
+
     /// Subscribe to all subnets
     #[clap(long)]
     subscribe_all_subnets: bool,
@@ -375,9 +401,22 @@ struct BeaconNodeOptions {
     #[clap(long, default_value_t = DEFAULT_METRICS_UPDATE_INTERVAL_SECONDS)]
     metrics_update_interval: u64,
 
-    /// Optional remote metrics URL that Grandine will periodically send metrics to
+    /// Optional remote metrics (beaconcha.in metrics) URL that Grandine will periodically send metrics to
     #[clap(long)]
     remote_metrics_url: Option<RedactingUrl>,
+
+    /// The default tracing level controlling how detailed telemetry output will be.
+    #[clap(long, requires("telemetry_metrics_url"), default_value_t = Level::INFO)]
+    telemetry_level: Level,
+
+    /// Optional OTLP metrics gRPC URL that Grandine will submit tracing and span data to.
+    /// WARNING: This feature is experimental, unstable, and subject to change. Use with caution.
+    #[clap(long)]
+    telemetry_metrics_url: Option<RedactingUrl>,
+
+    /// Optional OTLP service name.
+    #[clap(long, requires("telemetry_metrics_url"), default_value_t = APPLICATION_NAME.to_string())]
+    telemetry_service_name: String,
 
     /// Enable validator liveness tracking
     /// [default: disabled]
@@ -397,6 +436,20 @@ struct BeaconNodeOptions {
 
     #[clap(long, default_value_t = DEFAULT_KZG_BACKEND)]
     kzg_backend: KzgBackend,
+
+    /// A list beacon block roots that beacon node rejects unconditionally
+    #[clap(long)]
+    blacklisted_blocks: Vec<H256>,
+
+    /// Disable `engine_getBlobs` integration, use purely gossip and p2p requests.
+    /// Use for testing purpose
+    #[clap(long)]
+    disable_engine_getblobs: bool,
+
+    /// Disable reconstruction while syncing the chain
+    /// [default: disabled]
+    #[clap(long)]
+    sync_without_reconstruction: bool,
 }
 
 #[expect(
@@ -429,6 +482,10 @@ struct NetworkConfigOptions {
     /// Disable peer scoring
     #[clap(long)]
     disable_peer_scoring: bool,
+
+    /// Disable rate limiting both inbound and outbound
+    #[clap(long)]
+    disable_rate_limiting: bool,
 
     /// Disable NAT traversal via UPnP
     /// [default: enabled]
@@ -518,7 +575,22 @@ struct NetworkConfigOptions {
     trusted_peers: Vec<PeerIdSerialized>,
 }
 
+impl BeaconNodeOptions {
+    pub fn telemetry_config(&self) -> Option<TelemetryConfig> {
+        if let Some(url) = self.telemetry_metrics_url.clone() {
+            return Some(TelemetryConfig {
+                url,
+                service_name: self.telemetry_service_name.clone(),
+                trace_level: self.telemetry_level,
+            });
+        }
+
+        None
+    }
+}
+
 impl NetworkConfigOptions {
+    #[expect(clippy::too_many_lines)]
     fn into_config(
         self,
         network: Network,
@@ -534,6 +606,7 @@ impl NetworkConfigOptions {
             disable_enr_auto_update,
             disable_quic,
             disable_peer_scoring,
+            disable_rate_limiting,
             disable_upnp,
             discovery_port,
             discovery_port_ipv6,
@@ -571,8 +644,12 @@ impl NetworkConfigOptions {
         network_config.target_subnet_peers = target_subnet_peers;
         network_config.trusted_peers = trusted_peers;
         network_config.libp2p_private_key_file = libp2p_private_key_file;
-        network_config.inbound_rate_limiter_config = Some(InboundRateLimiterConfig::default());
-        network_config.outbound_rate_limiter_config = Some(OutboundRateLimiterConfig::default());
+
+        if !disable_rate_limiting {
+            network_config.inbound_rate_limiter_config = Some(InboundRateLimiterConfig::default());
+            network_config.outbound_rate_limiter_config =
+                Some(OutboundRateLimiterConfig::default());
+        }
 
         if let Some(listen_address_ipv6) = listen_address_ipv6 {
             network_config.set_ipv4_ipv6_listening_addresses(
@@ -637,6 +714,10 @@ impl NetworkConfigOptions {
             network_config.subscribe_all_subnets = true;
         }
 
+        if Feature::SubscribeToAllDataColumnSubnets.is_enabled() {
+            network_config.subscribe_all_data_column_subnets = true;
+        }
+
         // Setting this in the last place to overwrite any changes to table filter from other CLI options
         if enable_private_discovery {
             network_config.discv5_config.table_filter = |_| true;
@@ -674,7 +755,7 @@ impl NetworkConfigOptions {
             }
 
             if !manual_options.is_empty() {
-                warn!(
+                warn_with_peers!(
                     "UPnP enabled with manual ENR settings: {}; \
                      manual ENR settings might be overridden by UPnP",
                     manual_options.join(", "),
@@ -698,6 +779,10 @@ struct SlasherOptions {
     slashing_history_limit: u64,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "False positive. The `bool`s are independent."
+)]
 #[derive(Args)]
 struct ValidatorOptions {
     /// Path to a directory containing EIP-2335 keystore files
@@ -748,6 +833,10 @@ struct ValidatorOptions {
     #[clap(long, default_value_t = DEFAULT_BUILDER_MAX_SKIPPED_SLOTS_PER_EPOCH)]
     builder_max_skipped_slots_per_epoch: u64,
 
+    /// Percentage multiplier to apply to the builder's payload value when choosing between a builder payload header and payload from the paired execution node
+    #[clap(long, default_value_t = ValidatorConfig::default().default_builder_boost_factor)]
+    default_builder_boost_factor: Uint256,
+
     /// Default execution gas limit for all validators
     #[clap(long, default_value_t = PREFERRED_EXECUTION_GAS_LIMIT)]
     default_gas_limit: Gas,
@@ -775,6 +864,18 @@ struct ValidatorOptions {
     /// Number of epochs to keep slashing protection data for
     #[clap(long, default_value_t = DEFAULT_SLASHING_PROTECTION_HISTORY_LIMIT)]
     slashing_protection_history_limit: u64,
+
+    /// Print reports about validator performance
+    #[clap(long)]
+    report_validator_performance: bool,
+
+    // Withhold all data column sidecars when assigned to propose a block. Use for testing purpose
+    #[clap(long)]
+    withhold_data_columns_publishing: bool,
+
+    // Backfill custody groups
+    #[clap(long)]
+    no_custody_groups_backfill: bool,
 }
 
 #[derive(Args)]
@@ -836,9 +937,6 @@ impl From<ValidatorApiOptions> for ValidatorApiConfig {
 enum Network {
     #[cfg(any(feature = "network-mainnet", test))]
     Mainnet,
-    #[cfg(any(feature = "network-goerli", test))]
-    #[clap(alias = "prater")]
-    Goerli,
     #[cfg(any(feature = "network-sepolia", test))]
     Sepolia,
     #[cfg(any(feature = "network-holesky", test))]
@@ -859,8 +957,6 @@ impl Network {
         match self {
             #[cfg(any(feature = "network-mainnet", test))]
             Self::Mainnet => Some(PredefinedNetwork::Mainnet),
-            #[cfg(any(feature = "network-goerli", test))]
-            Self::Goerli => Some(PredefinedNetwork::Goerli),
             #[cfg(any(feature = "network-sepolia", test))]
             Self::Sepolia => Some(PredefinedNetwork::Sepolia),
             #[cfg(any(feature = "network-holesky", test))]
@@ -874,7 +970,6 @@ impl Network {
 
 impl GrandineArgs {
     // This is not a `TryFrom` impl because this has side effects.
-    #[expect(clippy::cognitive_complexity)]
     #[expect(clippy::too_many_lines)]
     pub fn try_into_config(self) -> Result<GrandineConfig> {
         let Self {
@@ -885,6 +980,7 @@ impl GrandineArgs {
             validator_options,
             validator_api_options,
             graffiti,
+            disable_blockprint_graffiti,
             mut features,
             command,
             ..
@@ -900,6 +996,7 @@ impl GrandineArgs {
             verify_capella_preset_file,
             verify_deneb_preset_file,
             verify_electra_preset_file,
+            verify_fulu_preset_file,
             verify_configuration_file,
             terminal_total_difficulty_override,
             terminal_block_hash_override,
@@ -908,6 +1005,8 @@ impl GrandineArgs {
             mut genesis_state_file,
             genesis_state_download_url,
         } = chain_options;
+
+        let telemetry_config = beacon_node_options.telemetry_config();
 
         let BeaconNodeOptions {
             max_empty_slots,
@@ -928,6 +1027,7 @@ impl GrandineArgs {
             max_epochs_to_retain_states_in_cache,
             state_cache_lock_timeout,
             state_slot,
+            subscribe_all_data_column_subnets,
             subscribe_all_subnets,
             suggested_fee_recipient,
             jwt_id,
@@ -944,6 +1044,10 @@ impl GrandineArgs {
             detect_doppelgangers,
             in_memory,
             kzg_backend,
+            blacklisted_blocks,
+            disable_engine_getblobs,
+            sync_without_reconstruction,
+            ..
         } = beacon_node_options;
 
         // let SlasherOptions {
@@ -965,6 +1069,7 @@ impl GrandineArgs {
             builder_disable_checks,
             builder_max_skipped_slots,
             builder_max_skipped_slots_per_epoch,
+            default_builder_boost_factor,
             default_gas_limit,
             use_validator_key_cache,
             web3signer_public_keys,
@@ -972,10 +1077,13 @@ impl GrandineArgs {
             web3signer_api_urls,
             web3signer_urls,
             slashing_protection_history_limit,
+            report_validator_performance,
+            withhold_data_columns_publishing,
+            no_custody_groups_backfill,
         } = validator_options;
 
         if in_memory {
-            warn!(
+            warn_with_peers!(
                 "running Grandine in in-memory mode; \
                  no data will be stored on disk; \
                  all data will be lost on exit",
@@ -984,11 +1092,11 @@ impl GrandineArgs {
 
         // There's technically nothing wrong with this, but the user may have made a mistake.
         if configuration_file.is_some() && verify_configuration_file.is_some() {
-            warn!("both --configuration-file and --verify-configuration-file specified");
+            warn_with_peers!("both --configuration-file and --verify-configuration-file specified");
         }
 
         if remote_metrics_url.is_some() && !metrics_enabled {
-            warn!(
+            warn_with_peers!(
                 "remote metrics enabled without ---metrics. \
                  Network, system and process metrics will not be available"
             );
@@ -997,7 +1105,7 @@ impl GrandineArgs {
         if let Some(directory) = configuration_directory {
             configuration_file = configuration_file
                 .inspect(|_| {
-                    warn!(
+                    warn_with_peers!(
                         "both --configuration-directory and --configuration-file specified; \
                          --configuration-file will take precedence",
                     );
@@ -1006,7 +1114,7 @@ impl GrandineArgs {
 
             deposit_contract_starting_block = match deposit_contract_starting_block {
                 Some(number) => {
-                    warn!(
+                    warn_with_peers!(
                         "both --configuration-directory and --deposit-contract-starting-block specified; \
                          --deposit-contract-starting-block will take precedence",
                     );
@@ -1020,7 +1128,7 @@ impl GrandineArgs {
 
             genesis_state_file = genesis_state_file
                 .inspect(|_| {
-                    warn!(
+                    warn_with_peers!(
                         "both --configuration-directory and --genesis-state-file specified; \
                          --genesis-state-file will take precedence",
                     );
@@ -1033,7 +1141,7 @@ impl GrandineArgs {
                 network_config_options.boot_nodes =
                     config_dir::parse_plain_bootnodes(bytes.as_str())?;
             } else {
-                warn!(
+                warn_with_peers!(
                     "both --configuration-directory and --boot-nodes specified; \
                      --boot-nodes will take precedence",
                 );
@@ -1063,7 +1171,7 @@ impl GrandineArgs {
         let unknown = core::mem::take(&mut chain_config.unknown);
 
         if !unknown.is_empty() {
-            warn!(
+            warn_with_peers!(
                 "unknown configuration variables: [{:?}]",
                 unknown.keys().format(", "),
             );
@@ -1109,6 +1217,13 @@ impl GrandineArgs {
             &chain_config.preset_base.electra_preset(),
             verify_electra_preset_file,
             Phase::Electra,
+        )?;
+
+        verify_preset(
+            &chain_config,
+            &chain_config.preset_base.fulu_preset(),
+            verify_fulu_preset_file,
+            Phase::Fulu,
         )?;
 
         verify_config(&chain_config, verify_configuration_file)?;
@@ -1162,12 +1277,17 @@ impl GrandineArgs {
             timeout: request_timeout,
         });
 
-        let http_api_config = HttpApiConfig::from(http_api_options);
+        let mut services = vec![];
+
         let validator_api_config = validator_api_options
             .enable_validator_api
             .then(|| ValidatorApiConfig::from(validator_api_options));
 
-        let mut services = vec![(http_api_config.address, "HTTP API")];
+        let http_api_config = Option::<HttpApiConfig>::from(http_api_options);
+
+        if let Some(http_api_config) = http_api_config.as_ref() {
+            services.push((http_api_config.address, "HTTP API"));
+        }
 
         if let Some(metrics_server_config) = metrics_server_config.as_ref() {
             services.push((SocketAddr::from(metrics_server_config), "Metrics API"));
@@ -1220,7 +1340,16 @@ impl GrandineArgs {
             .into_iter()
             .chain(subscribe_all_subnets.then_some(Feature::SubscribeToAllAttestationSubnets))
             .chain(subscribe_all_subnets.then_some(Feature::SubscribeToAllSyncCommitteeSubnets))
-            .collect();
+            .chain(
+                subscribe_all_data_column_subnets
+                    .then_some(Feature::SubscribeToAllDataColumnSubnets),
+            )
+            .collect::<Vec<_>>();
+
+        // enabling these features here, because it being used in below network config conversion
+        for feature in &features {
+            feature.enable();
+        }
 
         let auth_options = AuthOptions {
             secrets_path: jwt_secret,
@@ -1229,12 +1358,12 @@ impl GrandineArgs {
         };
 
         if back_sync {
-            warn!("--back_sync option is deprecated. Use --back-sync instead.");
+            warn_with_peers!("--back_sync option is deprecated. Use --back-sync instead.");
             back_sync_enabled = true;
         }
 
         let builder_url = if builder_url.is_none() && builder_api_url.is_some() {
-            warn!("--builder-api-url option is deprecated. Use --builder-url instead.");
+            warn_with_peers!("--builder-api-url option is deprecated. Use --builder-url instead.");
             builder_api_url
         } else {
             builder_url
@@ -1249,7 +1378,9 @@ impl GrandineArgs {
         });
 
         let web3signer_urls = if web3signer_urls.is_empty() && !web3signer_api_urls.is_empty() {
-            warn!("--web3signer-api-urls option is deprecated. Use --web3signer-urls instead.");
+            warn_with_peers!(
+                "--web3signer-api-urls option is deprecated. Use --web3signer-urls instead."
+            );
             web3signer_api_urls
         } else {
             web3signer_urls
@@ -1294,8 +1425,10 @@ impl GrandineArgs {
             validators,
             keystore_storage_password_file,
             graffiti,
+            disable_blockprint_graffiti,
             max_empty_slots,
             suggested_fee_recipient: suggested_fee_recipient.unwrap_or(GRANDINE_DONATION_ADDRESS),
+            default_builder_boost_factor,
             default_gas_limit,
             network_config: network_config_options.into_config(
                 network,
@@ -1311,7 +1444,6 @@ impl GrandineArgs {
             command,
             slashing_enabled,
             slashing_history_limit,
-            features,
             state_slot,
             auth_options,
             builder_config,
@@ -1319,6 +1451,7 @@ impl GrandineArgs {
             http_api_config,
             max_events,
             metrics_config,
+            telemetry_config,
             track_liveness,
             detect_doppelgangers,
             use_validator_key_cache,
@@ -1326,12 +1459,27 @@ impl GrandineArgs {
             in_memory,
             validator_api_config,
             kzg_backend,
+            blacklisted_blocks: blacklisted_blocks.into_iter().collect(),
+            report_validator_performance,
+            withhold_data_columns_publishing,
+            backfill_custody_groups: !no_custody_groups_backfill,
+            disable_engine_getblobs,
+            sync_without_reconstruction,
         })
     }
 
     #[must_use]
-    pub fn clap_error(message: impl Display) -> ClapError {
+    pub fn clap_error(message: impl core::fmt::Display) -> ClapError {
         Self::command().error(ErrorKind::ValueValidation, message)
+    }
+
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        (!self.beacon_node_options.in_memory)
+            .then(|| directories::data_directory(self.beacon_node_options.data_dir.as_ref()))
+    }
+
+    pub fn telemetry_config(&self) -> Option<TelemetryConfig> {
+        self.beacon_node_options.telemetry_config()
     }
 }
 
@@ -1345,8 +1493,6 @@ struct Difference {
 
 #[derive(Debug, Error)]
 enum Error {
-    #[error("graffiti must be no longer than {} bytes", H256::len_bytes())]
-    GraffitiTooLong,
     // `clap` cannot check this. `clap::builder::PossibleValue` does not have a `requires` method.
     #[error("--configuration-file must be specified when connecting to custom network")]
     MissingConfigurationFileForCustom,
@@ -1378,15 +1524,6 @@ enum Error {
     },
 }
 
-fn parse_graffiti(string: &str) -> Result<H256> {
-    ensure!(string.len() <= H256::len_bytes(), Error::GraffitiTooLong);
-
-    let mut graffiti = H256::zero();
-    graffiti[..string.len()].copy_from_slice(string.as_bytes());
-
-    Ok(graffiti)
-}
-
 fn verify_preset<T: DeserializeOwned + Serialize>(
     chain_config: &ChainConfig,
     preset: &T,
@@ -1414,6 +1551,8 @@ fn verify_config(chain_config: &ChainConfig, file_path: Option<PathBuf>) -> Resu
         differences.is_empty(),
         Error::ConfigMismatch { differences },
     );
+
+    info_with_peers!("configuration matches the one in configuration file");
 
     Ok(())
 }
@@ -1489,7 +1628,7 @@ fn headers_to_allow_origin(allowed_origins: Vec<HeaderValue>) -> Option<AllowOri
         // `tower_http::cors::AllowOrigin::list` panics if a wildcard is passed to it.
         if allowed_origins.contains(&HeaderValue::from_static("*")) {
             if allowed_origins.len() > 1 {
-                warn!(
+                warn_with_peers!(
                     "extra values of Access-Control-Allow-Origin specified along with a wildcard; \
                     only the wildcard will be used",
                 );
@@ -1508,6 +1647,7 @@ fn headers_to_allow_origin(allowed_origins: Vec<HeaderValue>) -> Option<AllowOri
 mod tests {
     use core::net::{Ipv4Addr, SocketAddr};
 
+    use ssz::Uint256;
     use tempfile::NamedTempFile;
 
     use crate::commands::InterchangeCommand;
@@ -1550,6 +1690,43 @@ mod tests {
     fn back_sync_disabled_by_default() {
         let config = config_from_args([]);
         assert!(!config.back_sync_enabled);
+    }
+
+    #[test]
+    fn default_builder_boost_factor() {
+        let config = config_from_args([]);
+        assert_eq!(config.default_builder_boost_factor, Uint256::from_u64(100));
+    }
+
+    #[test]
+    fn zero_default_builder_boost_factor() {
+        let config = config_from_args(["--default-builder-boost-factor", "0"]);
+        assert_eq!(config.default_builder_boost_factor, Uint256::ZERO);
+    }
+
+    #[test]
+    fn custom_default_builder_boost_factor() {
+        let config = config_from_args(["--default-builder-boost-factor", "200"]);
+        assert_eq!(config.default_builder_boost_factor, Uint256::from_u64(200));
+    }
+
+    #[test]
+    fn max_default_builder_boost_facot() {
+        let config = config_from_args([
+            "--default-builder-boost-factor",
+            format!("{}", u64::MAX).as_str(),
+        ]);
+
+        assert_eq!(
+            config.default_builder_boost_factor,
+            Uint256::from_u64(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn invalid_default_builder_boost_factor() {
+        try_config_from_args(["--default-builder-boost-factor", "-100"])
+            .expect_err("negative --default-builder-boost-factor is invalid");
     }
 
     #[test]
@@ -1649,12 +1826,18 @@ mod tests {
     }
 
     #[test]
+    fn http_api_disabled() {
+        let config = config_from_args(["--http-port", "1234", "--disable-http-api"]);
+        assert!(config.http_api_config.is_none());
+    }
+
+    #[test]
     fn http_port_option() {
         let config = config_from_args(["--http-port", "1234"]);
 
         assert_eq!(
-            config.http_api_config.address,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234),
+            config.http_api_config.map(|config| config.address),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
         );
     }
 
@@ -1664,8 +1847,11 @@ mod tests {
 
         // `Debug` is the only way to inspect the contents of `AllowOrigin`.
         assert_eq!(
-            format!("{:?}", config.http_api_config.allow_origin),
-            "List([\"http://127.0.0.1:5052\"])",
+            format!(
+                "{:?}",
+                config.http_api_config.map(|config| config.allow_origin)
+            ),
+            "Some(List([\"http://127.0.0.1:5052\"]))",
         );
     }
 
@@ -1675,8 +1861,11 @@ mod tests {
 
         // `Debug` is the only way to inspect the contents of `AllowOrigin`.
         assert_eq!(
-            format!("{:?}", config.http_api_config.allow_origin),
-            "Const(\"*\")",
+            format!(
+                "{:?}",
+                config.http_api_config.map(|config| config.allow_origin)
+            ),
+            "Some(Const(\"*\"))",
         );
     }
 
@@ -1691,8 +1880,11 @@ mod tests {
 
         // `Debug` is the only way to inspect the contents of `AllowOrigin`.
         assert_eq!(
-            format!("{:?}", config.http_api_config.allow_origin),
-            "List([\"http://localhost\", \"http://example.com\"])",
+            format!(
+                "{:?}",
+                config.http_api_config.map(|config| config.allow_origin)
+            ),
+            "Some(List([\"http://localhost\", \"http://example.com\"]))",
         );
     }
 
@@ -1709,9 +1901,85 @@ mod tests {
 
         // `Debug` is the only way to inspect the contents of `AllowOrigin`.
         assert_eq!(
-            format!("{:?}", config.http_api_config.allow_origin),
-            "Const(\"*\")",
+            format!(
+                "{:?}",
+                config.http_api_config.map(|config| config.allow_origin)
+            ),
+            "Some(Const(\"*\"))",
         );
+    }
+
+    #[test]
+    fn telemetry_config_disabled_by_default() {
+        let config = config_from_args([]);
+        assert!(config.telemetry_config.is_none());
+    }
+
+    #[test]
+    fn telemetry_config_options() {
+        let config = config_from_args(["--telemetry-metrics-url", "http://localhost:4317"]);
+        let telemetry_config = config.telemetry_config;
+
+        assert_eq!(
+            telemetry_config
+                .as_ref()
+                .map(|config| config.url.to_string()),
+            Some("http://localhost:4317/".to_owned()),
+        );
+
+        assert_eq!(
+            telemetry_config.as_ref().map(|config| config.trace_level),
+            Some(Level::INFO),
+        );
+
+        assert_eq!(
+            telemetry_config.map(|config| config.service_name),
+            Some("Grandine".to_owned()),
+        );
+    }
+
+    #[test]
+    fn telemetry_config_custom_service_name() {
+        let config = config_from_args([
+            "--telemetry-metrics-url",
+            "http://localhost:4317",
+            "--telemetry-service-name",
+            "grandine-bn",
+            "--telemetry-level",
+            "debug",
+        ]);
+
+        let telemetry_config = config.telemetry_config;
+
+        assert_eq!(
+            telemetry_config
+                .as_ref()
+                .map(|config| config.url.to_string()),
+            Some("http://localhost:4317/".to_owned()),
+        );
+
+        assert_eq!(
+            telemetry_config.as_ref().map(|config| config.trace_level),
+            Some(Level::DEBUG),
+        );
+
+        assert_eq!(
+            telemetry_config.map(|config| config.service_name),
+            Some("grandine-bn".to_owned()),
+        );
+    }
+
+    #[test]
+    fn telemetry_config_service_name_without_url() {
+        try_config_from_args(["--telemetry-service-name", "grandine-bn"]).expect_err(
+            "passing --telemetry-service-name without --telemetry-metrics-url should fail",
+        );
+    }
+
+    #[test]
+    fn telemetry_level_without_url() {
+        try_config_from_args(["--telemetry-level", "debug"])
+            .expect_err("passing --telemetry-level without --telemetry-metrics-url should fail");
     }
 
     #[test]
@@ -1729,7 +1997,7 @@ mod tests {
                 .validator_api_config
                 .as_ref()
                 .map(|config| config.address),
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1234)),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1234)),
         );
     }
 
@@ -1887,11 +2155,8 @@ mod tests {
 
     #[test]
     fn graffiti_option_too_long() {
-        try_config_from_args([
-            "--graffiti",
-            "**test-graffiti*******************************",
-        ])
-        .expect_err("parse_graffiti should fail");
+        try_config_from_args(["--graffiti", "**test-graffiti******************"])
+            .expect_err("parse_graffiti should fail");
     }
 
     #[test]

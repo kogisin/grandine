@@ -7,16 +7,23 @@ use eth2_libp2p::GossipId;
 use execution_engine::ExecutionEngine;
 use fork_choice_store::{
     AggregateAndProofOrigin, AttestationItem, BlobSidecarAction, BlobSidecarOrigin, ChainLink,
-    StateCacheProcessor, Store,
+    DataColumnSidecarAction, DataColumnSidecarOrigin, StateCacheProcessor, Store,
 };
 use helper_functions::misc;
 use itertools::Itertools as _;
+use pubkey_cache::PubkeyCache;
 use serde::Serialize;
 use std_ext::ArcExt;
 use thiserror::Error;
+use tracing::instrument;
+use typenum::Unsigned as _;
 use types::{
     combined::{BeaconState, SignedAggregateAndProof, SignedBeaconBlock},
     deneb::containers::{BlobIdentifier, BlobSidecar},
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar},
+        primitives::ColumnIndex,
+    },
     nonstandard::{PayloadStatus, Phase, WithStatus},
     phase0::{
         containers::Checkpoint,
@@ -49,7 +56,7 @@ impl<P, E, A, W> Controller<P, E, A, W>
 where
     P: Preset,
     E: ExecutionEngine<P> + Clone + Send + Sync + 'static,
-    A: UnboundedSink<AttestationVerifierMessage<P, W>>,
+    A: UnboundedSink<AttestationVerifierMessage<P, W>> + Sync,
     W: Wait,
 {
     #[must_use]
@@ -165,8 +172,11 @@ where
         }
     }
 
-    pub fn checkpoint_state(&self, checkpoint: Checkpoint) -> Result<Option<Arc<BeaconState<P>>>> {
-        self.snapshot().checkpoint_state(checkpoint)
+    pub fn checkpoint_state_blocking(
+        &self,
+        checkpoint: Checkpoint,
+    ) -> Result<Option<Arc<BeaconState<P>>>> {
+        self.snapshot().checkpoint_state_blocking(checkpoint)
     }
 
     // The [Eth Beacon Node API specification] does not say if `GET /eth/v2/debug/beacon/heads`
@@ -283,12 +293,60 @@ where
     }
 
     #[must_use]
+    pub fn is_last_slot_of_epoch(&self) -> bool {
+        let store = self.store_snapshot();
+
+        store.slot() == misc::compute_start_slot_at_epoch::<P>(store.current_epoch() + 1) - 1
+    }
+
+    #[must_use]
+    #[instrument(level = "debug", skip_all)]
     pub fn state_by_chain_link(&self, chain_link: &ChainLink<P>) -> Arc<BeaconState<P>> {
         chain_link.state(&self.store_snapshot())
     }
 
-    pub fn state_at_slot(&self, slot: Slot) -> Result<Option<WithStatus<Arc<BeaconState<P>>>>> {
-        self.snapshot().state_at_slot(slot)
+    pub fn state_at_slot_blocking(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<WithStatus<Arc<BeaconState<P>>>>> {
+        self.snapshot().state_at_slot_blocking(slot)
+    }
+
+    pub fn state_at_slot_cached_blocking(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<WithStatus<Arc<BeaconState<P>>>>> {
+        let store = self.store_snapshot();
+
+        if slot < store.finalized_slot() {
+            let state_from_cache = self.state_at_slot_cache().get_or_try_init(slot, || {
+                Ok(self
+                    .state_at_slot_blocking(slot)?
+                    .map(|with_status| with_status.value))
+            })?;
+
+            if let Some(state) = state_from_cache {
+                return Ok(Some(WithStatus::valid(state, true)));
+            }
+        }
+
+        let store_epoch = store.current_epoch();
+        let requested_epoch = misc::compute_epoch_at_slot::<P>(slot);
+        let max_allowed_epoch = store_epoch + P::MinSeedLookahead::U64;
+
+        // If it is the last slot of an epoch,
+        // state at this slot can be used to precompute states for next + P::MIN_SEED_LOOKAHEAD epoch
+        if !(requested_epoch == max_allowed_epoch + 1 && self.is_last_slot_of_epoch()) {
+            ensure!(
+                requested_epoch <= max_allowed_epoch,
+                Error::EpochTooFarInTheFuture {
+                    requested_epoch,
+                    store_epoch,
+                },
+            );
+        }
+
+        self.state_at_slot_blocking(slot)
     }
 
     pub fn state_before_or_at_slot(
@@ -322,7 +380,7 @@ where
         Ok(None)
     }
 
-    pub fn exibits_equivocation(&self, block: &Arc<SignedBeaconBlock<P>>) -> bool {
+    pub fn exhibits_equivocation(&self, block: &Arc<SignedBeaconBlock<P>>) -> bool {
         let block_slot = block.message().slot();
         let store = self.store_snapshot();
 
@@ -333,8 +391,8 @@ where
         let block_proposer_index = block.message().proposer_index();
         let block_root = block.message().hash_tree_root();
 
-        store.exibits_equivocation_on_blobs(block_slot, block_proposer_index, block_root)
-            || store.exibits_equivocation_on_blocks(block_slot, block_proposer_index, block_root)
+        store.exhibits_equivocation_on_blobs(block_slot, block_proposer_index, block_root)
+            || store.exhibits_equivocation_on_blocks(block_slot, block_proposer_index, block_root)
     }
 
     pub fn check_block_root(&self, block_root: H256) -> Result<Option<WithStatus<H256>>> {
@@ -448,7 +506,7 @@ where
                     let block_kzg_commitment_indices = block
                         .message()
                         .body()
-                        .post_deneb()
+                        .with_blob_kzg_commitments()
                         .map(|body| {
                             (0..)
                                 .zip(body.blob_kzg_commitments())
@@ -479,69 +537,182 @@ where
             .collect()
     }
 
-    pub fn preprocessed_state_at_current_slot(&self) -> Result<Arc<BeaconState<P>>> {
-        let store = self.store_snapshot();
-        let head = store.head();
+    pub fn data_column_sidecars_by_ids(
+        &self,
+        data_column_ids: impl IntoIterator<Item = DataColumnIdentifier> + Send,
+    ) -> Result<Vec<Arc<DataColumnSidecar<P>>>> {
+        let snapshot = self.snapshot();
+        let storage = self.storage();
 
-        self.state_cache()
-            .state_at_slot(&store, head.block_root, store.slot())
+        let data_columns = data_column_ids
+            .into_iter()
+            .map(
+                |data_column_id| match snapshot.cached_data_column_sidecar_by_id(data_column_id) {
+                    Some(data_column_sidecar) => Ok(Some(data_column_sidecar)),
+                    None => storage.data_column_sidecar_by_id(data_column_id),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect_vec();
+
+        Ok(data_columns)
     }
 
-    pub fn preprocessed_state_at_next_slot(&self) -> Result<Arc<BeaconState<P>>> {
+    pub fn data_column_sidecars_by_root(
+        &self,
+        block_root: H256,
+    ) -> Result<Vec<Arc<DataColumnSidecar<P>>>> {
+        self.data_column_sidecars_by_ids(
+            (0..P::NumberOfColumns::U64).map(|index| DataColumnIdentifier { block_root, index }),
+        )
+    }
+
+    pub fn data_column_sidecars_by_range(
+        &self,
+        range: Range<Slot>,
+        columns: &[ColumnIndex],
+        max_request_data_column_sidecars: usize,
+    ) -> Result<Vec<Arc<DataColumnSidecar<P>>>> {
+        let canonical_chain_blocks = self.blocks_by_range(range)?;
+
+        let data_column_ids = canonical_chain_blocks
+            .iter()
+            .filter_map(|BlockWithRoot { block, root }| {
+                block.phase().is_peerdas_activated().then_some({
+                    columns.iter().copied().map(|index| DataColumnIdentifier {
+                        index,
+                        block_root: *root,
+                    })
+                })
+            })
+            .flatten()
+            .take(max_request_data_column_sidecars);
+
+        self.data_column_sidecars_by_ids(data_column_ids)
+    }
+
+    pub async fn preprocessed_state_at_current_slot(&self) -> Result<Arc<BeaconState<P>>> {
+        let store = self.store_snapshot();
+        let pubkey_cache = self.pubkey_cache().clone_arc();
+        let state_cache = self.state_cache().clone_arc();
+
+        tokio::task::spawn_blocking(move || {
+            state_cache.state_at_slot(&pubkey_cache, &store, store.head().block_root, store.slot())
+        })
+        .await?
+    }
+
+    pub fn preprocessed_state_at_current_slot_blocking(&self) -> Result<Arc<BeaconState<P>>> {
         let store = self.store_snapshot();
         let head = store.head();
 
         self.state_cache()
-            .state_at_slot(&store, head.block_root, store.slot() + 1)
+            .state_at_slot(self.pubkey_cache(), &store, head.block_root, store.slot())
+    }
+
+    pub fn preprocessed_state_at_next_slot_blocking(&self) -> Result<Arc<BeaconState<P>>> {
+        let store = self.store_snapshot();
+        let head = store.head();
+
+        self.state_cache().state_at_slot(
+            self.pubkey_cache(),
+            &store,
+            head.block_root,
+            store.slot() + 1,
+        )
     }
 
     // The `block_root` and `state` parameters are needed
     // to avoid a race condition in `Validator::slot_head`.
-    pub fn preprocessed_state_post_block(
+    pub fn preprocessed_state_post_block_blocking(
         &self,
         block_root: H256,
         slot: Slot,
     ) -> Result<Arc<BeaconState<P>>> {
         let store = self.store_snapshot();
+        let pubkey_cache = self.pubkey_cache();
+        let state_cache = self.state_cache();
 
-        if let Some(state) = self
-            .state_cache()
-            .try_state_at_slot(&store, block_root, slot)?
+        if let Some(state) =
+            state_cache.try_state_at_slot(pubkey_cache, &store, block_root, slot, true)?
         {
             return Ok(state);
         }
 
         if let Some(state) = self.storage().state_post_block(block_root)? {
-            return self
-                .state_cache()
-                .process_slots(&store, state, block_root, slot);
+            return state_cache.process_slots(pubkey_cache, &store, state, block_root, slot);
         }
 
         bail!(Error::StateNotFound { block_root })
     }
 
-    pub fn preprocessed_state_at_epoch(
+    // Modified `preprocessed_state_post_block` method to be used for block production.
+    pub async fn preprocessed_state_for_block_production(
+        &self,
+        block_root: H256,
+        slot: Slot,
+    ) -> Result<Arc<BeaconState<P>>> {
+        let store = self.store_snapshot();
+        let pubkey_cache = self.pubkey_cache().clone_arc();
+        let state_cache = self.state_cache().clone_arc();
+        let storage = self.owned_storage();
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(state) = state_cache.try_state_at_slot_for_block_sync(
+                &pubkey_cache,
+                &store,
+                block_root,
+                slot,
+            )? {
+                return Ok(state);
+            }
+
+            if let Some(state) = storage.state_post_block(block_root)? {
+                return state_cache.process_slots(&pubkey_cache, &store, state, block_root, slot);
+            }
+
+            bail!(Error::StateNotFound { block_root })
+        })
+        .await?
+    }
+
+    pub async fn preprocessed_state_at_epoch(
         &self,
         requested_epoch: Epoch,
     ) -> Result<WithStatus<Arc<BeaconState<P>>>> {
         let store = self.store_snapshot();
         let store_epoch = store.current_epoch();
+        let max_allowed_epoch = store_epoch + P::MinSeedLookahead::U64;
 
-        ensure!(
-            requested_epoch <= store_epoch + P::MIN_SEED_LOOKAHEAD,
-            Error::EpochTooFarInTheFuture {
-                requested_epoch,
-                store_epoch,
-            },
-        );
+        // If it is the last slot of an epoch,
+        // state at this slot can be used to precompute states for next + P::MIN_SEED_LOOKAHEAD epoch
+        if !(requested_epoch == max_allowed_epoch + 1 && self.is_last_slot_of_epoch()) {
+            ensure!(
+                requested_epoch <= max_allowed_epoch,
+                Error::EpochTooFarInTheFuture {
+                    requested_epoch,
+                    store_epoch,
+                },
+            );
+        }
 
-        let head = store.head();
         let requested_slot = misc::compute_start_slot_at_epoch::<P>(requested_epoch);
+        let pubkey_cache = self.pubkey_cache().clone_arc();
+        let state_cache = self.state_cache().clone_arc();
 
-        let state = self
-            .state_cache()
-            .state_at_slot(&store, head.block_root, requested_slot)
-            .unwrap_or_else(|_| head.state(&store));
+        let state = tokio::task::spawn_blocking(move || {
+            let head = store.head();
+
+            state_cache
+                .state_at_slot(&pubkey_cache, &store, head.block_root, requested_slot)
+                .unwrap_or_else(|_| head.state(&store))
+        })
+        .await?;
+
+        let store = self.store_snapshot();
+        let head = store.head();
 
         Ok(WithStatus {
             value: state,
@@ -556,8 +727,9 @@ where
     }
 
     #[must_use]
-    pub fn snapshot(&self) -> Snapshot<P> {
+    pub fn snapshot(&self) -> Snapshot<'_, P> {
         Snapshot {
+            pubkey_cache: self.pubkey_cache().clone_arc(),
             store_snapshot: self.store_snapshot(),
             state_cache: self.state_cache().clone_arc(),
             storage: self.storage(),
@@ -568,8 +740,28 @@ where
         self.store_snapshot().min_checked_block_availability_epoch()
     }
 
-    pub fn min_checked_data_availability_epoch(&self) -> Epoch {
-        self.store_snapshot().min_checked_data_availability_epoch()
+    pub fn min_checked_blob_availability_epoch(&self) -> Epoch {
+        self.store_snapshot().min_checked_blob_availability_epoch()
+    }
+
+    pub fn min_checked_data_column_availability_epoch(&self) -> Epoch {
+        self.store_snapshot()
+            .min_checked_data_column_availability_epoch()
+    }
+
+    pub fn min_checked_data_availability_epoch(&self, slot: Slot) -> Epoch {
+        self.store_snapshot()
+            .min_checked_data_availability_epoch(slot)
+    }
+
+    #[must_use]
+    pub fn unfinalized_chain_link_by_execution_block_hash(
+        &self,
+        block_hash: ExecutionBlockHash,
+    ) -> Option<ChainLink<P>> {
+        self.store_snapshot()
+            .unfinalized_chain_link_by_execution_block_hash(block_hash)
+            .cloned()
     }
 
     pub fn validate_blob_sidecar_with_state(
@@ -578,7 +770,7 @@ where
         block_seen: bool,
         origin: &BlobSidecarOrigin,
         parent_fn: impl FnOnce() -> Option<(Arc<SignedBeaconBlock<P>>, PayloadStatus)>,
-        state_fn: impl FnOnce() -> Result<Arc<BeaconState<P>>>,
+        state_fn: impl FnOnce() -> Option<Arc<BeaconState<P>>>,
     ) -> Result<BlobSidecarAction<P>> {
         self.store_snapshot().validate_blob_sidecar_with_state(
             blob_sidecar,
@@ -587,6 +779,28 @@ where
             parent_fn,
             state_fn,
         )
+    }
+
+    #[instrument(ret(level = "debug"), level = "debug", skip_all)]
+    pub fn validate_data_column_sidecar_with_state(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        block_seen: bool,
+        origin: &DataColumnSidecarOrigin,
+        validate_block_presence: bool,
+        parent_fn: impl FnOnce() -> Option<(Arc<SignedBeaconBlock<P>>, PayloadStatus)>,
+        state_fn: impl FnOnce() -> Option<Arc<BeaconState<P>>>,
+    ) -> Result<DataColumnSidecarAction<P>> {
+        self.store_snapshot()
+            .validate_data_column_sidecar_with_state(
+                data_column_sidecar,
+                block_seen,
+                origin,
+                validate_block_presence,
+                parent_fn,
+                state_fn,
+                None,
+            )
     }
 }
 
@@ -756,9 +970,10 @@ pub struct BlockWithRoot<P: Preset> {
 /// [wiki]: https://github.com/facebook/rocksdb/wiki/Snapshot/e09da0053d05583919354cfaf834b8e8edd97be8
 #[expect(clippy::struct_field_names)]
 pub struct Snapshot<'storage, P: Preset> {
+    pubkey_cache: Arc<PubkeyCache>,
     // Use a `Guard` instead of an owned snapshot unlike in tasks based on the intuition that
     // `Snapshot`s will be less common than tasks.
-    store_snapshot: Guard<Arc<Store<P>>>,
+    store_snapshot: Guard<Arc<Store<P, Storage<P>>>>,
     state_cache: Arc<StateCacheProcessor<P>>,
     storage: &'storage Storage<P>,
 }
@@ -775,7 +990,10 @@ impl<P: Preset> Snapshot<'_, P> {
             .map(ChainLink::slot)
     }
 
-    pub fn checkpoint_state(&self, checkpoint: Checkpoint) -> Result<Option<Arc<BeaconState<P>>>> {
+    pub fn checkpoint_state_blocking(
+        &self,
+        checkpoint: Checkpoint,
+    ) -> Result<Option<Arc<BeaconState<P>>>> {
         if let Some(state) = self.store_snapshot.checkpoint_state(checkpoint) {
             return Ok(Some(state.clone_arc()));
         }
@@ -783,8 +1001,13 @@ impl<P: Preset> Snapshot<'_, P> {
         let Checkpoint { epoch, root } = checkpoint;
         let slot = misc::compute_start_slot_at_epoch::<P>(epoch);
 
-        self.state_cache
-            .try_state_at_slot(&self.store_snapshot, root, slot)
+        self.state_cache.try_state_at_slot(
+            &self.pubkey_cache,
+            &self.store_snapshot,
+            root,
+            slot,
+            self.is_forward_synced(),
+        )
     }
 
     #[must_use]
@@ -795,6 +1018,11 @@ impl<P: Preset> Snapshot<'_, P> {
     #[must_use]
     pub fn finalized_epoch(&self) -> Epoch {
         self.store_snapshot.finalized_epoch()
+    }
+
+    #[must_use]
+    pub fn finalized_slot(&self) -> Slot {
+        self.store_snapshot.finalized_slot()
     }
 
     #[must_use]
@@ -868,13 +1096,19 @@ impl<P: Preset> Snapshot<'_, P> {
     //                      Beacon Chain Explorer used at the time. Consider adding a check to prevent
     //                      this method for computing states for future slots. The Eth Beacon Node API
     //                      specification does not say if this is allowed.
-    pub fn state_at_slot(&self, slot: Slot) -> Result<Option<WithStatus<Arc<BeaconState<P>>>>> {
+    pub fn state_at_slot_blocking(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<WithStatus<Arc<BeaconState<P>>>>> {
         let store = &self.store_snapshot;
 
         if let Some(chain_link) = store.chain_link_before_or_at(slot) {
-            let state = self
-                .state_cache
-                .state_at_slot(store, chain_link.block_root, slot)?;
+            let state = self.state_cache.state_at_slot(
+                &self.pubkey_cache,
+                store,
+                chain_link.block_root,
+                slot,
+            )?;
 
             return Ok(Some(WithStatus {
                 value: state,
@@ -886,7 +1120,7 @@ impl<P: Preset> Snapshot<'_, P> {
         if let Some(state) = self.storage.stored_state(slot)? {
             let finalized = store.is_slot_finalized(state.slot());
             return Ok(Some(WithStatus::valid(state, finalized)));
-        };
+        }
 
         Ok(None)
     }
@@ -934,6 +1168,15 @@ impl<P: Preset> Snapshot<'_, P> {
     ) -> Option<Arc<BlobSidecar<P>>> {
         self.store_snapshot.cached_blob_sidecar_by_id(blob_id)
     }
+
+    #[must_use]
+    pub(crate) fn cached_data_column_sidecar_by_id(
+        &self,
+        data_column_id: DataColumnIdentifier,
+    ) -> Option<Arc<DataColumnSidecar<P>>> {
+        self.store_snapshot
+            .cached_data_column_sidecar_by_id(data_column_id)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -957,4 +1200,55 @@ enum Error {
     },
     #[error("state not found in fork choice store: {block_root:?}")]
     StateNotFound { block_root: H256 },
+}
+
+#[cfg(test)]
+mod tests {
+    use types::{config::Config, preset::Minimal};
+
+    use crate::specialized::TestController;
+
+    use super::*;
+
+    #[test]
+    fn test_state_at_slot_cached_allowed_epoch_boundaries() {
+        let config = Arc::new(Config::minimal());
+        let genesis_state = factory::min_genesis_state::<Minimal>(&config, &PubkeyCache::default())
+            .expect("should build beacon state")
+            .0;
+        let genesis_block = Arc::new(genesis::beacon_block(&genesis_state));
+        let (controller, _mutator_handle) =
+            TestController::quiet(config, genesis_block, genesis_state);
+
+        controller
+            .state_at_slot_cached_blocking(0)
+            .expect("should get state at slot 0");
+
+        controller.on_slot(6);
+        controller.wait_for_tasks();
+
+        controller
+            .state_at_slot_cached_blocking(15)
+            .expect("should get state at slot 15");
+        assert!(controller.state_at_slot_cached_blocking(16).is_err());
+
+        controller.on_slot(7);
+        controller.wait_for_tasks();
+
+        controller
+            .state_at_slot_cached_blocking(16)
+            .expect("should get state at slot 16");
+        controller
+            .state_at_slot_cached_blocking(23)
+            .expect("should get state at slot 23");
+        assert!(controller.state_at_slot_cached_blocking(24).is_err());
+
+        controller.on_slot(8);
+        controller.wait_for_tasks();
+
+        controller
+            .state_at_slot_cached_blocking(23)
+            .expect("should get state at slot 23");
+        assert!(controller.state_at_slot_cached_blocking(24).is_err());
+    }
 }

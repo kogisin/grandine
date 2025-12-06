@@ -17,7 +17,7 @@ use anyhow::Result;
 use derivative::Derivative;
 use derive_more::From;
 use execution_engine::ExecutionEngine;
-use log::debug;
+use logging::trace_with_peers;
 use parking_lot::{Condvar, Mutex};
 use std_ext::ArcExt as _;
 use types::preset::Preset;
@@ -26,7 +26,9 @@ use crate::{
     tasks::{
         AggregateAndProofTask, AttestationTask, AttesterSlashingTask, BlobSidecarTask,
         BlockAttestationsTask, BlockTask, BlockVerifyForGossipTask, CheckpointStateTask,
-        PersistBlobSidecarsTask, PreprocessStateTask, Run,
+        DataColumnSidecarTask, PersistBlobSidecarsTask, PersistDataColumnSidecarsTask,
+        PersistPubkeyCacheTask, PreprocessStateTask, RetryDataColumnSidecarTask, Run,
+        StateAtSlotCacheFlushTask,
     },
     wait::Wait,
 };
@@ -68,11 +70,12 @@ impl<P: Preset, E, W> ThreadPool<P, E, W> {
         self.shared.condvar.notify_one();
     }
 
-    pub fn task_counts(&self) -> (usize, usize) {
+    pub fn task_counts(&self) -> (usize, usize, usize) {
         let critical = self.shared.critical.lock();
         let high = critical.high_priority_tasks.len();
+        let mid = critical.mid_priority_tasks.len();
         let low = critical.low_priority_tasks.len();
-        (high, low)
+        (high, mid, low)
     }
 }
 
@@ -94,30 +97,45 @@ pub struct Critical<P: Preset, E, W> {
     // allocation permanently. An unrolled linked list (other than `crossbeam_queue::SegQueue`)
     // might be the best of both worlds.
     high_priority_tasks: VecDeque<HighPriorityTask<P, E, W>>,
+    mid_priority_tasks: VecDeque<MidPriorityTask<P, W>>,
     low_priority_tasks: VecDeque<LowPriorityTask<P, W>>,
 }
 
-// TODO(feature/deneb): Figure out if `BlobSidecarTask` should be a high priority task.
 #[derive(From)]
 enum HighPriorityTask<P: Preset, E, W> {
+    BlobSidecar(BlobSidecarTask<P, W>),
     Block(BlockTask<P, E, W>),
     BlockForGossip(BlockVerifyForGossipTask<P, W>),
-    BlobSidecar(BlobSidecarTask<P, W>),
     // `CheckpointStateTask` is a high priority task to prevent attestation tasks from delaying
     // processing of blocks that are waiting for checkpoint states. However, this may result in a
     // `CheckpointStateTask` being prioritized when it's only needed to verify attestations.
     CheckpointState(CheckpointStateTask<P, W>),
     PreprocessState(PreprocessStateTask<P, W>),
+    RetryDataColumnSidecar(RetryDataColumnSidecarTask<P, W>),
+}
+
+#[derive(From)]
+enum MidPriorityTask<P: Preset, W> {
+    DataColumnSidecar(DataColumnSidecarTask<P, W>),
 }
 
 impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for HighPriorityTask<P, E, W> {
     fn run(self) {
         match self {
+            Self::BlobSidecar(task) => task.run(),
             Self::Block(task) => task.run(),
             Self::BlockForGossip(task) => task.run(),
-            Self::BlobSidecar(task) => task.run(),
             Self::CheckpointState(task) => task.run(),
             Self::PreprocessState(task) => task.run(),
+            Self::RetryDataColumnSidecar(task) => task.run(),
+        }
+    }
+}
+
+impl<P: Preset, W> Run for MidPriorityTask<P, W> {
+    fn run(self) {
+        match self {
+            Self::DataColumnSidecar(task) => task.run(),
         }
     }
 }
@@ -129,6 +147,9 @@ enum LowPriorityTask<P: Preset, W> {
     BlockAttestations(BlockAttestationsTask<P, W>),
     AttesterSlashing(AttesterSlashingTask<P, W>),
     PersistBlobSidecarsTask(PersistBlobSidecarsTask<P, W>),
+    PersistPubkeyCacheTask(PersistPubkeyCacheTask<P, W>),
+    StateAtSlotCacheFlush(StateAtSlotCacheFlushTask<P>),
+    PersistDataColumnSidecarsTask(PersistDataColumnSidecarsTask<P, W>),
 }
 
 impl<P: Preset, W> Run for LowPriorityTask<P, W> {
@@ -139,6 +160,9 @@ impl<P: Preset, W> Run for LowPriorityTask<P, W> {
             Self::BlockAttestations(task) => task.run(),
             Self::AttesterSlashing(task) => task.run(),
             Self::PersistBlobSidecarsTask(task) => task.run(),
+            Self::PersistPubkeyCacheTask(task) => task.run(),
+            Self::StateAtSlotCacheFlush(task) => task.run(),
+            Self::PersistDataColumnSidecarsTask(task) => task.run(),
         }
     }
 }
@@ -162,6 +186,12 @@ impl<P: Preset, E, W> Spawn<P, E, W> for BlockVerifyForGossipTask<P, W> {
 impl<P: Preset, E, W> Spawn<P, E, W> for BlobSidecarTask<P, W> {
     fn spawn(self, critical: &mut Critical<P, E, W>) {
         critical.high_priority_tasks.push_back(self.into())
+    }
+}
+
+impl<P: Preset, E, W> Spawn<P, E, W> for DataColumnSidecarTask<P, W> {
+    fn spawn(self, critical: &mut Critical<P, E, W>) {
+        critical.mid_priority_tasks.push_back(self.into())
     }
 }
 
@@ -207,8 +237,32 @@ impl<P: Preset, E, W> Spawn<P, E, W> for PersistBlobSidecarsTask<P, W> {
     }
 }
 
+impl<P: Preset, E, W> Spawn<P, E, W> for PersistPubkeyCacheTask<P, W> {
+    fn spawn(self, critical: &mut Critical<P, E, W>) {
+        critical.low_priority_tasks.push_back(self.into())
+    }
+}
+
+impl<P: Preset, E, W> Spawn<P, E, W> for RetryDataColumnSidecarTask<P, W> {
+    fn spawn(self, critical: &mut Critical<P, E, W>) {
+        critical.high_priority_tasks.push_back(self.into())
+    }
+}
+
+impl<P: Preset, E, W> Spawn<P, E, W> for StateAtSlotCacheFlushTask<P> {
+    fn spawn(self, critical: &mut Critical<P, E, W>) {
+        critical.low_priority_tasks.push_back(self.into())
+    }
+}
+
+impl<P: Preset, E, W> Spawn<P, E, W> for PersistDataColumnSidecarsTask<P, W> {
+    fn spawn(self, critical: &mut Critical<P, E, W>) {
+        critical.low_priority_tasks.push_back(self.into())
+    }
+}
+
 fn run_worker<P: Preset, E: ExecutionEngine<P> + Send, W>(shared: &Shared<P, E, W>) {
-    debug!("thread {} starting", thread_name());
+    trace_with_peers!("thread {} starting", thread_name());
 
     'outer: loop {
         let mut critical = shared.critical.lock();
@@ -220,14 +274,21 @@ fn run_worker<P: Preset, E: ExecutionEngine<P> + Send, W>(shared: &Shared<P, E, 
 
             if let Some(task) = critical.high_priority_tasks.pop_front() {
                 drop(critical);
-                debug!("thread {} received high priority task", thread_name());
+                trace_with_peers!("thread {} received high priority task", thread_name());
+                task.run_and_handle_panics();
+                continue 'outer;
+            }
+
+            if let Some(task) = critical.mid_priority_tasks.pop_front() {
+                drop(critical);
+                trace_with_peers!("thread {} received mid priority task", thread_name());
                 task.run_and_handle_panics();
                 continue 'outer;
             }
 
             if let Some(task) = critical.low_priority_tasks.pop_front() {
                 drop(critical);
-                debug!("thread {} received low priority task", thread_name());
+                trace_with_peers!("thread {} received low priority task", thread_name());
                 task.run_and_handle_panics();
                 continue 'outer;
             }
@@ -236,7 +297,7 @@ fn run_worker<P: Preset, E: ExecutionEngine<P> + Send, W>(shared: &Shared<P, E, 
         }
     }
 
-    debug!("thread {} stopping", thread_name());
+    trace_with_peers!("thread {} stopping", thread_name());
 }
 
 // Keeping the `Thread` and its name around as locals in `run_worker` seems to add a small amount of

@@ -1,6 +1,5 @@
-use core::ops::RangeBounds;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
 
@@ -11,10 +10,10 @@ use dedicated_executor::DedicatedExecutor;
 use eth1_api::ApiController;
 use features::Feature;
 use fork_choice_control::Wait;
-use log::warn;
 use prometheus_metrics::Metrics;
 use ssz::ContiguousList;
 use std_ext::ArcExt as _;
+use tracing::instrument;
 use types::{
     combined::{Attestation as CombinedAttestation, BeaconState},
     config::Config,
@@ -24,6 +23,7 @@ use types::{
     },
     preset::Preset,
 };
+use validator_statistics::ValidatorStatistics;
 
 use crate::{
     attestation_agg_pool::{
@@ -37,13 +37,12 @@ use crate::{
     misc::PoolTask,
 };
 
-use super::conversion::convert_attestation_for_pool;
-
 pub struct Manager<P: Preset, W: Wait> {
     controller: ApiController<P, W>,
     dedicated_executor: Arc<DedicatedExecutor>,
     metrics: Option<Arc<Metrics>>,
     pool: Arc<Pool<P>>,
+    validator_statistics: Option<Arc<ValidatorStatistics>>,
 }
 
 impl<P: Preset, W: Wait> Manager<P, W> {
@@ -52,6 +51,7 @@ impl<P: Preset, W: Wait> Manager<P, W> {
         controller: ApiController<P, W>,
         dedicated_executor: Arc<DedicatedExecutor>,
         metrics: Option<Arc<Metrics>>,
+        validator_statistics: Option<Arc<ValidatorStatistics>>,
     ) -> Arc<Self> {
         let chain_config = controller.chain_config().clone_arc();
 
@@ -60,6 +60,7 @@ impl<P: Preset, W: Wait> Manager<P, W> {
             dedicated_executor,
             metrics,
             pool: Arc::new(Pool::new(chain_config)),
+            validator_statistics,
         })
     }
 
@@ -149,29 +150,26 @@ impl<P: Preset, W: Wait> Manager<P, W> {
         });
     }
 
-    pub fn insert_attestation(&self, wait_group: W, attestation: &CombinedAttestation<P>) {
-        match convert_attestation_for_pool(&self.controller, (*attestation).clone()) {
-            Ok(attestation) => {
-                self.spawn_detached(InsertAttestationTask {
-                    wait_group,
-                    pool: self.pool.clone_arc(),
-                    attestation: Arc::new(attestation),
-                    metrics: self.metrics.clone(),
-                });
-            }
-            Err(error) => {
-                warn!("Failed to insert attestation to pool: {error:?}");
-            }
-        }
+    pub fn insert_attestation(
+        &self,
+        wait_group: W,
+        attestation: Arc<CombinedAttestation<P>>,
+        attester_index: Option<ValidatorIndex>,
+    ) {
+        self.spawn_detached(InsertAttestationTask {
+            wait_group,
+            pool: self.pool.clone_arc(),
+            controller: self.controller.clone_arc(),
+            attestation,
+            attester_index,
+            metrics: self.metrics.clone(),
+            validator_statistics: self.validator_statistics.clone(),
+        });
     }
 
-    pub async fn has_registered_validators_proposing_in_slots(
-        &self,
-        range: impl RangeBounds<Slot> + Send,
-    ) -> bool {
-        self.pool
-            .has_registered_validators_proposing_in_slots(range)
-            .await
+    #[instrument(level = "debug", skip_all)]
+    pub async fn is_registered_validator(&self, validator_index: ValidatorIndex) -> bool {
+        self.pool.is_registered_validator(validator_index).await
     }
 
     pub fn pack_proposable_attestations(&self) {
@@ -180,6 +178,10 @@ impl<P: Preset, W: Wait> Manager<P, W> {
             controller: self.controller.clone_arc(),
             metrics: self.metrics.clone(),
         });
+    }
+
+    pub async fn registered_validator_indices(&self) -> HashSet<ValidatorIndex> {
+        self.pool.registered_validator_indices().await
     }
 
     pub fn set_committees_with_aggregators(
@@ -202,6 +204,7 @@ impl<P: Preset, W: Wait> Manager<P, W> {
             controller: self.controller.clone_arc(),
             pubkeys,
             prepared_proposer_indices,
+            validator_statistics: self.validator_statistics.clone(),
         });
     }
 

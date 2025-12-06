@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use bls::{traits::CachedPublicKey as _, CachedPublicKey, SignatureBytes};
+use bls::{PublicKeyBytes, SignatureBytes};
 use helper_functions::{
     accessors::{
         attestation_epoch, get_beacon_proposer_index, get_current_epoch, get_randao_mix,
@@ -18,7 +18,9 @@ use helper_functions::{
     verifier::{MultiVerifier, SingleVerifier, Triple, Verifier, VerifierOption},
 };
 use itertools::Itertools as _;
-use rayon::iter::{IntoParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _};
+use pubkey_cache::PubkeyCache;
+#[cfg(not(target_os = "zkvm"))]
+use rayon::iter::ParallelIterator as _;
 use ssz::SszHash as _;
 use typenum::Unsigned as _;
 use types::{
@@ -42,7 +44,7 @@ use crate::unphased::Error;
 
 pub enum CombinedDeposit {
     NewValidator {
-        pubkey: CachedPublicKey,
+        pubkey: PublicKeyBytes,
         withdrawal_credentials: Vec<H256>,
         amounts: GweiVec,
         signatures: Vec<SignatureBytes>,
@@ -70,6 +72,7 @@ impl CombinedDeposit {
 }
 
 pub fn process_block_header_for_gossip<P: Preset>(
+    config: &Config,
     state: &impl BeaconState<P>,
     block: &impl BeaconBlock<P>,
 ) -> Result<()> {
@@ -95,7 +98,7 @@ pub fn process_block_header_for_gossip<P: Preset>(
     );
 
     // > Verify that proposer index is the correct index
-    let computed = get_beacon_proposer_index(state)?;
+    let computed = get_beacon_proposer_index(config, state)?;
     let in_block = block.proposer_index();
 
     ensure!(
@@ -115,11 +118,13 @@ pub fn process_block_header_for_gossip<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_block_header<P: Preset>(
+    config: &Config,
     state: &mut impl BeaconState<P>,
     block: &impl BeaconBlock<P>,
 ) -> Result<()> {
-    process_block_header_for_gossip(state, block)?;
+    process_block_header_for_gossip(config, state, block)?;
 
     // > Cache current block as the new latest block
     *state.latest_block_header_mut() = BeaconBlockHeader {
@@ -140,8 +145,10 @@ pub fn process_block_header<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_randao<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl BeaconState<P>,
     body: &impl BeaconBlockBody<P>,
     mut verifier: impl Verifier,
@@ -150,14 +157,14 @@ pub fn process_randao<P: Preset>(
     let randao_reveal = body.randao_reveal();
 
     // > Verify RANDAO reveal
-    let proposer_index = get_beacon_proposer_index(state)?;
+    let proposer_index = get_beacon_proposer_index(config, state)?;
     let public_key = &state.validators().get(proposer_index)?.pubkey;
 
     if !verifier.has_option(VerifierOption::SkipRandaoVerification) {
         verifier.verify_singular(
             RandaoEpoch::from(epoch).signing_root(config, state),
             randao_reveal,
-            public_key,
+            pubkey_cache.get_or_insert(*public_key)?,
             SignatureKind::Randao,
         )?;
     }
@@ -175,6 +182,7 @@ pub fn process_randao<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_eth1_data<P: Preset>(
     state: &mut impl BeaconState<P>,
     body: &impl BeaconBlockBody<P>,
@@ -202,14 +210,22 @@ pub fn process_eth1_data<P: Preset>(
 
 pub fn validate_proposer_slashing<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     proposer_slashing: ProposerSlashing,
 ) -> Result<()> {
-    validate_proposer_slashing_with_verifier(config, state, proposer_slashing, SingleVerifier)
+    validate_proposer_slashing_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        proposer_slashing,
+        SingleVerifier,
+    )
 }
 
 pub fn validate_proposer_slashing_with_verifier<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     proposer_slashing: ProposerSlashing,
     mut verifier: impl Verifier,
@@ -261,7 +277,7 @@ pub fn validate_proposer_slashing_with_verifier<P: Preset>(
         verifier.verify_singular(
             signed_header.message.signing_root(config, state),
             signed_header.signature,
-            &proposer.pubkey,
+            pubkey_cache.get_or_insert(proposer.pubkey)?,
             SignatureKind::Block,
         )?;
     }
@@ -271,14 +287,22 @@ pub fn validate_proposer_slashing_with_verifier<P: Preset>(
 
 pub fn validate_attester_slashing<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     attester_slashing: &impl AttesterSlashing<P>,
 ) -> Result<Vec<ValidatorIndex>> {
-    validate_attester_slashing_with_verifier(config, state, attester_slashing, SingleVerifier)
+    validate_attester_slashing_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        attester_slashing,
+        SingleVerifier,
+    )
 }
 
 pub fn validate_attester_slashing_with_verifier<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     attester_slashing: &impl AttesterSlashing<P>,
     mut verifier: impl Verifier,
@@ -294,8 +318,15 @@ pub fn validate_attester_slashing_with_verifier<P: Preset>(
         Error::<P>::AttestationDataNotSlashable { data_1, data_2 },
     );
 
-    validate_received_indexed_attestation(config, state, attestation_1, &mut verifier)?;
-    validate_received_indexed_attestation(config, state, attestation_2, verifier)?;
+    validate_received_indexed_attestation(
+        config,
+        pubkey_cache,
+        state,
+        attestation_1,
+        &mut verifier,
+    )?;
+
+    validate_received_indexed_attestation(config, pubkey_cache, state, attestation_2, verifier)?;
 
     let current_epoch = get_current_epoch(state);
 
@@ -320,14 +351,16 @@ pub fn validate_attester_slashing_with_verifier<P: Preset>(
 
 pub fn validate_attestation<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     attestation: &Attestation<P>,
 ) -> Result<()> {
-    validate_attestation_with_verifier(config, state, attestation, SingleVerifier)
+    validate_attestation_with_verifier(config, pubkey_cache, state, attestation, SingleVerifier)
 }
 
 pub fn validate_attestation_with_verifier<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     attestation: &Attestation<P>,
     verifier: impl Verifier,
@@ -382,12 +415,20 @@ pub fn validate_attestation_with_verifier<P: Preset>(
     let indexed_attestation = get_indexed_attestation(state, attestation)?;
 
     // > Verify signature
-    validate_constructed_indexed_attestation(config, state, &indexed_attestation, verifier)
+    validate_constructed_indexed_attestation(
+        config,
+        pubkey_cache,
+        state,
+        &indexed_attestation,
+        verifier,
+    )
 }
 
 #[expect(clippy::too_many_lines)]
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn validate_deposits<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     deposits: impl IntoIterator<Item = Deposit>,
 ) -> Result<Vec<CombinedDeposit>> {
@@ -397,9 +438,9 @@ pub fn validate_deposits<P: Preset>(
         .into_values()
         .map(|deposits| {
             let (_, first_deposit) = deposits[0];
-            let existing_validator_index = index_of_public_key(state, first_deposit.data.pubkey);
-            let cached_public_key = CachedPublicKey::from(first_deposit.data.pubkey);
-            (existing_validator_index, cached_public_key, deposits)
+            let pubkey = first_deposit.data.pubkey;
+            let existing_validator_index = index_of_public_key(state, &pubkey);
+            (existing_validator_index, pubkey, deposits)
         })
         .collect_vec();
 
@@ -408,13 +449,12 @@ pub fn validate_deposits<P: Preset>(
     //
     // On our development machines `multi_verify` is a little slower but uses less CPU.
     // It will likely be faster than parallel verification on CPUs with fewer cores.
-    let required_signatures_valid = deposits_by_pubkey
-        .par_iter()
+    let required_signatures_valid = helper_functions::par_iter!(deposits_by_pubkey)
         .filter(|(existing_validator_index, _, _)| existing_validator_index.is_none())
-        .map(|(_, cached_public_key, deposits)| {
+        .map(|(_, pubkey, deposits)| {
             let (_, first_deposit) = deposits[0];
 
-            let public_key = *cached_public_key.decompress()?;
+            let public_key = pubkey_cache.get_or_insert(*pubkey)?;
 
             // > Verify the deposit signature (proof of possession)
             // > which is not checked by the deposit contract
@@ -433,9 +473,8 @@ pub fn validate_deposits<P: Preset>(
         .and_then(|triples| MultiVerifier::from(triples).finish())
         .is_ok();
 
-    let mut combined_deposits = deposits_by_pubkey
-        .into_par_iter()
-        .map(|(existing_validator_index, cached_public_key, deposits)| {
+    let mut combined_deposits = helper_functions::into_par_iter!(deposits_by_pubkey)
+        .map(|(existing_validator_index, pubkey, deposits)| {
             for (position, deposit) in deposits.iter().copied() {
                 // > Verify the Merkle branch
                 verify_deposit_merkle_branch(
@@ -478,8 +517,11 @@ pub fn validate_deposits<P: Preset>(
                     let deposit_message = DepositMessage::from(deposit.data);
 
                     // > Fork-agnostic domain since deposits are valid across forks
-                    deposit_message
-                        .verify(config, deposit.data.signature, &cached_public_key)
+                    pubkey_cache
+                        .get_or_insert(pubkey)
+                        .and_then(|pubkey| {
+                            deposit_message.verify(config, deposit.data.signature, pubkey)
+                        })
                         .is_ok()
                 })
             };
@@ -511,7 +553,7 @@ pub fn validate_deposits<P: Preset>(
                 .multiunzip();
 
                 CombinedDeposit::NewValidator {
-                    pubkey: pubkey.into(),
+                    pubkey,
                     withdrawal_credentials,
                     amounts,
                     signatures,
@@ -549,11 +591,18 @@ pub fn verify_deposit_merkle_branch<P: Preset>(
 
 pub fn process_voluntary_exit<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl BeaconState<P>,
     signed_voluntary_exit: SignedVoluntaryExit,
     verifier: impl Verifier,
 ) -> Result<()> {
-    validate_voluntary_exit_with_verifier(config, state, signed_voluntary_exit, verifier)?;
+    validate_voluntary_exit_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        signed_voluntary_exit,
+        verifier,
+    )?;
 
     // > Initiate exit
     initiate_validator_exit(config, state, signed_voluntary_exit.message.validator_index)
@@ -561,14 +610,22 @@ pub fn process_voluntary_exit<P: Preset>(
 
 pub fn validate_voluntary_exit<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     signed_voluntary_exit: SignedVoluntaryExit,
 ) -> Result<()> {
-    validate_voluntary_exit_with_verifier(config, state, signed_voluntary_exit, SingleVerifier)
+    validate_voluntary_exit_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        signed_voluntary_exit,
+        SingleVerifier,
+    )
 }
 
 pub fn validate_voluntary_exit_with_verifier<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     signed_voluntary_exit: SignedVoluntaryExit,
     mut verifier: impl Verifier,
@@ -620,7 +677,7 @@ pub fn validate_voluntary_exit_with_verifier<P: Preset>(
     verifier.verify_singular(
         voluntary_exit.signing_root(config, state),
         signed_voluntary_exit.signature,
-        &validator.pubkey,
+        pubkey_cache.get_or_insert(validator.pubkey)?,
         SignatureKind::VoluntaryExit,
     )?;
 

@@ -1,18 +1,21 @@
 use core::ops::Not as _;
 
-use anyhow::{anyhow, Error as AnyhowError, Result};
-use bls::traits::CachedPublicKey as _;
+use anyhow::Result;
 use execution_engine::ExecutionEngine;
 use helper_functions::{
     accessors,
     error::SignatureKind,
-    misc, phase0, predicates,
+    misc, par_utils, phase0, predicates,
     signing::{RandaoEpoch, SignForSingleFork as _},
     slot_report::SlotReport,
     verifier::{NullVerifier, Triple, Verifier, VerifierOption},
 };
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use pubkey_cache::PubkeyCache;
+#[cfg(not(target_os = "zkvm"))]
+use rayon::iter::ParallelIterator as _;
 use ssz::Hc;
+#[cfg(target_os = "zkvm")]
+use ssz::SszHash;
 use types::{
     bellatrix::{beacon_state::BeaconState, containers::SignedBeaconBlock},
     config::Config,
@@ -28,6 +31,7 @@ use crate::{
 #[expect(clippy::too_many_arguments)]
 pub fn state_transition<P: Preset, V: Verifier + Send>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut Hc<BeaconState<P>>,
     signed_block: &SignedBeaconBlock<P>,
     process_slots: ProcessSlots,
@@ -40,26 +44,30 @@ pub fn state_transition<P: Preset, V: Verifier + Send>(
 
     // > Process slots (including those with no blocks) since block
     if process_slots.should_process(state, block) {
-        slot_processing::process_slots(config, state, block.slot)?;
+        slot_processing::process_slots(config, pubkey_cache, state, block.slot)?;
     }
 
     let verify_signatures = V::IS_NULL.not().then(|| {
         let state = state.clone();
 
         // > Verify signature
-        move || verify_signatures(config, &state, signed_block, verifier)
+        move || verify_signatures(config, pubkey_cache, &state, signed_block, verifier)
     });
 
     let process_block = || {
         // > Process block
         block_processing::custom_process_block(
             config,
+            pubkey_cache,
             state,
             &signed_block.message,
             execution_engine,
             NullVerifier,
             slot_report,
         )?;
+
+        #[cfg(target_os = "zkvm")]
+        bls::set_rand_seed(state.hash_tree_root().0);
 
         // > Verify state root
         state_root_policy.verify(state, block)?;
@@ -68,22 +76,8 @@ pub fn state_transition<P: Preset, V: Verifier + Send>(
     };
 
     if let Some(verify_signatures) = verify_signatures {
-        std::thread::scope(|scope| {
-            let verify_signatures = scope.spawn(verify_signatures);
-            let process_block = scope.spawn(process_block);
-
-            let signature_result = verify_signatures
-                .join()
-                .map_err(|_| anyhow!("failed to verify signatures"))
-                .and_then(|result| result);
-
-            let block_result = process_block
-                .join()
-                .map_err(|_| anyhow!("failed to process block"))
-                .and_then(|result| result);
-
-            signature_result.and(block_result)
-        })
+        let (block_result, signature_result) = par_utils::join(process_block, verify_signatures);
+        signature_result.and(block_result)
     } else {
         process_block()
     }
@@ -91,6 +85,7 @@ pub fn state_transition<P: Preset, V: Verifier + Send>(
 
 pub fn verify_signatures<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &BeaconState<P>,
     block: &SignedBeaconBlock<P>,
     mut verifier: impl Verifier,
@@ -100,10 +95,12 @@ pub fn verify_signatures<P: Preset>(
     if !verifier.has_option(VerifierOption::SkipBlockBaseSignatures) {
         // Block signature
 
+        let pubkey = accessors::public_key(state, block.message.proposer_index)?;
+
         verifier.verify_singular(
             block.message.signing_root(config, state),
             block.signature,
-            accessors::public_key(state, block.message.proposer_index)?,
+            pubkey_cache.get_or_insert(*pubkey)?,
             SignatureKind::Block,
         )?;
 
@@ -113,7 +110,7 @@ pub fn verify_signatures<P: Preset>(
             RandaoEpoch::from(misc::compute_epoch_at_slot::<P>(block.message.slot))
                 .signing_root(config, state),
             block.message.body.randao_reveal,
-            accessors::public_key(state, block.message.proposer_index)?,
+            pubkey_cache.get_or_insert(*pubkey)?,
             SignatureKind::Randao,
         )?;
 
@@ -124,10 +121,12 @@ pub fn verify_signatures<P: Preset>(
                 proposer_slashing.signed_header_1,
                 proposer_slashing.signed_header_2,
             ] {
+                let pubkey = accessors::public_key(state, signed_header.message.proposer_index)?;
+
                 verifier.verify_singular(
                     signed_header.message.signing_root(config, state),
                     signed_header.signature,
-                    accessors::public_key(state, signed_header.message.proposer_index)?,
+                    pubkey_cache.get_or_insert(*pubkey)?,
                     SignatureKind::Block,
                 )?;
             }
@@ -146,9 +145,8 @@ pub fn verify_signatures<P: Preset>(
                         .iter()
                         .copied()
                         .map(|validator_index| {
-                            accessors::public_key(state, validator_index)?
-                                .decompress()
-                                .map_err(AnyhowError::new)
+                            pubkey_cache
+                                .get_or_insert(*accessors::public_key(state, validator_index)?)
                         }),
                     |public_keys| {
                         verifier.verify_aggregate(
@@ -168,8 +166,7 @@ pub fn verify_signatures<P: Preset>(
 
         accessors::initialize_shuffled_indices(state, attestations)?;
 
-        let triples = attestations
-            .par_iter()
+        let triples = helper_functions::par_iter!(attestations)
             .map(|attestation| {
                 let indexed_attestation = phase0::get_indexed_attestation(state, attestation)?;
 
@@ -177,6 +174,7 @@ pub fn verify_signatures<P: Preset>(
 
                 predicates::validate_constructed_indexed_attestation(
                     config,
+                    pubkey_cache,
                     state,
                     &indexed_attestation,
                     &mut triple,
@@ -194,7 +192,10 @@ pub fn verify_signatures<P: Preset>(
             verifier.verify_singular(
                 voluntary_exit.message.signing_root(config, state),
                 voluntary_exit.signature,
-                accessors::public_key(state, voluntary_exit.message.validator_index)?,
+                pubkey_cache.get_or_insert(*accessors::public_key(
+                    state,
+                    voluntary_exit.message.validator_index,
+                )?)?,
                 SignatureKind::VoluntaryExit,
             )?;
         }
@@ -205,6 +206,7 @@ pub fn verify_signatures<P: Preset>(
 
         altair::verify_sync_aggregate_signature(
             config,
+            pubkey_cache,
             state,
             block.message.body.sync_aggregate,
             &mut verifier,

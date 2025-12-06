@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use anyhow::Result;
-use bls::{traits::SecretKey as _, CachedPublicKey, SecretKey, Signature, SignatureBytes};
+use bls::{traits::SecretKey as _, PublicKey, SecretKey, Signature, SignatureBytes};
 use derive_more::From;
 use ssz::{Ssz, SszHash};
 use types::{
@@ -26,6 +28,7 @@ use types::{
     electra::containers::{
         AggregateAndProof as ElectraAggregateAndProof, BeaconBlock as ElectraBeaconBlock,
     },
+    fulu::containers::BeaconBlock as FuluBeaconBlock,
     phase0::{
         consts::{
             DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
@@ -76,12 +79,12 @@ pub trait SignForAllForks: SszHash {
         &self,
         config: &Config,
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
     ) -> Result<()> {
         SingleVerifier.verify_singular(
             self.signing_root(config),
             signature_bytes,
-            cached_public_key,
+            public_key,
             Self::SIGNATURE_KIND,
         )
     }
@@ -111,12 +114,12 @@ pub trait SignForAllForksWithGenesis<P: Preset>: SszHash {
         config: &Config,
         beacon_state: &(impl BeaconState<P> + ?Sized),
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
     ) -> Result<()> {
         SingleVerifier.verify_singular(
             self.signing_root(config, beacon_state),
             signature_bytes,
-            cached_public_key,
+            public_key,
             Self::SIGNATURE_KIND,
         )
     }
@@ -148,12 +151,12 @@ pub trait SignForSingleFork<P: Preset>: SszHash {
         config: &Config,
         beacon_state: &(impl BeaconState<P> + ?Sized),
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
     ) -> Result<()> {
         SingleVerifier.verify_singular(
             self.signing_root(config, beacon_state),
             signature_bytes,
-            cached_public_key,
+            public_key,
             Self::SIGNATURE_KIND,
         )
     }
@@ -190,12 +193,12 @@ pub trait SignForSingleForkAtSlot<P: Preset>: SszHash {
         beacon_state: &(impl BeaconState<P> + ?Sized),
         slot: Slot,
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
     ) -> Result<()> {
         SingleVerifier.verify_singular(
             self.signing_root(config, beacon_state, slot),
             signature_bytes,
-            cached_public_key,
+            public_key,
             Self::SIGNATURE_KIND,
         )
     }
@@ -312,6 +315,15 @@ impl<P: Preset> SignForSingleFork<P> for ElectraBeaconBlock<P> {
     }
 }
 
+impl<P: Preset> SignForSingleFork<P> for FuluBeaconBlock<P> {
+    const DOMAIN_TYPE: DomainType = DOMAIN_BEACON_PROPOSER;
+    const SIGNATURE_KIND: SignatureKind = SignatureKind::Block;
+
+    fn epoch(&self) -> Epoch {
+        misc::compute_epoch_at_slot::<P>(self.slot)
+    }
+}
+
 impl<P: Preset> SignForSingleFork<P> for CombinedBeaconBlock<P> {
     const DOMAIN_TYPE: DomainType = DOMAIN_BEACON_PROPOSER;
     const SIGNATURE_KIND: SignatureKind = SignatureKind::Block;
@@ -405,6 +417,7 @@ impl<P: Preset> SignForSingleFork<P> for VoluntaryExit {
 
         let domain = if current_fork_version == config.deneb_fork_version
             || current_fork_version == config.electra_fork_version
+            || current_fork_version == config.fulu_fork_version
         {
             let fork_version = Some(config.capella_fork_version);
             let genesis_validators_root = Some(beacon_state.genesis_validators_root());

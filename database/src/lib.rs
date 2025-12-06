@@ -1,24 +1,61 @@
 use core::ops::{Range, RangeFrom, RangeToInclusive};
+#[cfg(not(target_os = "zkvm"))]
+use std::path::Path;
 use std::{
     borrow::Cow,
-    path::Path,
     sync::{Arc, Mutex},
 };
 
 use anyhow::Result;
+#[cfg(not(target_os = "zkvm"))]
 use bytesize::ByteSize;
+#[cfg(not(target_os = "zkvm"))]
+use futures::channel::mpsc::UnboundedSender;
 use im::OrdMap;
+#[cfg(not(target_os = "zkvm"))]
 use itertools::Either;
+#[cfg(not(target_os = "zkvm"))]
 use libmdbx::{DatabaseFlags, Environment, Geometry, ObjectLength, Stat, WriteFlags};
-use log::info;
+#[cfg(not(target_os = "zkvm"))]
+use logging::{debug_with_peers, error_with_peers};
 use snap::raw::{Decoder, Encoder};
 use std_ext::ArcExt as _;
 use tap::Pipe as _;
+#[cfg(not(target_os = "zkvm"))]
 use thiserror::Error;
 use unwrap_none::UnwrapNone as _;
 
+#[cfg(not(target_os = "zkvm"))]
 const GROWTH_STEP: ByteSize = ByteSize::mib(256);
+
+#[cfg(not(target_os = "zkvm"))]
 const MAX_NAMED_DATABASES: usize = 10;
+
+pub trait PrefixableKey {
+    const PREFIX: &'static str;
+
+    #[must_use]
+    fn has_prefix(bytes: &[u8]) -> bool {
+        bytes.starts_with(Self::PREFIX.as_bytes())
+    }
+}
+
+#[cfg(not(target_os = "zkvm"))]
+#[derive(Debug)]
+pub enum RestartMessage {
+    StorageMapFull(libmdbx::Error),
+}
+
+#[cfg(not(target_os = "zkvm"))]
+impl RestartMessage {
+    pub fn send(self, tx: &UnboundedSender<Self>) {
+        if let Err(message) = tx.unbounded_send(self) {
+            debug_with_peers!(
+                "send to restart service failed because the receiver was dropped: {message:?}"
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum DatabaseMode {
@@ -58,11 +95,13 @@ impl DatabaseMode {
 pub struct Database(DatabaseKind);
 
 impl Database {
+    #[cfg(not(target_os = "zkvm"))]
     pub fn persistent(
         name: &str,
         directory: impl AsRef<Path>,
         max_size: ByteSize,
         mode: DatabaseMode,
+        restart_tx: Option<UnboundedSender<RestartMessage>>,
     ) -> Result<Self> {
         // If a database with the legacy name exists, keep using it.
         // Otherwise, create a new database with the specified name.
@@ -89,14 +128,14 @@ impl Database {
         let existing_db = transaction.open_db(Some(legacy_name));
 
         let database_name = if existing_db.is_err() {
-            info!("database: {legacy_name} with name {name}");
+            debug_with_peers!("database: {legacy_name} with name {name}");
             if !mode.is_read_only() {
                 transaction.create_db(Some(name), DatabaseFlags::default())?;
             }
 
             name
         } else {
-            info!("legacy database: {legacy_name}");
+            debug_with_peers!("legacy database: {legacy_name}");
             legacy_name
         }
         .to_owned();
@@ -106,6 +145,7 @@ impl Database {
         Ok(Self(DatabaseKind::Persistent {
             database_name,
             environment,
+            restart_tx,
         }))
     }
 
@@ -118,9 +158,11 @@ impl Database {
 
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_rw_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -147,9 +189,11 @@ impl Database {
         let end = range.end.as_ref();
 
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_rw_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -198,9 +242,11 @@ impl Database {
 
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         let contains_key = match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -219,9 +265,11 @@ impl Database {
 
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -239,11 +287,14 @@ impl Database {
         .transpose()
     }
 
+    #[cfg(not(target_os = "zkvm"))]
     pub fn db_stats(&self) -> Result<Option<Stat>> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -257,11 +308,13 @@ impl Database {
 
     pub fn iterate_all_keys_with_lengths(
         &self,
-    ) -> Result<impl Iterator<Item = Result<(Cow<[u8]>, usize)>>> {
+    ) -> Result<impl Iterator<Item = Result<(Cow<'_, [u8]>, usize)>>> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -278,10 +331,20 @@ impl Database {
             DatabaseKind::InMemory { map } => {
                 let map = map.lock().expect("in-memory database mutex is poisoned");
 
-                map.clone()
+                let it = map
+                    .clone()
                     .into_iter()
-                    .map(|(key, value)| Ok((Cow::Owned(key.to_vec()), value.len())))
-                    .pipe(Either::Right)
+                    .map(|(key, value)| Ok((Cow::Owned(key.to_vec()), value.len())));
+
+                #[cfg(not(target_os = "zkvm"))]
+                {
+                    it.pipe(Either::Right)
+                }
+
+                #[cfg(target_os = "zkvm")]
+                {
+                    it
+                }
             }
         }
         .pipe(Ok)
@@ -291,13 +354,15 @@ impl Database {
     pub fn iterator_ascending(
         &self,
         range: RangeFrom<impl AsRef<[u8]>>,
-    ) -> Result<impl Iterator<Item = Result<(Cow<[u8]>, Vec<u8>)>>> {
+    ) -> Result<impl Iterator<Item = Result<(Cow<'_, [u8]>, Vec<u8>)>>> {
         let start = range.start.as_ref();
 
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -323,10 +388,19 @@ impl Database {
                         .expect_none("start_pair should have been discarded by OrdMap::split");
                 }
 
-                above
-                    .into_iter()
-                    .map(|(key, value)| Ok((Cow::Owned(key.to_vec()), decompress(value.as_ref())?)))
-                    .pipe(Either::Right)
+                let it = above.into_iter().map(|(key, value)| {
+                    Ok((Cow::Owned(key.to_vec()), decompress(value.as_ref())?))
+                });
+
+                #[cfg(not(target_os = "zkvm"))]
+                {
+                    it.pipe(Either::Right)
+                }
+
+                #[cfg(target_os = "zkvm")]
+                {
+                    it
+                }
             }
         }
         .pipe(Ok)
@@ -336,13 +410,15 @@ impl Database {
     pub fn iterator_descending(
         &self,
         range: RangeToInclusive<impl AsRef<[u8]>>,
-    ) -> Result<impl Iterator<Item = Result<(Cow<[u8]>, Vec<u8>)>>> {
+    ) -> Result<impl Iterator<Item = Result<(Cow<'_, [u8]>, Vec<u8>)>>> {
         let end = range.end.as_ref();
 
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -368,11 +444,19 @@ impl Database {
                         .expect_none("end_pair should have been discarded by OrdMap::split");
                 }
 
-                below
-                    .into_iter()
-                    .rev()
-                    .map(|(key, value)| Ok((Cow::Owned(key.to_vec()), decompress(value.as_ref())?)))
-                    .pipe(Either::Right)
+                let it = below.into_iter().rev().map(|(key, value)| {
+                    Ok((Cow::Owned(key.to_vec()), decompress(value.as_ref())?))
+                });
+
+                #[cfg(not(target_os = "zkvm"))]
+                {
+                    it.pipe(Either::Right)
+                }
+
+                #[cfg(target_os = "zkvm")]
+                {
+                    it
+                }
             }
         }
         .pipe(Ok)
@@ -387,9 +471,11 @@ impl Database {
         pairs: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
     ) -> Result<()> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx,
             } => {
                 let transaction = environment.begin_rw_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -397,10 +483,16 @@ impl Database {
                 for (key, value) in pairs {
                     let key = key.as_ref();
                     let compressed = compress(value.as_ref())?;
-                    transaction.put(database.dbi(), key, compressed, WriteFlags::default())?;
+                    transaction
+                        .put(database.dbi(), key, compressed, WriteFlags::default())
+                        .map_err(|error| {
+                            handle_write_error(database_name, error, restart_tx.as_ref())
+                        })?;
                 }
 
-                transaction.commit()?;
+                transaction.commit().map_err(|error| {
+                    handle_write_error(database_name, error, restart_tx.as_ref())
+                })?;
             }
             DatabaseKind::InMemory { map } => {
                 let mut map = map.lock().expect("in-memory database mutex is poisoned");
@@ -426,9 +518,11 @@ impl Database {
     /// [`im::OrdMap::get_prev`]: https://docs.rs/im/15.1.0/im/ordmap/struct.OrdMap.html#method.get_prev
     pub fn prev(&self, key: impl AsRef<[u8]>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -458,9 +552,11 @@ impl Database {
     /// [`im::OrdMap::get_next`]: https://docs.rs/im/15.1.0/im/ordmap/struct.OrdMap.html#method.get_next
     pub fn next(&self, key: impl AsRef<[u8]>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         match self.kind() {
+            #[cfg(not(target_os = "zkvm"))]
             DatabaseKind::Persistent {
                 database_name,
                 environment,
+                restart_tx: _,
             } => {
                 let transaction = environment.begin_ro_txn()?;
                 let database = transaction.open_db(Some(database_name))?;
@@ -483,12 +579,22 @@ impl Database {
     }
 }
 
+impl From<InMemoryMap> for Database {
+    fn from(map: InMemoryMap) -> Self {
+        Self(DatabaseKind::InMemory {
+            map: Mutex::new(map),
+        })
+    }
+}
+
 enum DatabaseKind {
+    #[cfg(not(target_os = "zkvm"))]
     Persistent {
         // TODO(Grandine Team): It should be possible to remove `database_name` by using the default
         //                      database (`None`), but that would probably force users to resync.
         database_name: String,
         environment: Environment,
+        restart_tx: Option<UnboundedSender<RestartMessage>>,
     },
     InMemory {
         // Various methods of `OrdMap` and `Database` clone the elements of this map,
@@ -512,11 +618,12 @@ enum DatabaseKind {
     },
 }
 
+#[cfg(not(target_os = "zkvm"))]
 #[derive(Debug, Error)]
 #[error("database directory path should be a valid Unicode string")]
 struct Error;
 
-type InMemoryMap = OrdMap<Arc<[u8]>, Arc<[u8]>>;
+pub type InMemoryMap = OrdMap<Arc<[u8]>, Arc<[u8]>>;
 
 fn compress(data: &[u8]) -> Result<Vec<u8>> {
     Encoder::new().compress_vec(data).map_err(Into::into)
@@ -526,9 +633,27 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     Decoder::new().decompress_vec(data).map_err(Into::into)
 }
 
+#[cfg(not(target_os = "zkvm"))]
 fn decompress_pair<K>((key, compressed_value): (K, Cow<[u8]>)) -> Result<(K, Vec<u8>)> {
     let value = decompress(&compressed_value)?;
     Ok((key, value))
+}
+
+#[cfg(not(target_os = "zkvm"))]
+fn handle_write_error(
+    database_name: &str,
+    error: libmdbx::Error,
+    restart_tx: Option<&UnboundedSender<RestartMessage>>,
+) -> libmdbx::Error {
+    if error == libmdbx::Error::MapFull {
+        error_with_peers!("error while writing to {database_name} database: {error}");
+
+        if let Some(restart_tx) = restart_tx {
+            RestartMessage::StorageMapFull(error).send(restart_tx);
+        }
+    }
+
+    error
 }
 
 #[cfg(test)]
@@ -795,6 +920,7 @@ mod tests {
             TempDir::new()?,
             ByteSize::mib(1),
             DatabaseMode::ReadWrite,
+            None,
         )?;
 
         populate_database(&database)?;

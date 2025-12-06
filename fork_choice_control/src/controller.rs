@@ -10,6 +10,7 @@
 
 use core::{panic::AssertUnwindSafe, sync::atomic::AtomicBool};
 use std::{
+    collections::HashSet,
     sync::{mpsc::Sender, Arc},
     thread::{Builder, JoinHandle},
     time::Instant,
@@ -18,42 +19,52 @@ use std::{
 use anyhow::{Context as _, Result};
 use arc_swap::{ArcSwap, Guard};
 use clock::Tick;
+use dashmap::DashMap;
 use eth2_libp2p::{GossipId, PeerId};
 use execution_engine::{ExecutionEngine, PayloadStatusV1};
 use fork_choice_store::{
     AggregateAndProofOrigin, AttestationItem, AttestationOrigin, AttesterSlashingOrigin,
-    BlobSidecarOrigin, BlockOrigin, StateCacheProcessor, Store, StoreConfig,
+    BlobSidecarOrigin, BlockOrigin, DataColumnSidecarOrigin, StateCacheProcessor, Store,
+    StoreConfig,
 };
 use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
 use genesis::AnchorCheckpointProvider;
-use http_api_utils::EventChannels;
+use logging::debug_with_peers;
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
 use std_ext::ArcExt as _;
 use thiserror::Error;
+use tracing::{instrument, Span};
 use types::{
     combined::{
         Attestation, AttesterSlashing, BeaconState, SignedAggregateAndProof, SignedBeaconBlock,
     },
     config::Config as ChainConfig,
     deneb::containers::BlobSidecar,
+    fulu::{containers::DataColumnSidecar, primitives::ColumnIndex},
     nonstandard::ValidationOutcome,
-    phase0::primitives::{ExecutionBlockHash, Slot, SubnetId},
+    phase0::{
+        containers::BeaconBlockHeader,
+        primitives::{ExecutionBlockHash, Slot, SubnetId, H256},
+    },
     preset::Preset,
     traits::SignedBeaconBlock as _,
 };
 
 use crate::{
     block_processor::BlockProcessor,
+    events::EventChannels,
     messages::{
         AttestationVerifierMessage, MutatorMessage, P2pMessage, PoolMessage, SubnetMessage,
         SyncMessage, ValidatorMessage,
     },
-    misc::{VerifyAggregateAndProofResult, VerifyAttestationResult},
+    misc::{ProcessingTimings, VerifyAggregateAndProofResult, VerifyAttestationResult},
     mutator::Mutator,
+    state_at_slot_cache::StateAtSlotCache,
     storage::Storage,
     tasks::{
         AggregateAndProofTask, AttestationTask, AttesterSlashingTask, BlobSidecarTask, BlockTask,
-        BlockVerifyForGossipTask,
+        BlockVerifyForGossipTask, DataColumnSidecarTask, StateAtSlotCacheFlushTask,
     },
     thread_pool::{Spawn, ThreadPool},
     unbounded_sink::UnboundedSink,
@@ -62,9 +73,11 @@ use crate::{
 
 pub struct Controller<P: Preset, E, A, W: Wait> {
     // The latest consistent snapshot of the store.
-    store_snapshot: Arc<ArcSwap<Store<P>>>,
+    store_snapshot: Arc<ArcSwap<Store<P, Storage<P>>>>,
     block_processor: Arc<BlockProcessor<P>>,
     execution_engine: E,
+    pubkey_cache: Arc<PubkeyCache>,
+    state_at_slot_cache: Arc<StateAtSlotCache<P>>,
     state_cache: Arc<StateCacheProcessor<P>>,
     storage: Arc<Storage<P>>,
     thread_pool: ThreadPool<P, E, W>,
@@ -91,32 +104,39 @@ where
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
         store_config: StoreConfig,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
         tick: Tick,
-        event_channels: Arc<EventChannels>,
+        event_channels: Arc<EventChannels<P>>,
         execution_engine: E,
         metrics: Option<Arc<Metrics>>,
         attestation_verifier_tx: A, // impl UnboundedSink<AttestationVerifierMessage<P, W>>,
         p2p_tx: impl UnboundedSink<P2pMessage<P>>,
-        pool_tx: impl UnboundedSink<PoolMessage>,
+        pool_tx: impl UnboundedSink<PoolMessage<P, W>>,
         subnet_tx: impl UnboundedSink<SubnetMessage<W>>,
         sync_tx: impl UnboundedSink<SyncMessage<P>>,
         validator_tx: impl UnboundedSink<ValidatorMessage<P, W>>,
         storage: Arc<Storage<P>>,
         unfinalized_blocks: impl DoubleEndedIterator<Item = Result<Arc<SignedBeaconBlock<P>>>>,
         finished_back_sync: bool,
+        blacklisted_blocks: HashSet<H256>,
+        sidecars_construction_started: Arc<DashMap<H256, Slot>>,
     ) -> Result<(Arc<Self>, MutatorHandle<P, W>)> {
         let finished_initial_forward_sync = anchor_block.message().slot() >= tick.slot;
 
         let mut store = Store::new(
             chain_config.clone_arc(),
+            pubkey_cache.clone_arc(),
             store_config,
             anchor_block,
             anchor_state,
+            storage.clone_arc(),
             finished_initial_forward_sync,
             finished_back_sync,
+            blacklisted_blocks,
+            sidecars_construction_started,
         );
 
         store.apply_tick(tick)?;
@@ -126,9 +146,14 @@ where
         let thread_pool = ThreadPool::new()?;
         let (mutator_tx, mutator_rx) = std::sync::mpsc::channel();
 
-        let block_processor = Arc::new(BlockProcessor::new(chain_config, state_cache.clone_arc()));
+        let block_processor = Arc::new(BlockProcessor::new(
+            chain_config,
+            pubkey_cache.clone_arc(),
+            state_cache.clone_arc(),
+        ));
 
         let mut mutator = Mutator::new(
+            pubkey_cache.clone_arc(),
             store_snapshot.clone_arc(),
             state_cache.clone_arc(),
             block_processor.clone_arc(),
@@ -160,10 +185,14 @@ where
                 .context(Error::MutatorFailed)
         })?;
 
+        let state_at_slot_cache = Arc::new(StateAtSlotCache::build());
+
         let controller = Arc::new(Self {
             store_snapshot,
             block_processor,
             execution_engine,
+            pubkey_cache,
+            state_at_slot_cache,
             state_cache,
             storage,
             thread_pool,
@@ -185,6 +214,25 @@ where
         self.storage().config()
     }
 
+    pub fn on_store_sampling_columns(&self, sampling_columns: HashSet<ColumnIndex>) {
+        MutatorMessage::StoreSamplingColumns { sampling_columns }.send(&self.owned_mutator_tx());
+    }
+
+    pub fn is_sidecars_construction_started(&self, block_root: &H256) -> bool {
+        self.store_snapshot()
+            .is_sidecars_construction_started(block_root)
+    }
+
+    pub fn mark_sidecar_construction_started(&self, block_root: H256, slot: Slot) {
+        self.store_snapshot()
+            .mark_sidecar_construction_started(block_root, slot);
+    }
+
+    pub fn mark_sidecar_construction_failed(&self, block_root: &H256) {
+        self.store_snapshot()
+            .mark_sidecar_construction_failed(block_root)
+    }
+
     // This should be called at the start of every tick.
     // More or less frequent calls are allowed but may worsen performance and quality of the head.
     // According to the Fork Choice specification, `on_tick` should be called every second,
@@ -197,7 +245,17 @@ where
             wait_group: self.owned_wait_group(),
             tick,
         }
-        .send(&self.mutator_tx)
+        .send(&self.mutator_tx);
+
+        if tick.is_start_of_slot() {
+            self.spawn(StateAtSlotCacheFlushTask {
+                state_at_slot_cache: self.state_at_slot_cache.clone_arc(),
+            });
+
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.set_beacon_clock_slot(tick.slot);
+            }
+        }
     }
 
     pub fn on_back_sync_status(&self, is_back_synced: bool) {
@@ -208,14 +266,29 @@ where
         .send(&self.mutator_tx)
     }
 
+    #[instrument(
+        parent = None,
+        skip_all
+        fields(gossip_id = ?gossip_id, slot = block.message().slot())
+    )]
     pub fn on_gossip_block(&self, block: Arc<SignedBeaconBlock<P>>, gossip_id: GossipId) {
         self.spawn_block_task(block, BlockOrigin::Gossip(gossip_id))
     }
 
+    #[instrument(
+        parent = None,
+        skip_all
+        fields(peer_id = ?peer_id, slot = block.message().slot())
+    )]
     pub fn on_requested_block(&self, block: Arc<SignedBeaconBlock<P>>, peer_id: Option<PeerId>) {
         self.spawn_block_task(block, BlockOrigin::Requested(peer_id))
     }
 
+    #[instrument(
+        parent = None,
+        skip_all
+        fields(slot = block.message().slot())
+    )]
     pub fn on_own_block(&self, wait_group: W, block: Arc<SignedBeaconBlock<P>>) {
         self.spawn_block_task_with_wait_group(wait_group, block, BlockOrigin::Own)
     }
@@ -237,6 +310,36 @@ where
         self.spawn_blob_sidecar_task(blob_sidecar, true, BlobSidecarOrigin::Api(sender))
     }
 
+    pub fn on_own_data_column_sidecar(
+        &self,
+        wait_group: W,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+    ) {
+        self.spawn_data_column_sidecar_task_with_wait_group(
+            wait_group,
+            data_column_sidecar,
+            true,
+            DataColumnSidecarOrigin::Own,
+        )
+    }
+
+    pub fn on_api_data_column_sidecar(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        sender: Option<OneshotSender<Result<ValidationOutcome>>>,
+    ) {
+        self.spawn_data_column_sidecar_task(
+            data_column_sidecar,
+            true,
+            DataColumnSidecarOrigin::Api(sender),
+        )
+    }
+
+    #[instrument(
+        parent = None,
+        skip_all
+        fields(slot = block.message().slot())
+    )]
     pub fn on_api_block(
         &self,
         block: Arc<SignedBeaconBlock<P>>,
@@ -269,11 +372,13 @@ where
 
     pub fn on_notified_new_payload(
         &self,
+        beacon_block_root: H256,
         execution_block_hash: ExecutionBlockHash,
         payload_status: PayloadStatusV1,
     ) {
         MutatorMessage::NotifiedNewPayload {
             wait_group: self.owned_wait_group(),
+            beacon_block_root,
             execution_block_hash,
             payload_status,
         }
@@ -305,6 +410,17 @@ where
                 attestation,
                 AttestationOrigin::Api(subnet_id, sender),
             ),
+        }
+        .send(&self.attestation_verifier_tx);
+    }
+
+    pub fn on_api_singular_attestation_batch(
+        &self,
+        attestations: Vec<AttestationItem<P, GossipId>>,
+    ) {
+        AttestationVerifierMessage::AttestationBatch {
+            wait_group: self.owned_wait_group(),
+            attestations,
         }
         .send(&self.attestation_verifier_tx);
     }
@@ -413,6 +529,14 @@ where
         self.spawn_blob_sidecar_task(blob_sidecar, true, BlobSidecarOrigin::ExecutionLayer)
     }
 
+    pub fn on_el_data_column_sidecar(&self, data_column_sidecar: Arc<DataColumnSidecar<P>>) {
+        self.spawn_data_column_sidecar_task(
+            data_column_sidecar,
+            true,
+            DataColumnSidecarOrigin::ExecutionLayer,
+        )
+    }
+
     pub fn on_gossip_blob_sidecar(
         &self,
         blob_sidecar: Arc<BlobSidecar<P>>,
@@ -427,6 +551,20 @@ where
         )
     }
 
+    pub fn on_gossip_data_column_sidecar(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        subnet_id: SubnetId,
+        gossip_id: GossipId,
+        block_seen: bool,
+    ) {
+        self.spawn_data_column_sidecar_task(
+            data_column_sidecar,
+            block_seen,
+            DataColumnSidecarOrigin::Gossip(subnet_id, gossip_id),
+        )
+    }
+
     pub fn on_requested_blob_sidecar(
         &self,
         blob_sidecar: Arc<BlobSidecar<P>>,
@@ -438,6 +576,7 @@ where
             mutator_tx: self.owned_mutator_tx(),
             wait_group: self.owned_wait_group(),
             blob_sidecar,
+            state: None,
             block_seen,
             origin: BlobSidecarOrigin::Requested(peer_id),
             submission_time: Instant::now(),
@@ -445,11 +584,69 @@ where
         })
     }
 
+    pub fn on_requested_data_column_sidecar(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        block_seen: bool,
+        peer_id: PeerId,
+    ) {
+        let block_header = data_column_sidecar.signed_block_header.message;
+        if !self.store_snapshot().is_forward_synced()
+            && self
+                .store_snapshot()
+                .accepted_data_column_sidecar(block_header, data_column_sidecar.index)
+        {
+            debug_with_peers!(
+                "received data column sidecar has been accepted, ignore this one from peer {peer_id} \
+                 (index: {}, slot: {})",
+                data_column_sidecar.index,
+                data_column_sidecar.slot(),
+            );
+            return;
+        }
+
+        self.spawn(DataColumnSidecarTask {
+            store_snapshot: self.owned_store_snapshot(),
+            mutator_tx: self.owned_mutator_tx(),
+            wait_group: self.owned_wait_group(),
+            data_column_sidecar,
+            state: None,
+            block_seen,
+            origin: DataColumnSidecarOrigin::Requested(peer_id),
+            submission_time: Instant::now(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
+    pub fn on_reconstruction(
+        &self,
+        wait_group: W,
+        block_root: H256,
+        block: Arc<SignedBeaconBlock<P>>,
+        data_column_sidecars: Vec<Arc<DataColumnSidecar<P>>>,
+    ) {
+        MutatorMessage::ReconstructedMissingColumns {
+            wait_group,
+            block_root,
+            block,
+            data_column_sidecars,
+        }
+        .send(&self.mutator_tx)
+    }
+
     pub fn store_back_sync_blob_sidecars(
         &self,
         blob_sidecars: impl IntoIterator<Item = Arc<BlobSidecar<P>>>,
     ) -> Result<()> {
         self.storage.store_back_sync_blob_sidecars(blob_sidecars)
+    }
+
+    pub fn store_back_sync_data_column_sidecars(
+        &self,
+        data_column_sidecars: impl IntoIterator<Item = Arc<DataColumnSidecar<P>>>,
+    ) -> Result<()> {
+        self.storage
+            .store_back_sync_data_column_sidecars(data_column_sidecars)
     }
 
     pub fn store_back_sync_blocks(
@@ -500,6 +697,58 @@ where
             mutator_tx: self.owned_mutator_tx(),
             wait_group,
             blob_sidecar,
+            state: None,
+            block_seen,
+            origin,
+            submission_time: Instant::now(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
+    fn spawn_data_column_sidecar_task(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        block_seen: bool,
+        origin: DataColumnSidecarOrigin,
+    ) {
+        self.spawn_data_column_sidecar_task_with_wait_group(
+            self.owned_wait_group(),
+            data_column_sidecar,
+            block_seen,
+            origin,
+        )
+    }
+
+    fn spawn_data_column_sidecar_task_with_wait_group(
+        &self,
+        wait_group: W,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        block_seen: bool,
+        origin: DataColumnSidecarOrigin,
+    ) {
+        // During syncing, prevent spawning task if the sidecar has been accepted.
+        // On the other hand, forward it to the `mutator` to allow distributed publishing if it is synced.
+        let block_header = data_column_sidecar.signed_block_header.message;
+        if !self.store_snapshot().is_forward_synced()
+            && self
+                .store_snapshot()
+                .accepted_data_column_sidecar(block_header, data_column_sidecar.index)
+        {
+            debug_with_peers!(
+                "received data column sidecar has been accepted, ignore this one from {origin:?} \
+                 (index: {}, slot: {})",
+                data_column_sidecar.index,
+                data_column_sidecar.slot(),
+            );
+            return;
+        }
+
+        self.spawn(DataColumnSidecarTask {
+            store_snapshot: self.owned_store_snapshot(),
+            mutator_tx: self.owned_mutator_tx(),
+            wait_group,
+            data_column_sidecar,
+            state: None,
             block_seen,
             origin,
             submission_time: Instant::now(),
@@ -525,8 +774,9 @@ where
             wait_group,
             block,
             origin,
-            submission_time: Instant::now(),
+            processing_timings: ProcessingTimings::new(),
             metrics: self.metrics.clone(),
+            tracing_span: Span::current(),
         })
     }
 
@@ -543,6 +793,14 @@ where
         &self.block_processor
     }
 
+    pub const fn pubkey_cache(&self) -> &Arc<PubkeyCache> {
+        &self.pubkey_cache
+    }
+
+    pub(crate) const fn state_at_slot_cache(&self) -> &Arc<StateAtSlotCache<P>> {
+        &self.state_at_slot_cache
+    }
+
     pub(crate) const fn state_cache(&self) -> &Arc<StateCacheProcessor<P>> {
         &self.state_cache
     }
@@ -551,12 +809,33 @@ where
         self.store_snapshot().store_config()
     }
 
-    pub(crate) fn store_snapshot(&self) -> Guard<Arc<Store<P>>> {
+    pub fn sampling_columns(&self) -> HashSet<ColumnIndex> {
+        self.store_snapshot().sampling_columns().clone()
+    }
+
+    pub fn sampling_columns_count(&self) -> usize {
+        self.store_snapshot().sampling_columns_count()
+    }
+
+    pub fn accepted_data_column_sidecar(
+        &self,
+        block_header: BeaconBlockHeader,
+        index: ColumnIndex,
+    ) -> bool {
+        self.store_snapshot()
+            .accepted_data_column_sidecar(block_header, index)
+    }
+
+    pub(crate) fn store_snapshot(&self) -> Guard<Arc<Store<P, Storage<P>>>> {
         self.store_snapshot.load()
     }
 
-    pub(crate) fn owned_store_snapshot(&self) -> Arc<Store<P>> {
+    pub(crate) fn owned_store_snapshot(&self) -> Arc<Store<P, Storage<P>>> {
         self.store_snapshot.load_full()
+    }
+
+    pub(crate) fn owned_storage(&self) -> Arc<Storage<P>> {
+        self.storage.clone_arc()
     }
 
     pub(crate) fn storage(&self) -> &Storage<P> {

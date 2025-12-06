@@ -92,7 +92,7 @@ impl<'list, T, N, B: BundleSize<T>> IntoIterator for &'list PersistentList<T, N,
                 stack.push(node.as_ref().as_ref());
             }
             None => stack = vec![],
-        };
+        }
 
         ExactSize::new(Leaves { stack }.flatten(), self.length)
     }
@@ -114,7 +114,7 @@ impl<'list, T: Clone, N, B: BundleSize<T>> IntoIterator for &'list mut Persisten
                 stack.push(node.make_mut().as_mut());
             }
             None => stack = vec![],
-        };
+        }
 
         ExactSize::new(LeavesMut { stack }.flatten(), self.length)
     }
@@ -241,8 +241,13 @@ impl<T: SszSize, N, B> SszSize for PersistentList<T, N, B> {
 
 impl<C, T: SszRead<C>, N: Unsigned, B: BundleSize<T>> SszRead<C> for PersistentList<T, N, B> {
     fn from_ssz_unchecked(context: &C, bytes: &[u8]) -> Result<Self, ReadError> {
-        let results = shared::read_list(context, bytes)?;
-        itertools::process_results(results, |elements| Self::try_from_iter(elements))?
+        // TODO(32-bit support): remove saturating_usize, in favor of using u64 for max length checks.
+        //
+        // this saturating_usize is setting hard limit on 32-bit architectures, where maximum length
+        // doesn't fit in 4-byte usize. On 32-bit architectures (for instance zkvms), maximum overflows
+        // and becomes 0, failing to deserialize valid structures - BeaconState for example, as it has
+        // `validators` field, which upper limit is set to 1099511627776 (2^40).
+        shared::read_list(shared::saturating_usize::<N>(), context, bytes)
     }
 }
 
@@ -671,7 +676,7 @@ impl<T, B: BundleSize<T>> Node<T, B> {
                     right.make_mut().push(element, right_length);
                     if Self::pushing_increases_height(right_length) {
                         right_height += 1;
-                    };
+                    }
                     assert!(right_height <= left_height);
 
                     Self::Internal {

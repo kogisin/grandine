@@ -1,6 +1,6 @@
 use core::time::Duration;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -8,25 +8,27 @@ use std::{
 use anyhow::Result;
 use bls::{traits::Signature as _, PublicKeyBytes};
 use eth1_api::ApiController;
-use features::Feature::DebugAttestationPacker;
 use fork_choice_control::Wait;
 use fork_choice_store::StateCacheError;
 use helper_functions::accessors;
-use log::warn;
+use logging::{exception, warn_with_peers};
 use prometheus_metrics::Metrics;
 use ssz::ContiguousList;
 use std_ext::ArcExt as _;
 use types::{
-    combined::BeaconState,
+    combined::{Attestation as CombinedAttestation, BeaconState},
+    electra::error::AttestationConversionError,
     phase0::containers::Attestation,
     phase0::primitives::{CommitteeIndex, Slot, ValidatorIndex},
     preset::Preset,
     traits::BeaconState as _,
 };
+use validator_statistics::ValidatorStatistics;
 
 use crate::{
     attestation_agg_pool::{
         attestation_packer::{AttestationPacker, PackOutcome},
+        conversion::convert_attestation_for_pool,
         pool::Pool,
         types::Aggregate,
     },
@@ -60,7 +62,11 @@ impl<P: Preset, W: Wait> PoolTask for BestProposableAttestationsTask<P, W> {
             return Ok(attestations);
         }
 
-        DebugAttestationPacker.warn(format_args!("no optimal attestations for slot: {slot}"));
+        features::warn!(
+            DebugAttestationPacker,
+            "no optimal attestations for slot: {}",
+            slot
+        );
 
         let attestation_packer = AttestationPacker::new(
             controller.chain_config().clone_arc(),
@@ -114,7 +120,7 @@ impl<P: Preset, W: Wait> PoolTask for PackProposableAttestationsTask<P, W> {
             metrics,
         } = self;
 
-        let beacon_state = controller.preprocessed_state_at_next_slot()?;
+        let beacon_state = controller.preprocessed_state_at_next_slot_blocking()?;
         let slot = controller.slot() + 1;
 
         let mut attestation_packer = AttestationPacker::new(
@@ -157,7 +163,9 @@ impl<P: Preset, W: Wait> PoolTask for PackProposableAttestationsTask<P, W> {
 
             if deadline_reached {
                 if let Some(metrics) = metrics.as_ref() {
-                    metrics.set_attestation_packer_iteration_count(iteration.saturating_sub(1));
+                    metrics
+                        .att_pool_pack_iterations
+                        .inc_by(iteration.saturating_sub(1).into());
                 }
 
                 break;
@@ -170,7 +178,7 @@ impl<P: Preset, W: Wait> PoolTask for PackProposableAttestationsTask<P, W> {
             if attestation_packer.should_update_current_participation(head_block_root) {
                 attestation_packer.update_current_participation(
                     head_block_root,
-                    controller.preprocessed_state_at_next_slot()?,
+                    controller.preprocessed_state_at_next_slot_blocking()?,
                 )?;
             }
         }
@@ -179,34 +187,75 @@ impl<P: Preset, W: Wait> PoolTask for PackProposableAttestationsTask<P, W> {
     }
 }
 
-pub struct InsertAttestationTask<P: Preset, W> {
+pub struct InsertAttestationTask<P: Preset, W: Wait> {
     pub wait_group: W,
     pub pool: Arc<Pool<P>>,
-    pub attestation: Arc<Attestation<P>>,
+    pub controller: ApiController<P, W>,
+    pub attestation: Arc<CombinedAttestation<P>>,
+    pub attester_index: Option<ValidatorIndex>,
     pub metrics: Option<Arc<Metrics>>,
+    pub validator_statistics: Option<Arc<ValidatorStatistics>>,
 }
 
-impl<P: Preset, W: Send + 'static> PoolTask for InsertAttestationTask<P, W> {
+impl<P: Preset, W: Wait> PoolTask for InsertAttestationTask<P, W> {
     type Output = ();
 
     async fn run(self) -> Result<Self::Output> {
         let Self {
             wait_group,
             pool,
+            controller,
             attestation,
+            mut attester_index,
             metrics,
+            validator_statistics,
         } = self;
 
+        if let CombinedAttestation::Single(single_attestation) = attestation.as_ref() {
+            attester_index = Some(single_attestation.attester_index);
+        }
+
+        let attestation = match convert_attestation_for_pool(&controller, attestation) {
+            Ok(attestation) => attestation,
+            Err(error) => {
+                match error.downcast_ref::<AttestationConversionError>() {
+                    Some(AttestationConversionError::Irrelevant) => {}
+                    Some(AttestationConversionError::AttesterNotInCommittee { .. }) => {
+                        exception!("failed to convert attestation for pool: {error:?}");
+                    }
+                    _ => {
+                        warn_with_peers!("failed to convert attestation for pool: {error:?}");
+                    }
+                }
+
+                return Ok(());
+            }
+        };
+
         let Attestation {
-            ref aggregation_bits,
+            aggregation_bits,
             data,
             signature,
-        } = *attestation;
+        } = attestation;
 
         let is_singular = aggregation_bits.count_ones() == 1;
 
-        if is_singular && !pool.aggregate_in_committee(data.index, data.slot).await {
-            return Ok(());
+        if is_singular {
+            if let Some(validator_index) = attester_index {
+                let _timer = metrics
+                    .as_ref()
+                    .map(|metrics| metrics.att_pool_attestation_tracking_times.start_timer());
+
+                if let Some(validator_statistics) = validator_statistics.as_ref() {
+                    validator_statistics
+                        .track_attestation_vote::<P>(data, validator_index)
+                        .await;
+                }
+            }
+
+            if !pool.aggregate_in_committee(data.index, data.slot).await {
+                return Ok(());
+            }
         }
 
         let _timer = metrics
@@ -219,7 +268,7 @@ impl<P: Preset, W: Send + 'static> PoolTask for InsertAttestationTask<P, W> {
 
         if !is_singular || aggregates.is_empty() {
             let mut aggregate = Aggregate {
-                aggregation_bits: aggregation_bits.clone(),
+                aggregation_bits,
                 signature: signature.try_into()?,
             };
 
@@ -229,16 +278,25 @@ impl<P: Preset, W: Send + 'static> PoolTask for InsertAttestationTask<P, W> {
 
             aggregates.push(aggregate);
         } else {
+            let attestation = Attestation {
+                aggregation_bits,
+                data,
+                signature,
+            };
+
             for aggregate in aggregates.iter_mut() {
                 aggregate_attestation(&attestation, aggregate)?;
+            }
+
+            if is_singular {
+                singular_attestations
+                    .write()
+                    .await
+                    .insert(Arc::new(attestation));
             }
         }
 
         pool.add_data_root_to_data_entry(data).await;
-
-        if is_singular {
-            singular_attestations.write().await.insert(attestation);
-        }
 
         drop(wait_group);
 
@@ -272,6 +330,7 @@ pub struct SetRegisteredValidatorsTask<P: Preset, W: Wait> {
     pub controller: ApiController<P, W>,
     pub pubkeys: Vec<PublicKeyBytes>,
     pub prepared_proposer_indices: Vec<ValidatorIndex>,
+    pub validator_statistics: Option<Arc<ValidatorStatistics>>,
 }
 
 impl<P: Preset, W: Wait> PoolTask for SetRegisteredValidatorsTask<P, W> {
@@ -283,15 +342,16 @@ impl<P: Preset, W: Wait> PoolTask for SetRegisteredValidatorsTask<P, W> {
             controller,
             pubkeys,
             prepared_proposer_indices,
+            validator_statistics,
         } = self;
 
-        let beacon_state = match controller.preprocessed_state_at_current_slot() {
+        let beacon_state = match controller.preprocessed_state_at_current_slot_blocking() {
             Ok(state) => state,
             Err(error) => {
                 if let Some(StateCacheError::StateFarBehind { .. }) = error.downcast_ref() {
                     controller.head_state().value
                 } else {
-                    warn!(
+                    warn_with_peers!(
                         "failed get preprocessed state at current slot needed for validating registered validator pubkeys: {error}",
                     );
                     return Ok(());
@@ -299,11 +359,18 @@ impl<P: Preset, W: Wait> PoolTask for SetRegisteredValidatorsTask<P, W> {
             }
         };
 
-        let validator_indices = pubkeys
+        let mut validator_indices = pubkeys
             .into_iter()
-            .filter_map(|pubkey| accessors::index_of_public_key(&beacon_state, pubkey))
-            .chain(prepared_proposer_indices)
-            .collect();
+            .filter_map(|pubkey| accessors::index_of_public_key(&beacon_state, &pubkey))
+            .collect::<HashSet<_>>();
+
+        if let Some(validator_statistics) = validator_statistics.as_ref() {
+            validator_statistics
+                .set_registered_validator_indices(validator_indices.clone())
+                .await;
+        }
+
+        validator_indices.extend(prepared_proposer_indices);
 
         pool.set_registered_validator_indices(validator_indices)
             .await;

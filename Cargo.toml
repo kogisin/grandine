@@ -13,7 +13,9 @@ members = [
     'bls/bls-zkcrypto',
     'builder_api',
     'clock',
+    'data_dumper',
     'database',
+    'debug_info',
     'deposit_tree',
     'directories',
     'doppelganger_protection',
@@ -45,6 +47,7 @@ members = [
     'panics',
     'predefined_chains',
     'prometheus_metrics',
+    'pubkey_cache',
     'runtime',
     'serde_utils',
     'shuffling',
@@ -62,7 +65,11 @@ members = [
     'types',
     'validator',
     'validator_key_cache',
+    'validator_statistics',
+    'zkvm/guest/risc0',
+    'zkvm/host',
 ]
+
 # Feature resolver version 2 is the default starting with Rust 2021, but that does not apply in
 # virtual workspaces. Starting with Rust 1.72.0, Cargo warns if a Rust 2021 virtual workspace does
 # not explicitly specify a feature resolver. See <https://github.com/rust-lang/cargo/pull/10910>.
@@ -281,47 +288,44 @@ private_intra_doc_links = 'allow'
 
 [workspace.dependencies]
 aes = { version = '0.8', features = ['zeroize'] }
-alloy-rlp = '0.3.9'
+alloy-rlp = '0.3'
 anyhow = { version = '1', features = ['backtrace'] }
 arc-swap = '1'
 assert-json-diff = '2'
-async-channel = '1'
-async-trait = '0.1'
-asynchronous-codec = '0.7'
 axum = { version = '0.8' }
-axum-extra = { version = '0.10', features = ['typed-header', 'query'] }
+axum-extra = { version = '0.12', features = ['typed-header', 'query'] }
 base64 = '0.22'
 bincode = '1'
 bit_field = '0.10'
 bitvec = '1'
-bls12_381 = { git = "https://github.com/zkcrypto/bls12_381.git" }
+bls12_381 = { git = 'https://github.com/grandinetech/universal-precompiles.git', tag = 'bls12_381-6bb9695-up.1' }
 blst = { version = '0.3', features = ['portable'] }
+bonsai-sdk = '1.4'
+borsh = '1.5'
 bstr = '1'
 build-time = '0.1'
 byteorder = '1'
 bytes = '1'
-bytesize = { version = '1', features = ['serde'] }
-cached = '0.53'
+bytesize = { version = '2', features = ['serde'] }
+cached = '0.56'
 chrono = '0.4'
 clap = { version = '4', features = ['derive'] }
 const-hex = '1.14'
 const_format = '0.2'
-constant_time_eq = '0.3'
-conv = '0.3'
-criterion = '0.5'
+constant_time_eq = '0.4'
+criterion = '0.7'
 crossbeam-skiplist = '0.1'
 crossbeam-utils = '0.8'
 ctr = { version = '0.9', features = ['zeroize'] }
-darling = '0.20'
+darling = '0.21'
 dashmap = '6.1'
 dedicated_executor = { path = 'dedicated_executor' }
 delay_map = '0.4'
 derivative = '2'
-derive_more = { version = '1', features = ["full"] }
-dirs = '5'
-discv5 = { version = '0.9', features = ['libp2p'] }
-drain_filter_polyfill = '0.1'
-duplicate = '1'
+derive_more = { version = '2', features = ['full'] }
+dirs = '6'
+discv5 = { version = '0.10', features = ['libp2p'] }
+duplicate = '2'
 easy-ext = '1'
 either = '1'
 enum-iterator = '2'
@@ -329,48 +333,47 @@ enum-map = '2'
 enumset = '1'
 env_logger = '0.11'
 ethereum-types = '0.14'
-ff = "0.13.0"
-fixed-hash = '0.8.0'
+ff = '0.13'
+fixed-hash = '0.8'
 fnv = '1'
-fs-err = { version = '2', features = ['tokio'] }
+fs-err = { version = '3', features = ['tokio'] }
 fs_extra = '1'
 futures = '0.3'
-futures-ticker = '0.0.3'
-futures-timer = '3'
-generic-array = { version = '0.14', features = ['serde'] }
-getrandom = '0.2'
+gag = '1'
+# Temporary freeze until the code is migrated to 1.x
+# generic-array lock path: universal_precompiles -> sha2 -> digest (newer versions migrated to hybrid-array)
+generic-array = { version = '=0.14.7', features = ['serde'] }
 git-version = '0.3'
 glob = '0.3'
 good_lp = { version = '1', default-features = false, features = ['highs'] }
 hash_hasher = '2'
-hashlink = '0.9'
 hex = { version = '0.4', features = ['serde'] }
-hex-literal = '0.4'
+hex-literal = '1'
 hmac = '0.12'
 http = '1'
 http-body-util = '0.1'
 httparse = '1'
-httpmock = '0.7'
-hyper = '1'
-igd-next = '0.15'
+httpmock = '0.8'
+igd-next = '0.16'
 # Possible optimization: fork `im` and make it use `triomphe`.
 # It's easy to do, but the amount of memory it saves is negligible.
 im = '15'
-impl-serde = '0.4'
+impl-serde = '0.5'
 integer-sqrt = '0.1'
 instant = '0.1'
-itertools = '0.13'
-jemalloc-ctl = '0.5'
-jemallocator = '0.5'
+itertools = '0.14'
 jwt-simple = { version = '0.12', default-features = false, features = ['pure-rust'] }
 kzg = { git = 'https://github.com/grandinetech/rust-kzg.git' }
 lazy_static = '1'
-libmdbx = { git = 'https://github.com/paradigmxyz/reth.git', package = 'reth-libmdbx', rev = 'c228fe15808c3acbf18dc3af1a03ef5cbdcda07a' }
-libp2p = { version = '0.55', default-features = false, features = ['metrics', 'dns', 'ecdsa', 'identify', 'macros', 'noise', 'plaintext', 'secp256k1', 'serde', 'tcp', 'tokio', 'yamux', 'quic', 'upnp'] }
+libmdbx = { git = 'https://github.com/paradigmxyz/reth.git', package = 'reth-libmdbx', rev = '6f8e7258f4733279080e4bd8345ce50538a40d6e' }
+libp2p = { version = '0.56', default-features = false, features = ['metrics', 'dns', 'ecdsa', 'identify', 'macros', 'noise', 'plaintext', 'secp256k1', 'serde', 'tcp', 'tokio', 'yamux', 'quic', 'upnp'] }
 libp2p-mplex = '0.43'
+libp2p-identity = { version = '0.2.10', features = ['peerid'] }
+local-ip-address = '0.6'
 log = '0.4'
-lru = '0.12'
-mediatype = '0.19'
+logroller = '0.1'
+lru = '0.16'
+mediatype = '0.21'
 memoffset = '0.9'
 mime = '0.3'
 nonzero_ext = '0.3'
@@ -381,6 +384,9 @@ num_cpus = '1'
 num_threads = '0.1'
 once_cell = '1'
 openssl = '0.10'
+opentelemetry = '0.31'
+opentelemetry_sdk = '0.31'
+opentelemetry-otlp = { version = '0.31', features = ['grpc-tonic'] }
 parking_lot = '0.12'
 parse-display = '0.10'
 pathdiff = '0.2'
@@ -388,24 +394,23 @@ pbkdf2 = '0.12'
 primitive-types = '0.12'
 proc-macro-crate = '3'
 proc-macro2 = '1'
-# Due to vulnerability in dependency use unreleased version, upgrade to '>0.13.4' once it's released
-prometheus = { git = 'https://github.com/tikv/rust-prometheus.git', rev = 'e17c5ced2bc0f8ea436aaf1acc830a30ab15ada3' }
-prometheus-client = '0.22'
+prometheus = '0.14'
+prometheus-client = '0.23'
 psutil = '3'
-quick-protobuf = '0.8'
-quick-protobuf-codec = '0.3'
 quickcheck = '1'
 quickcheck_macros = '1'
 quote = '1'
 rand = '0.8'
+rand_chacha = '0.3'
 rayon = '1'
 rc-box = '1'
-# Currently refinery does not support rusqlite version 0.32
-refinery = { git = 'https://github.com/manuteleco/refinery.git', rev = '63f3c39a8adb40e9e7b7f9c8b21a4fee2d685e3d', features = ['rusqlite'] }
+refinery = { version = '0.9',  features = ['rusqlite'] }
 regex = '1'
 replace_with = '0.1'
 reqwest = { version = '0.12', features = ['json', 'native-tls-vendored'] }
-rusqlite = { version = '0.32', features = ['bundled'] }
+risc0-build = { version = '3.0.3', features = ['unstable'] }
+risc0-zkvm = { version = '3.0.3', features = ['unstable', 'heap-embedded-alloc'] }
+rusqlite = { version = '0.37', features = ['bundled'] }
 rust-kzg-arkworks5 = { git = 'https://github.com/grandinetech/rust-kzg.git' }
 rust-kzg-blst = { git = 'https://github.com/grandinetech/rust-kzg.git' }
 rust-kzg-constantine = { git = 'https://github.com/grandinetech/rust-kzg.git' }
@@ -413,10 +418,11 @@ rust-kzg-mcl = { git = 'https://github.com/grandinetech/rust-kzg.git' }
 rust-kzg-zkcrypto = { git = 'https://github.com/grandinetech/rust-kzg.git' }
 scrypt = '0.11'
 semver = '1'
+serial_test = '3'
 serde = { version = '1', features = ['derive', 'rc'] }
 serde-aux = '4'
 serde_json = { version = '1', features = ['preserve_order'] }
-serde_qs = { version = '0.14', features = ['axum'] }
+serde_qs = { version = '0.15', features = ['axum'] }
 serde_repr = '0.1'
 serde_with = '3'
 # TODO: replace serde_yaml with alternative, since it is deprecated:
@@ -424,33 +430,42 @@ serde_with = '3'
 serde_yaml = '0.9'
 # The `asm` feature in `sha2` doesn't do anything on recent `x86_64` CPUs
 # because `sha2` defaults to using CPU intrinsics.
-sha2 = { version = '0.10', features = ['compress'] }
+sha2 = { git = 'https://github.com/grandinetech/universal-precompiles.git', tag = 'sha2-v0.10.9-up.1', features = ['compress'] }
+
 slog = { version = '2', features = ['max_level_trace'] }
 slog-async = '2'
 slog-stdlog = '4'
 slog-term = '2'
 smallvec = { version = '1', features = ['serde', 'union'] }
 snap = '1'
+sp1-helper = '5.2.1'
+sp1-sdk = '5.2.1'
+sp1-zkvm = { version = '5.2.1', features = ['embedded'] }
 static_assertions = '1'
-strum = { version = '0.26', features = ['derive'] }
+strum = { version = '0.27', features = ['derive'] }
 syn = { version = '2', features = ['full'] }
-sysinfo = '0.33'
+sysinfo = '0.37'
 tap = '1'
 tempfile = '3'
 test-case = '3'
 test-generator = '0.3'
-testing_logger = '0.1'
-thiserror = '1'
-tiny-keccak = '2'
+thiserror = '2'
+tikv-jemalloc-ctl = { version = '0.6', features = ['stats'] }
+tikv-jemallocator = { version = '0.6', features = ['stats', 'background_threads_runtime_support'] }
+tiny-keccak = { version = '2', features = ['keccak'] }
 tokio = { version = '1', features = ['fs', 'macros', 'rt-multi-thread', 'signal', 'sync', 'time'] }
 tokio-io-timeout = '1'
 tokio-stream = { version = '0.1', features = ['sync'] }
 tokio-util = { version = '0.7', features = ['codec', 'compat', 'time'] }
 tower = { version = '0.5', features = ['timeout'] }
-tower-http = { version = '0.5', features = ['cors', 'trace'] }
+tower-http = { version = '0.6', features = ['cors', 'trace'] }
 tracing = '0.1'
+tracing-appender = '0.2'
+tracing-opentelemetry = '0.32'
+tracing-subscriber = { version = '0.3', features = ['env-filter', 'fmt', 'registry', 'chrono'] }
+tracing-test = '0.2'
 triomphe = '0.1'
-tynm = '0.1'
+tynm = '0.2'
 typenum = '1'
 unicode-normalization = '0.1'
 unsigned-varint = { version = '= 0.8', features = ['codec'] }
@@ -458,8 +473,9 @@ unwrap_none = '0.1'
 url = '2'
 uuid = { version = '1', features = ['serde', 'v4'] }
 variant_count = '1'
-void = '1'
 web3 = { git = 'https://github.com/grandinetech/rust-web3.git' }
+winsafe = { version = '0', features = ['kernel', 'psapi'] }
+xz2 = { version = '0.1' }
 zeroize = { version = '1', features = ['derive', 'serde'] }
 
 allocator = { path = 'allocator' }
@@ -467,13 +483,16 @@ arithmetic = { path = 'arithmetic' }
 attestation_verifier = { path = 'attestation_verifier' }
 binary_utils = { path = 'binary_utils' }
 block_producer = { path = 'block_producer' }
+# Replace the line below with `bls = { path = 'bls', features = ['blst'] }` for `ad_hoc_bench` and other utilities
 bls = { path = 'bls' }
 bls-blst = { path = 'bls/bls-blst' }
 bls-core = { path = 'bls/bls-core' }
 bls-zkcrypto = { path = 'bls/bls-zkcrypto' }
 builder_api = { path = 'builder_api' }
 clock = { path = 'clock' }
+data_dumper = { path = 'data_dumper' }
 database = { path = 'database' }
+debug_info = { path = 'debug_info' }
 deposit_tree = { path = 'deposit_tree' }
 directories = { path = 'directories' }
 doppelganger_protection = { path = 'doppelganger_protection' }
@@ -489,7 +508,7 @@ features = { path = 'features' }
 fork_choice_control = { path = 'fork_choice_control' }
 fork_choice_store = { path = 'fork_choice_store' }
 genesis = { path = 'genesis' }
-gossipsub = { path = 'eth2_libp2p/gossipsub', features = ['serde'] }
+gossipsub = { package = 'libp2p-gossipsub', git = 'https://github.com/sigp/rust-libp2p.git', rev = '5acdf89a65d64098f9346efa5769e57bcd19dea9', features = ['metrics', 'serde'] }
 grandine_version = { path = 'grandine_version' }
 hashing = { path = 'hashing' }
 helper_functions = { path = 'helper_functions' }
@@ -497,6 +516,7 @@ http_api = { path = 'http_api' }
 http_api_utils = { path = 'http_api_utils' }
 interop = { path = 'interop' }
 keymanager = { path = 'keymanager' }
+# Replace the line below with `kzg_utils = { path = 'kzg_utils', features = ['blst'] }` for `ad_hoc_bench` and other utilities
 kzg_utils = { path = 'kzg_utils' }
 liveness_tracker = { path = 'liveness_tracker' }
 logging = { path = 'logging' }
@@ -506,6 +526,7 @@ p2p = { path = 'p2p' }
 panics = { path = 'panics' }
 predefined_chains = { path = 'predefined_chains' }
 prometheus_metrics = { path = 'prometheus_metrics' }
+pubkey_cache = { path = 'pubkey_cache' }
 runtime = { path = 'runtime' }
 serde_utils = { path = 'serde_utils' }
 shuffling = { path = 'shuffling' }
@@ -523,7 +544,9 @@ try_from_iterator = { path = 'try_from_iterator' }
 types = { path = 'types' }
 validator = { path = 'validator' }
 validator_key_cache = { path = 'validator_key_cache' }
-winsafe = { git = 'https://github.com/rodrigocfd/winsafe', features = ['kernel', 'psapi'] }
+validator_statistics = { path = 'validator_statistics' }
+zkvm_guest_risc0 = { path = 'zkvm/guest/risc0' }
+zkvm_host = { path = 'zkvm/host' }
 
 # Banned crates
 #
@@ -568,10 +591,12 @@ inherits = 'release'
 # This makes file names and line numbers unavailable in backtraces.
 # Some stack frames disappear, but the ones that remain should still have identifiers.
 debug = 'none'
-# 105 MiB -> 90 MiB
-lto = true
+# We have a problem with `rayon` overflowing stack if compiled with lto.
+# This issue was also reported elsewhere:
+# https://users.rust-lang.org/t/lto-causes-stack-overflow/48256
+lto = false
 # 90 MiB -> 86 MiB
-codegen-units = 1
+# codegen-units = 1
 # 86 MiB -> 88 MiB
 # Optimizing for size previously caused a significant decrease in performance (and might still do).
 # It actually makes the executable bigger now.
@@ -581,3 +606,8 @@ codegen-units = 1
 # `geth` responds to invalid payloads with objects containing `method` and `params`.
 # We had to fork `jsonrpc` because it does not allow nonstandard members.
 jsonrpc-core = { git = 'https://github.com/grandinetech/jsonrpc.git' }
+quick-protobuf = { git = 'https://github.com/sigp/quick-protobuf.git', rev = '681f413312404ab6e51f0b46f39b0075c6f4ebfd' }
+sha2 = { git = 'https://github.com/grandinetech/universal-precompiles.git', tag = 'sha2-v0.10.9-up.1' }
+
+[patch.'https://github.com/zkcrypto/bls12_381.git']
+bls12_381 = { git = 'https://github.com/grandinetech/universal-precompiles.git', tag = 'bls12_381-6bb9695-up.1' }

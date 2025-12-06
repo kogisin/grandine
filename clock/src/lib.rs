@@ -60,11 +60,10 @@
 //! [`timer`]:         https://crates.io/crates/timer
 //! [`white_rabbit`]:  https://crates.io/crates/white_rabbit
 
-use core::{num::NonZeroU128, time::Duration};
-use std::time::{Instant, SystemTime};
+use core::{error::Error, time::Duration};
+use std::time::{Instant, SystemTime, SystemTimeError};
 
 use anyhow::Result;
-use arithmetic::U128Ext as _;
 use enum_iterator::Sequence;
 use futures::stream::{Stream, StreamExt as _, TryStreamExt as _};
 use helper_functions::misc;
@@ -82,9 +81,36 @@ use types::{
     traits::{BeaconBlock as _, SignedBeaconBlock},
 };
 
-use crate::fake_time::{InstantLike, SystemTimeLike};
-
+#[cfg(test)]
 mod fake_time;
+
+pub trait InstantLike: Sized {
+    fn checked_add(self, duration: Duration) -> Option<Self>;
+}
+
+pub trait SystemTimeLike: Copy {
+    type Error: Error + Send + Sync + 'static;
+
+    const UNIX_EPOCH: Self;
+
+    fn duration_since(self, earlier: Self) -> Result<Duration, Self::Error>;
+}
+
+impl InstantLike for Instant {
+    fn checked_add(self, duration: Duration) -> Option<Self> {
+        Self::checked_add(&self, duration)
+    }
+}
+
+impl SystemTimeLike for SystemTime {
+    type Error = SystemTimeError;
+
+    const UNIX_EPOCH: Self = Self::UNIX_EPOCH;
+
+    fn duration_since(self, earlier: Self) -> Result<Duration, Self::Error> {
+        Self::duration_since(&self, earlier)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize)]
 pub struct Tick {
@@ -165,7 +191,7 @@ impl Tick {
 
         let Self { slot, kind } = self;
         let slot_duration = slot_duration(config);
-        let tick_duration = tick_duration(config)?;
+        let tick_duration = tick_duration(config);
         let duration_before_slot = slot_duration.saturating_mul((slot - GENESIS_SLOT).try_into()?);
         let duration_after_slot = tick_duration.saturating_mul(kind as u32);
         let duration_until_tick = duration_before_slot + duration_after_slot;
@@ -186,7 +212,7 @@ impl Tick {
             .saturating_sub(unix_epoch_to_genesis)
             .as_nanos();
 
-        let nanos_per_tick = tick_duration(config)?.as_nanos();
+        let nanos_per_tick = tick_duration(config).as_nanos();
         let ticks_per_slot = u128::try_from(TickKind::CARDINALITY)?;
         let ticks_since_genesis = nanos_since_genesis / nanos_per_tick;
         let slots_since_genesis = u64::try_from(ticks_since_genesis / ticks_per_slot)?;
@@ -209,7 +235,7 @@ impl Tick {
 
         let next_slot = match kind.next() {
             Some(_) => slot,
-            None => slot.checked_add(1).ok_or(Error::RanOutOfSlots)?,
+            None => slot.checked_add(1).ok_or(ClockError::RanOutOfSlots)?,
         };
 
         let next_kind = enum_iterator::next_cycle(&kind);
@@ -236,13 +262,11 @@ pub enum TickKind {
 
 #[derive(Debug, Error)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-pub enum Error {
+pub enum ClockError {
     #[error("time of next tick overflowed")]
     NextInstantOverflow,
     #[error("ran out of slots")]
     RanOutOfSlots,
-    #[error("slot is not evenly divisible into {} ticks", TickKind::CARDINALITY)]
-    SlotNotEvenlyDivisible,
 }
 
 pub fn ticks(
@@ -258,7 +282,7 @@ pub fn ticks(
     let (mut next_tick, next_instant) =
         next_tick_with_instant(config, now_instant, now_system_time, genesis_time, false)?;
 
-    let tick_duration = tick_duration(config)?;
+    let tick_duration = tick_duration(config);
     let interval = tokio::time::interval_at(next_instant.into(), tick_duration);
 
     Ok(IntervalStream::new(interval)
@@ -321,11 +345,11 @@ fn next_tick_with_instant<I: InstantLike, S: SystemTimeLike>(
         next_tick = Tick::start_of_slot(GENESIS_SLOT);
         now_to_next_tick = unix_epoch_to_genesis - unix_epoch_to_now;
     } else {
-        let tick_duration = tick_duration(config)?;
+        let tick_duration = tick_duration(config);
         let genesis_to_now = unix_epoch_to_now - unix_epoch_to_genesis;
-        let slots_since_genesis = genesis_to_now.as_secs() / config.seconds_per_slot;
+        let slots_since_genesis = genesis_to_now.as_secs() / config.slot_duration_ms.as_secs();
         let genesis_to_current_slot =
-            Duration::from_secs(slots_since_genesis * config.seconds_per_slot.get());
+            Duration::from_secs(slots_since_genesis * config.slot_duration_ms.as_secs());
         let current_slot_to_now = genesis_to_now - genesis_to_current_slot;
 
         next_tick = Tick::start_of_slot(GENESIS_SLOT + slots_since_genesis);
@@ -344,40 +368,34 @@ fn next_tick_with_instant<I: InstantLike, S: SystemTimeLike>(
         }
 
         now_to_next_tick -= current_slot_to_now;
-    };
+    }
 
     let next_instant = now_instant
         .checked_add(now_to_next_tick)
-        .ok_or(Error::NextInstantOverflow)?;
+        .ok_or(ClockError::NextInstantOverflow)?;
 
     Ok((next_tick, next_instant))
 }
 
-fn tick_duration(config: &Config) -> Result<Duration, Error> {
+fn tick_duration(config: &Config) -> Duration {
     let slot_duration = slot_duration(config);
 
     let ticks_per_slot_u32 =
         u32::try_from(TickKind::CARDINALITY).expect("number of ticks per slot fits in u32");
 
-    let ticks_per_slot_u128 =
-        NonZeroU128::new(ticks_per_slot_u32.into()).expect("TickKind is not an empty enum");
-
-    if !slot_duration.as_nanos().is_multiple_of(ticks_per_slot_u128) {
-        return Err(Error::SlotNotEvenlyDivisible);
-    }
-
-    Ok(slot_duration / ticks_per_slot_u32)
+    slot_duration / ticks_per_slot_u32
 }
 
+// TODO: Remove this function and update all usages throughout the app to work with slot duration
+//       in ms (instead of seconds) once `Config::seconds_per_slot` is removed from the Config.
 const fn slot_duration(config: &Config) -> Duration {
-    Duration::from_secs(config.seconds_per_slot.get())
+    config.slot_duration_ms
 }
 
 #[cfg(test)]
 mod tests {
     use core::{num::NonZeroU64, ops::Add as _};
 
-    use arithmetic::UsizeExt as _;
     use futures::future::FutureExt as _;
     use itertools::Itertools as _;
     use nonzero_ext::nonzero;
@@ -390,7 +408,7 @@ mod tests {
 
     #[test]
     fn tick_count_is_a_multiple_of_interval_count() {
-        assert!(TickKind::CARDINALITY.is_multiple_of(INTERVALS_PER_SLOT));
+        assert!(TickKind::CARDINALITY.is_multiple_of(INTERVALS_PER_SLOT.into()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -626,16 +644,11 @@ mod tests {
         next_tick_with_instant(&Config::minimal(), time, true)
     }
 
-    #[test_case(NonZeroU64::MIN => Err(Error::SlotNotEvenlyDivisible))]
-    #[test_case(nonzero!(2_u64) => Err(Error::SlotNotEvenlyDivisible))]
-    #[test_case(nonzero!(3_u64) => Ok(Duration::from_millis(250)))]
-    #[test_case(nonzero!(4_u64) => Err(Error::SlotNotEvenlyDivisible))]
-    #[test_case(Config::minimal().seconds_per_slot => Ok(Duration::from_millis(500)))]
-    #[test_case(Config::mainnet().seconds_per_slot => Ok(Duration::from_secs(1)))]
-    #[test_case(nonzero!(18_u64) => Ok(Duration::from_millis(1500)))]
-    fn tick_duration_with_seconds_per_slot(
-        seconds_per_slot: NonZeroU64,
-    ) -> Result<Duration, Error> {
+    #[test_case(nonzero!(3_u64) => Duration::from_millis(250))]
+    #[test_case(NonZeroU64::new(Config::minimal().slot_duration_ms.as_secs()).expect("Config::minimal slot_duration_ms is nonzero") => Duration::from_millis(500))]
+    #[test_case(NonZeroU64::new(Config::mainnet().slot_duration_ms.as_secs()).expect("Config::mainnet slot_duration_ms is nonzero") => Duration::from_secs(1))]
+    #[test_case(nonzero!(18_u64) => Duration::from_millis(1500))]
+    fn tick_duration_with_seconds_per_slot(seconds_per_slot: NonZeroU64) -> Duration {
         let config = config_with_seconds_per_slot(seconds_per_slot);
         tick_duration(&config)
     }
@@ -674,8 +687,13 @@ mod tests {
     }
 
     fn config_with_seconds_per_slot(seconds_per_slot: NonZeroU64) -> Config {
+        #[expect(
+            deprecated,
+            reason = "seconds_per_slot is still present in the consensus specs as of v1.6.0-alpha.5"
+        )]
         Config {
             seconds_per_slot,
+            slot_duration_ms: Duration::from_secs(seconds_per_slot.get()),
             ..Config::default()
         }
     }

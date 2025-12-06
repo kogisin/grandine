@@ -1,12 +1,7 @@
-#![expect(
-    clippy::allow_attributes,
-    reason = "clippy::allow_attributes lint triggers from some derive macros. \
-              See <https://github.com/rust-lang/rust-clippy/issues/13349>."
-)]
 use core::fmt::Debug;
 
 use derivative::Derivative;
-use derive_more::{AsRef, Deref};
+use derive_more::Deref;
 use serde::{Serialize, Serializer};
 
 use crate::{
@@ -68,11 +63,8 @@ impl<T: SszSize> SszSize for DynamicList<T> {
 
 impl<T: SszReadDefault> SszRead<usize> for DynamicList<T> {
     fn from_ssz_unchecked(maximum: &usize, bytes: &[u8]) -> Result<Self, ReadError> {
-        let results = shared::read_list(&(), bytes)?;
-
-        itertools::process_results(results, |elements| {
-            Self::try_from_iter_with_maximum(elements, *maximum)
-        })?
+        let elements = shared::read_list(*maximum, &(), bytes)?;
+        Ok(Self::new_unchecked(elements))
     }
 }
 
@@ -107,19 +99,14 @@ impl<T> DynamicList<T> {
         Self::new_unchecked(vec![element; maximum].into())
     }
 
+    pub fn from_vec(vec: Vec<T>, maximum: usize) -> Result<Self, ReadError> {
+        Self::validate_length(vec.len(), maximum)?;
+        Ok(Self::new_unchecked(vec.into()))
+    }
+
     pub fn from_iter_with_maximum(elements: impl IntoIterator<Item = T>, maximum: usize) -> Self {
         let elements = elements.into_iter().take(maximum).collect::<Box<_>>();
         Self::new_unchecked(elements)
-    }
-
-    pub fn try_from_iter_with_maximum(
-        elements: impl IntoIterator<Item = T>,
-        maximum: usize,
-    ) -> Result<Self, ReadError> {
-        let elements = Box::from_iter(elements);
-
-        Self::validate_length(elements.len(), maximum)?;
-        Ok(Self::new_unchecked(elements))
     }
 
     const fn validate_length(actual: usize, maximum: usize) -> Result<(), ReadError> {

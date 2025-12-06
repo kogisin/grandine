@@ -1,20 +1,22 @@
 use core::sync::atomic::AtomicBool;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     thread::Builder,
 };
 
 use anyhow::{bail, ensure, Result};
-use database::Database;
+use database::{Database, PrefixableKey};
 use derive_more::Display;
 use eth1_api::RealController;
-use fork_choice_control::PrefixableKey;
-use fork_choice_store::{BlobSidecarAction, BlobSidecarOrigin};
+use fork_choice_store::{
+    BlobSidecarAction, BlobSidecarOrigin, DataColumnSidecarAction, DataColumnSidecarOrigin,
+};
 use futures::channel::mpsc::UnboundedSender;
 use genesis::AnchorCheckpointProvider;
 use helper_functions::misc;
-use log::{debug, info, warn};
+use logging::{debug_with_peers, info_with_peers, warn_with_peers};
+use serde::{Deserialize, Serialize};
 use ssz::{Ssz, SszReadDefault as _, SszWrite as _};
 use std_ext::ArcExt as _;
 use thiserror::Error;
@@ -25,7 +27,11 @@ use types::{
         containers::{BlobIdentifier, BlobSidecar},
         primitives::BlobIndex,
     },
-    nonstandard::PayloadStatus,
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar},
+        primitives::ColumnIndex,
+    },
+    nonstandard::{PayloadStatus, WithStatus},
     phase0::{
         consts::GENESIS_SLOT,
         primitives::{Slot, H256},
@@ -41,29 +47,37 @@ pub struct BackSync<P: Preset> {
     batch: Batch<P>,
     data: Data,
     archiving: bool,
+    sync_mode: SyncMode,
 }
 
 impl<P: Preset> BackSync<P> {
     pub fn load(database: &Database) -> Result<Option<Self>> {
         let data = Data::find(database)?;
 
-        debug!("loaded back-sync: {data:?}");
+        debug_with_peers!("loaded back-sync: {data:?}");
 
-        if let Some(data) = data.as_ref() {
-            info!(
-                "starting back-sync from {} to {} slot",
-                data.current.slot, data.low.slot
-            );
-        }
+        let Some(data) = data else {
+            return Ok(None);
+        };
 
-        Ok(data.map(Self::new))
+        let sync_mode = SyncMode::load(database, data.low.slot)?;
+
+        info_with_peers!(
+            "starting {} from {} to {} slot",
+            sync_mode.name(),
+            data.current.slot,
+            data.low.slot
+        );
+
+        Ok(Some(Self::new(data, sync_mode)))
     }
 
-    pub fn new(data: Data) -> Self {
+    pub fn new(data: Data, sync_mode: SyncMode) -> Self {
         Self {
             data,
             batch: Batch::default(),
             archiving: false,
+            sync_mode,
         }
     }
 
@@ -92,6 +106,7 @@ impl<P: Preset> BackSync<P> {
     }
 
     pub fn remove(&self, database: &Database) -> Result<()> {
+        self.sync_mode.remove(database, self.data.low.slot)?;
         self.data.remove(database)
     }
 
@@ -106,7 +121,7 @@ impl<P: Preset> BackSync<P> {
             self.batch.push_blob_sidecar(blob_sidecar);
         } else {
             let blob_identifier: BlobIdentifier = blob_sidecar.as_ref().into();
-            debug!("ignoring blob sidecar: {blob_identifier:?}, slot: {slot}");
+            debug_with_peers!("ignoring blob sidecar: {blob_identifier:?}, slot: {slot}");
         }
     }
 
@@ -116,12 +131,28 @@ impl<P: Preset> BackSync<P> {
         if slot <= self.high_slot() && !self.is_finished() {
             self.batch.push_block(block);
         } else {
-            debug!("ignoring block: {slot}");
+            debug_with_peers!("ignoring block: {slot}");
+        }
+    }
+
+    pub fn push_data_column_sidecar(&mut self, data_column_sidecar: Arc<DataColumnSidecar<P>>) {
+        let slot = data_column_sidecar.signed_block_header.message.slot;
+
+        if slot <= self.high_slot() && !self.is_finished() {
+            self.batch.push_data_column_sidecar(data_column_sidecar);
+        } else {
+            let data_column_id: DataColumnIdentifier = data_column_sidecar.as_ref().into();
+            debug_with_peers!("ignoring data column sidecar: {data_column_id:?}, slot: {slot}");
         }
     }
 
     pub fn save(&self, database: &Database) -> Result<()> {
+        self.sync_mode.save(database, self.data.low.slot)?;
         self.data.save(database)
+    }
+
+    pub const fn sync_mode(&self) -> &SyncMode {
+        &self.sync_mode
     }
 
     pub fn try_to_spawn_state_archiver(
@@ -132,12 +163,12 @@ impl<P: Preset> BackSync<P> {
         sync_tx: UnboundedSender<ArchiverToSync>,
     ) -> Result<()> {
         if !self.is_finished() {
-            debug!("not spawning state archiver: back-sync not yet finished");
+            debug_with_peers!("not spawning state archiver: back-sync not yet finished");
             return Ok(());
         }
 
         if self.archiving {
-            debug!("not spawning state archiver: state archiver already started");
+            debug_with_peers!("not spawning state archiver: state archiver already started");
             return Ok(());
         }
 
@@ -147,7 +178,7 @@ impl<P: Preset> BackSync<P> {
         Builder::new()
             .name("state-archiver".to_owned())
             .spawn(move || {
-                info!("archiving back-synced states from {start_slot} to {end_slot}");
+                info_with_peers!("archiving back-synced states from {start_slot} to {end_slot}");
 
                 match controller.archive_back_sync_states(
                     start_slot,
@@ -155,9 +186,13 @@ impl<P: Preset> BackSync<P> {
                     &anchor_checkpoint_provider,
                     &is_exiting,
                 ) {
-                    Ok(()) => info!("back-sync state archiver thread finished successfully"),
-                    Err(error) => warn!("unable to archive back back-sync states: {error:?}"),
-                };
+                    Ok(()) => {
+                        info_with_peers!("back-sync state archiver thread finished successfully")
+                    }
+                    Err(error) => {
+                        warn_with_peers!("unable to archive back back-sync states: {error:?}")
+                    }
+                }
 
                 ArchiverToSync::BackSyncStatesArchived.send(&sync_tx);
             })?;
@@ -175,13 +210,25 @@ impl<P: Preset> BackSync<P> {
     ) -> Result<()> {
         let last_block_checkpoint = self.data.current;
 
-        let (checkpoint, blocks, blob_sidecars) =
-            self.batch
-                .verify_from_checkpoint(config, controller, last_block_checkpoint)?;
+        let (checkpoint, blocks, blob_sidecars, data_column_sidecars) = match &self.sync_mode {
+            SyncMode::Default => {
+                self.batch
+                    .verify_from_checkpoint(config, controller, last_block_checkpoint)?
+            }
+            SyncMode::DataColumnsOnly { column_indices, .. } => {
+                self.batch.verify_extra_data_columns_from_checkpoint(
+                    config,
+                    controller,
+                    last_block_checkpoint,
+                    column_indices,
+                    self.low_slot(),
+                )?
+            }
+        };
 
-        info!("back-synced to {} slot", checkpoint.slot);
+        info_with_peers!("back-synced to {} slot", checkpoint.slot);
 
-        if checkpoint.slot == self.low_slot() {
+        if self.sync_mode.validate_checkpoint_slot() && checkpoint.slot == self.low_slot() {
             let expected = self.data.low;
             let actual = checkpoint;
 
@@ -196,12 +243,13 @@ impl<P: Preset> BackSync<P> {
         // Store back-synced blocks in fork choice db.
         controller.store_back_sync_blocks(blocks)?;
         controller.store_back_sync_blob_sidecars(blob_sidecars)?;
+        controller.store_back_sync_data_column_sidecars(data_column_sidecars)?;
 
         // Update back-sync progress in sync database.
         self.data.current = checkpoint;
         self.save(database)?;
 
-        debug!("back-sync batch saved {checkpoint:?}");
+        debug_with_peers!("back-sync batch saved {checkpoint:?}");
 
         Ok(())
     }
@@ -211,6 +259,7 @@ impl<P: Preset> BackSync<P> {
 struct Batch<P: Preset> {
     blocks: BTreeMap<Slot, Arc<SignedBeaconBlock<P>>>,
     blob_sidecars: HashMap<BlobIdentifier, Arc<BlobSidecar<P>>>,
+    data_column_sidecars: HashMap<DataColumnIdentifier, Arc<DataColumnSidecar<P>>>,
 }
 
 impl<P: Preset> Batch<P> {
@@ -223,6 +272,11 @@ impl<P: Preset> Batch<P> {
         self.blocks.insert(block.message().slot(), block);
     }
 
+    fn push_data_column_sidecar(&mut self, data_column_sidecar: Arc<DataColumnSidecar<P>>) {
+        self.data_column_sidecars
+            .insert(data_column_sidecar.as_ref().into(), data_column_sidecar);
+    }
+
     pub fn valid_blob_sidecars_for(
         &self,
         config: &Config,
@@ -232,7 +286,7 @@ impl<P: Preset> Batch<P> {
     ) -> Result<Vec<Arc<BlobSidecar<P>>>> {
         let block = block.message();
 
-        let Some(body) = block.body().post_deneb() else {
+        let Some(body) = block.body().with_blob_kzg_commitments() else {
             return Ok(vec![]);
         };
 
@@ -260,13 +314,15 @@ impl<P: Preset> Batch<P> {
                     })
                 };
 
-                let action = controller.validate_blob_sidecar_with_state(
-                    blob_sidecar.clone_arc(),
-                    true,
-                    &BlobSidecarOrigin::BackSync,
-                    || Some((parent.clone_arc(), PayloadStatus::Optimistic)),
-                    || Ok(head_state.clone_arc()),
-                )?;
+                let action = tokio::task::block_in_place(|| {
+                    controller.validate_blob_sidecar_with_state(
+                        blob_sidecar.clone_arc(),
+                        true,
+                        &BlobSidecarOrigin::BackSync,
+                        || Some((parent.clone_arc(), PayloadStatus::Optimistic)),
+                        || Some(head_state.clone_arc()),
+                    )
+                })?;
 
                 if !action.accepted() {
                     bail!(Error::BlobNotAccepted::<P> {
@@ -282,6 +338,75 @@ impl<P: Preset> Batch<P> {
             .collect()
     }
 
+    fn valid_data_column_sidecars_for(
+        &self,
+        config: &Config,
+        controller: &RealController<P>,
+        block: &Arc<SignedBeaconBlock<P>>,
+        parent: &Arc<SignedBeaconBlock<P>>,
+        validatable_columns: &HashSet<ColumnIndex>,
+        validate_block_presence: bool,
+    ) -> Result<Vec<Arc<DataColumnSidecar<P>>>> {
+        let block = block.message();
+
+        // `block.phase` has already been checked
+        let Some(body) = block.body().with_blob_kzg_commitments() else {
+            return Ok(vec![]);
+        };
+
+        if body.blob_kzg_commitments().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let head_state = controller.head_state().value;
+        let block_root = block.hash_tree_root();
+        let slot = block.slot();
+        let head_slot = head_state.slot();
+
+        if slot < misc::data_column_serve_range_slot::<P>(config, head_slot) {
+            return Ok(vec![]);
+        }
+
+        validatable_columns
+            .iter()
+            .copied()
+            .map(|index| {
+                let Some(data_column_sidear) = self
+                    .data_column_sidecars
+                    .get(&DataColumnIdentifier { block_root, index })
+                else {
+                    bail!(Error::DataColumnMissing::<P> {
+                        block_root,
+                        slot,
+                        index,
+                    })
+                };
+
+                let action = tokio::task::block_in_place(|| {
+                    controller.validate_data_column_sidecar_with_state(
+                        data_column_sidear.clone_arc(),
+                        true,
+                        &DataColumnSidecarOrigin::BackSync,
+                        validate_block_presence,
+                        || Some((parent.clone_arc(), PayloadStatus::Optimistic)),
+                        || Some(head_state.clone_arc()),
+                    )
+                })?;
+
+                if !action.accepted() {
+                    bail!(Error::DataColumnNotAccepted::<P> {
+                        action,
+                        block_root,
+                        slot,
+                        index
+                    })
+                }
+
+                Ok(data_column_sidear.clone_arc())
+            })
+            .collect()
+    }
+
     #[expect(clippy::type_complexity)]
     fn verify_from_checkpoint(
         &self,
@@ -290,14 +415,16 @@ impl<P: Preset> Batch<P> {
         mut checkpoint: SyncCheckpoint,
     ) -> Result<(
         SyncCheckpoint,
-        impl Iterator<Item = Arc<SignedBeaconBlock<P>>>,
-        impl Iterator<Item = Arc<BlobSidecar<P>>>,
+        Vec<Arc<SignedBeaconBlock<P>>>,
+        Vec<Arc<BlobSidecar<P>>>,
+        Vec<Arc<DataColumnSidecar<P>>>,
     )> {
-        debug!("verify back-sync batch from: {checkpoint:?}");
+        debug_with_peers!("verify back-sync batch from: {checkpoint:?}");
 
         let mut next_parent_root = checkpoint.parent_root;
         let mut verified_blob_sidecars = vec![];
         let mut verified_blocks = vec![];
+        let mut verified_data_column_sidecars = vec![];
         let head_state = controller.head_state().value();
 
         let mut blocks = self
@@ -314,10 +441,10 @@ impl<P: Preset> Batch<P> {
             if block.message().slot() == GENESIS_SLOT {
                 // if it's a genesis block, return it as is.
                 // It will be validated against our own genesis_block during
-                // final checkpoint vaildation
+                // final checkpoint validation
                 verified_blocks.push(block.clone_arc());
             } else if let Some(parent) = blocks.peek() {
-                debug!("back-sync batch block: {} {:?}", message.slot(), actual);
+                debug_with_peers!("back-sync batch block: {} {:?}", message.slot(), actual);
 
                 ensure!(
                     actual == next_parent_root,
@@ -328,12 +455,30 @@ impl<P: Preset> Batch<P> {
                     },
                 );
 
-                let mut blobs = self.valid_blob_sidecars_for(config, controller, block, parent)?;
+                if config
+                    .phase_at_slot::<P>(block.message().slot())
+                    .is_peerdas_activated()
+                {
+                    let mut data_columns = self.valid_data_column_sidecars_for(
+                        config,
+                        controller,
+                        block,
+                        parent,
+                        &controller.sampling_columns(),
+                        false,
+                    )?;
 
-                verified_blob_sidecars.append(&mut blobs);
+                    verified_data_column_sidecars.append(&mut data_columns);
+                } else {
+                    let mut blobs =
+                        self.valid_blob_sidecars_for(config, controller, block, parent)?;
+
+                    verified_blob_sidecars.append(&mut blobs);
+                }
 
                 transition_functions::combined::verify_base_signature_with_head_state(
                     config,
+                    controller.pubkey_cache(),
                     &head_state,
                     block,
                 )?;
@@ -348,13 +493,117 @@ impl<P: Preset> Batch<P> {
             checkpoint = earliest_block.as_ref().into();
         }
 
-        debug!("next batch checkpoint: {checkpoint:?}");
+        debug_with_peers!("next batch checkpoint: {checkpoint:?}");
 
         Ok((
             checkpoint,
-            verified_blocks.into_iter(),
-            verified_blob_sidecars.into_iter(),
+            verified_blocks,
+            verified_blob_sidecars,
+            verified_data_column_sidecars,
         ))
+    }
+
+    #[expect(clippy::type_complexity)]
+    fn verify_extra_data_columns_from_checkpoint(
+        &self,
+        config: &Config,
+        controller: &RealController<P>,
+        mut checkpoint: SyncCheckpoint,
+        column_indices: &HashSet<ColumnIndex>,
+        low_slot: Slot,
+    ) -> Result<(
+        SyncCheckpoint,
+        Vec<Arc<SignedBeaconBlock<P>>>,
+        Vec<Arc<BlobSidecar<P>>>,
+        Vec<Arc<DataColumnSidecar<P>>>,
+    )> {
+        debug_with_peers!("verify back-sync batch from: {checkpoint:?}");
+
+        let mut verified_data_column_sidecars = vec![];
+
+        let block_roots = self
+            .data_column_sidecars
+            .keys()
+            .map(|key| key.block_root)
+            .collect::<HashSet<_>>();
+
+        let mut blocks_with_roots = HashMap::new();
+        let mut earliest_block: Option<Arc<SignedBeaconBlock<P>>> = None;
+
+        for root in block_roots {
+            if let Some(block) = controller.block_by_root(root)?.map(WithStatus::value) {
+                blocks_with_roots.insert(root, block);
+            }
+        }
+
+        for block in blocks_with_roots.values() {
+            let parent_root = block.message().parent_root();
+
+            let parent = match blocks_with_roots.get(&parent_root) {
+                Some(parent) => parent,
+                None => &match controller
+                    .block_by_root(parent_root)?
+                    .map(WithStatus::value)
+                {
+                    Some(parent) => parent,
+                    None => continue,
+                },
+            };
+
+            let block_slot = block.message().slot();
+
+            if !config.phase_at_slot::<P>(block_slot).is_peerdas_activated() {
+                continue;
+            }
+
+            let mut data_columns = self.valid_data_column_sidecars_for(
+                config,
+                controller,
+                block,
+                parent,
+                column_indices,
+                false,
+            )?;
+
+            verified_data_column_sidecars.append(&mut data_columns);
+
+            if earliest_block
+                .as_ref()
+                .map(|block| block_slot < block.message().slot())
+                .unwrap_or(true)
+            {
+                earliest_block = Some(block.clone_arc());
+            }
+        }
+
+        if let Some(mut earliest_block) = earliest_block {
+            // Iterate through ancestor blocks without blobs if any to find the earliest block
+            loop {
+                let parent_root = earliest_block.message().parent_root();
+
+                if let Some(parent) = controller.block_by_root(parent_root)? {
+                    let parent = parent.value;
+
+                    if let Some(body) = parent.message().body().with_blob_kzg_commitments() {
+                        if parent.message().slot() >= low_slot
+                            && body.blob_kzg_commitments().is_empty()
+                        {
+                            // Set earliest block without blobs as earliest block
+                            earliest_block = parent;
+                            continue;
+                        }
+                    }
+                }
+
+                break;
+            }
+
+            checkpoint = earliest_block.as_ref().into();
+        }
+
+        debug_with_peers!("next batch checkpoint: {checkpoint:?}");
+
+        Ok((checkpoint, vec![], vec![], verified_data_column_sidecars))
     }
 }
 
@@ -394,6 +643,71 @@ impl Data {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SyncMode {
+    Default,
+    DataColumnsOnly {
+        column_indices: HashSet<ColumnIndex>,
+        // Data column backfill resets earliest available slot, so this field is used to preserve
+        // previous earliest available slot (either from previously finished back-sync or anchor block).
+        // After data column backfill is finished, earliest available slot is restored to its previous value.
+        previous_earliest_available_slot: Slot,
+    },
+}
+
+impl SyncMode {
+    fn name(&self) -> String {
+        match self {
+            Self::Default => "back-sync".into(),
+            Self::DataColumnsOnly { column_indices, .. } => {
+                format!("data column backfill (columns: {column_indices:?})")
+            }
+        }
+    }
+
+    fn save(&self, database: &Database, low_slot: Slot) -> Result<()> {
+        // Due to backwards compatibility and simplicity, back sync without additional sync mode record
+        // is treated as default back sync
+        if self.is_default() {
+            return Ok(());
+        }
+
+        database.put(Self::db_key(low_slot), bincode::serialize(&self)?)
+    }
+
+    fn remove(&self, database: &Database, low_slot: Slot) -> Result<()> {
+        if self.is_default() {
+            return Ok(());
+        }
+
+        database.delete(Self::db_key(low_slot))
+    }
+
+    fn load(database: &Database, low_slot: Slot) -> Result<Self> {
+        database
+            .get(Self::db_key(low_slot))?
+            .as_deref()
+            .map(bincode::deserialize)
+            .unwrap_or(Ok(Self::Default))
+            .map_err(Into::into)
+    }
+
+    fn db_key(low_slot: Slot) -> String {
+        SyncModeBySlot(low_slot).to_string()
+    }
+
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    const fn validate_checkpoint_slot(&self) -> bool {
+        match self {
+            Self::Default => true,
+            Self::DataColumnsOnly { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Ssz)]
 #[cfg_attr(test, derive(Default))]
 pub struct SyncCheckpoint {
@@ -414,13 +728,20 @@ impl<P: Preset> From<&SignedBeaconBlock<P>> for SyncCheckpoint {
     }
 }
 
-#[expect(clippy::module_name_repetitions)]
 #[derive(Display)]
 #[display("{}{_0:020}", Self::PREFIX)]
 pub struct BackSyncDataBySlot(pub Slot);
 
 impl PrefixableKey for BackSyncDataBySlot {
     const PREFIX: &'static str = "b";
+}
+
+#[derive(Display)]
+#[display("{}{_0:020}", Self::PREFIX)]
+pub struct SyncModeBySlot(pub Slot);
+
+impl PrefixableKey for SyncModeBySlot {
+    const PREFIX: &'static str = "m";
 }
 
 #[derive(Debug, Error)]
@@ -446,6 +767,21 @@ pub enum Error<P: Preset> {
         actual: H256,
         expected: H256,
         slot: Slot,
+    },
+    #[error(
+        "data column {index} for block {block_root:?} in slot {slot} not accepted: {action:?}"
+    )]
+    DataColumnNotAccepted {
+        action: DataColumnSidecarAction<P>,
+        block_root: H256,
+        slot: Slot,
+        index: ColumnIndex,
+    },
+    #[error("missing data column {index} for block {block_root:?} in slot {slot}")]
+    DataColumnMissing {
+        block_root: H256,
+        slot: Slot,
+        index: ColumnIndex,
     },
     #[error("final back-sync checkpoint mismatch (expected: {expected:?}, actual: {actual:?})")]
     FinalCheckpointMismatch {

@@ -1,10 +1,7 @@
 use core::cmp::Ordering;
 
 use anyhow::Result;
-use bls::{
-    traits::{CachedPublicKey as _, SignatureBytes as _},
-    SignatureBytes,
-};
+use bls::{traits::SignatureBytes as _, SignatureBytes};
 use types::{
     config::Config,
     electra::{consts::COMPOUNDING_WITHDRAWAL_PREFIX, containers::PendingDeposit},
@@ -36,12 +33,12 @@ pub fn balance<P: Preset>(
 }
 
 #[inline]
-pub fn increase_balance(balance: &mut Gwei, delta: Gwei) {
+pub const fn increase_balance(balance: &mut Gwei, delta: Gwei) {
     *balance += delta;
 }
 
 #[inline]
-pub fn decrease_balance(balance: &mut Gwei, delta: Gwei) {
+pub const fn decrease_balance(balance: &mut Gwei, delta: Gwei) {
     *balance = balance.saturating_sub(delta);
 }
 
@@ -129,7 +126,7 @@ pub fn queue_excess_active_balance<P: Preset>(
 
         let validator = state.validators().get(index)?;
 
-        let pubkey = validator.pubkey.to_bytes();
+        let pubkey = validator.pubkey;
         let withdrawal_credentials = validator.withdrawal_credentials;
 
         state.pending_deposits_mut().push(PendingDeposit {

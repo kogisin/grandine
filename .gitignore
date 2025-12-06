@@ -1,9 +1,19 @@
 .idea/
 .vscode/
 
-/target/
+/**/target/
+
+# Omit zkvm guest compiled artifacts
+/zkvm/guest/elf
+
 book/book
 book/deploy
 
 # Omit the trailing slash from `/eth2-cache`. This way it can be a symlink.
 /eth2-cache
+
+# large files
+consensus-spec-tests/
+
+# exception logs
+exception.log

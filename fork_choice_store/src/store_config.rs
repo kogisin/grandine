@@ -11,7 +11,7 @@ pub const DEFAULT_CACHE_LOCK_TIMEOUT_MILLIS: u64 = 1500;
 pub struct StoreConfig {
     #[derivative(Default(value = "32"))]
     pub max_empty_slots: u64,
-    #[derivative(Default(value = "64"))]
+    #[derivative(Default(value = "8"))]
     pub max_epochs_to_retain_states_in_cache: u64,
     #[derivative(Default(value = "Duration::from_millis(DEFAULT_CACHE_LOCK_TIMEOUT_MILLIS)"))]
     pub state_cache_lock_timeout: Duration,
@@ -19,6 +19,10 @@ pub struct StoreConfig {
     pub unfinalized_states_in_memory: u64,
     #[derivative(Default(value = "DEFAULT_KZG_BACKEND"))]
     pub kzg_backend: KzgBackend,
+    #[derivative(Default(value = "false"))]
+    pub disable_engine_getblobs: bool,
+    #[derivative(Default(value = "false"))]
+    pub sync_without_reconstruction: bool,
 }
 
 impl StoreConfig {

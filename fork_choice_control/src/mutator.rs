@@ -15,7 +15,7 @@
 // (in fact, the opposite may be true because `p2p_tx` would have to be cloned for each task).
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         mpsc::{Receiver, Sender},
         Arc,
@@ -24,32 +24,42 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Error as AnyhowError, Result};
 use arc_swap::ArcSwap;
 use clock::{Tick, TickKind};
-use drain_filter_polyfill::VecExt as _;
-use eth2_libp2p::{GossipId, PeerId};
-use execution_engine::{ExecutionEngine, PayloadStatusV1};
+use eth2_libp2p::GossipId;
+use execution_engine::{
+    EngineGetBlobsParams, EngineGetBlobsV1Params, EngineGetBlobsV2Params, ExecutionEngine,
+    PayloadStatusV1,
+};
 use fork_choice_store::{
     AggregateAndProofAction, ApplyBlockChanges, ApplyTickChanges, AttestationAction,
     AttestationItem, AttestationOrigin, AttestationValidationError, AttesterSlashingOrigin,
-    BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockOrigin, ChainLink, PayloadAction,
-    StateCacheProcessor, Store, ValidAttestation,
+    BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockOrigin, ChainLink,
+    DataColumnSidecarAction, DataColumnSidecarOrigin, Error, PayloadAction, StateCacheProcessor,
+    Store, ValidAttestation,
 };
 use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
 use helper_functions::{accessors, misc, predicates, verifier::NullVerifier};
-use http_api_utils::{DependentRootsBundle, EventChannels};
 use itertools::{Either, Itertools as _};
-use log::{debug, error, info, warn};
+use logging::{
+    debug_with_peers, error_with_peers, info_with_peers, trace_with_peers, warn_with_peers,
+};
 use num_traits::identities::Zero as _;
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
 use ssz::SszHash as _;
 use std_ext::ArcExt as _;
+use tracing::{instrument, Span};
 use typenum::Unsigned as _;
 use types::{
     combined::{BeaconState, ExecutionPayloadParams, SignedBeaconBlock},
     deneb::containers::{BlobIdentifier, BlobSidecar},
-    nonstandard::{RelativeEpoch, ValidationOutcome},
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar},
+        primitives::ColumnIndex,
+    },
+    nonstandard::{PayloadStatus, RelativeEpoch, ValidationOutcome},
     phase0::{
         containers::Checkpoint,
         primitives::{ExecutionBlockHash, Slot, ValidatorIndex, H256},
@@ -60,32 +70,38 @@ use types::{
 
 use crate::{
     block_processor::BlockProcessor,
+    events::{DependentRootsBundle, EventChannels},
     messages::{
         AttestationVerifierMessage, MutatorMessage, P2pMessage, PoolMessage, SubnetMessage,
         SyncMessage, ValidatorMessage,
     },
     misc::{
-        Delayed, MutatorRejectionReason, PendingAggregateAndProof, PendingAttestation,
-        PendingBlobSidecar, PendingBlock, PendingChainLink, VerifyAggregateAndProofResult,
-        VerifyAttestationResult, WaitingForCheckpointState,
+        BlockBlobAvailability, BlockDataColumnAvailability, Delayed, MutatorRejectionReason,
+        PendingAggregateAndProof, PendingAttestation, PendingBlobSidecar, PendingBlock,
+        PendingChainLink, PendingDataColumnSidecar, ProcessingTimings, ReorgSource,
+        VerifyAggregateAndProofResult, VerifyAttestationResult, WaitingForCheckpointState,
     },
     storage::Storage,
     tasks::{
         AttestationTask, BlobSidecarTask, BlockAttestationsTask, BlockTask, CheckpointStateTask,
-        PersistBlobSidecarsTask, PreprocessStateTask,
+        DataColumnSidecarTask, PersistBlobSidecarsTask, PersistDataColumnSidecarsTask,
+        PersistPubkeyCacheTask, PreprocessStateTask, RetryDataColumnSidecarTask,
     },
     thread_pool::{Spawn, ThreadPool},
     unbounded_sink::UnboundedSink,
     wait::Wait,
 };
 
+const DATA_COLUMN_RETAIN_DURATION_IN_SLOTS: Slot = 2;
+
 #[expect(clippy::struct_field_names)]
 pub struct Mutator<P: Preset, E, W, TS, PS, LS, NS, SS, VS> {
-    store: Arc<Store<P>>,
-    store_snapshot: Arc<ArcSwap<Store<P>>>,
+    pubkey_cache: Arc<PubkeyCache>,
+    store: Arc<Store<P, Storage<P>>>,
+    store_snapshot: Arc<ArcSwap<Store<P, Storage<P>>>>,
     state_cache: Arc<StateCacheProcessor<P>>,
     block_processor: Arc<BlockProcessor<P>>,
-    event_channels: Arc<EventChannels>,
+    event_channels: Arc<EventChannels<P>>,
     execution_engine: E,
     delayed_until_blobs: HashMap<H256, PendingBlock<P>>,
     delayed_until_block: HashMap<H256, Delayed<P>>,
@@ -99,6 +115,7 @@ pub struct Mutator<P: Preset, E, W, TS, PS, LS, NS, SS, VS> {
     // problem it solves can occur in normal operation as well. The execution layer may finish
     // validating the payload before the fork choice store processes the block containing it.
     delayed_until_payload: HashMap<ExecutionBlockHash, Vec<(PayloadStatusV1, Slot)>>,
+    delayed_until_state: HashMap<(H256, Slot), Delayed<P>>,
     // The specification doesn't explicitly state it, but `Store.checkpoint_states` is effectively a
     // cache, as its contents can be recomputed at any time using data from other fields.
     //
@@ -131,17 +148,18 @@ where
     W: Wait,
     TS: UnboundedSink<AttestationVerifierMessage<P, W>>,
     PS: UnboundedSink<P2pMessage<P>>,
-    LS: UnboundedSink<PoolMessage>,
+    LS: UnboundedSink<PoolMessage<P, W>>,
     NS: UnboundedSink<SubnetMessage<W>>,
     SS: UnboundedSink<SyncMessage<P>>,
     VS: UnboundedSink<ValidatorMessage<P, W>>,
 {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        store_snapshot: Arc<ArcSwap<Store<P>>>,
+        pubkey_cache: Arc<PubkeyCache>,
+        store_snapshot: Arc<ArcSwap<Store<P, Storage<P>>>>,
         state_cache: Arc<StateCacheProcessor<P>>,
         block_processor: Arc<BlockProcessor<P>>,
-        event_channels: Arc<EventChannels>,
+        event_channels: Arc<EventChannels<P>>,
         execution_engine: E,
         storage: Arc<Storage<P>>,
         thread_pool: ThreadPool<P, E, W>,
@@ -156,6 +174,7 @@ where
         validator_tx: VS,
     ) -> Self {
         Self {
+            pubkey_cache,
             store: store_snapshot.load_full(),
             store_snapshot,
             state_cache,
@@ -166,6 +185,7 @@ where
             delayed_until_block: HashMap::new(),
             delayed_until_slot: BTreeMap::new(),
             delayed_until_payload: HashMap::new(),
+            delayed_until_state: HashMap::new(),
             waiting_for_checkpoint_states: HashMap::new(),
             storage,
             thread_pool,
@@ -182,6 +202,7 @@ where
         }
     }
 
+    #[expect(clippy::too_many_lines)]
     pub fn run(&mut self) -> Result<()> {
         loop {
             match self
@@ -198,14 +219,16 @@ where
                     wait_group,
                     result,
                     origin,
-                    submission_time,
-                    rejected_block_root,
+                    processing_timings,
+                    block_root,
+                    tracing_span,
                 } => self.handle_block(
                     wait_group,
                     result,
                     origin,
-                    submission_time,
-                    rejected_block_root,
+                    processing_timings,
+                    block_root,
+                    tracing_span,
                 )?,
                 MutatorMessage::AggregateAndProof { wait_group, result } => {
                     self.handle_aggregate_and_proof(&wait_group, result)?
@@ -250,11 +273,37 @@ where
                     checkpoint,
                     checkpoint_state,
                 } => self.handle_checkpoint_state(&wait_group, checkpoint, checkpoint_state)?,
+                MutatorMessage::DataColumnSidecar {
+                    wait_group,
+                    result,
+                    origin,
+                    data_column_identifier,
+                    block_seen,
+                    submission_time,
+                } => self.handle_data_column_sidecar(
+                    wait_group,
+                    result,
+                    origin,
+                    data_column_identifier,
+                    block_seen,
+                    submission_time,
+                ),
                 MutatorMessage::FinishedPersistingBlobSidecars {
                     wait_group,
                     persisted_blob_ids,
                 } => {
                     self.handle_finish_persisting_blob_sidecars(wait_group, persisted_blob_ids);
+                }
+                MutatorMessage::FinishedPersistingDataColumnSidecars {
+                    wait_group,
+                    persisted_data_column_ids,
+                    slot,
+                } => {
+                    self.handle_finish_persisting_data_column_sidecars(
+                        wait_group,
+                        persisted_data_column_ids,
+                        slot,
+                    );
                 }
                 MutatorMessage::PreprocessedBeaconState { state } => {
                     self.prepare_execution_payload_for_next_slot(&state);
@@ -265,16 +314,32 @@ where
                 } => self.handle_notified_forkchoice_update_result(&wait_group, &payload_status),
                 MutatorMessage::NotifiedNewPayload {
                     wait_group,
+                    beacon_block_root,
                     execution_block_hash,
                     payload_status,
                 } => self.handle_notified_new_payload(
                     &wait_group,
+                    beacon_block_root,
                     execution_block_hash,
                     payload_status,
                 ),
                 MutatorMessage::Stop { save_to_storage } => {
                     break self.handle_stop(save_to_storage);
                 }
+                MutatorMessage::StoreSamplingColumns { sampling_columns } => {
+                    self.handle_store_sampling_columns(sampling_columns)
+                }
+                MutatorMessage::ReconstructedMissingColumns {
+                    wait_group,
+                    block_root,
+                    block,
+                    data_column_sidecars,
+                } => self.handle_reconstructed_missing_columns(
+                    &wait_group,
+                    block_root,
+                    &block,
+                    data_column_sidecars,
+                ),
             }
         }
     }
@@ -297,36 +362,36 @@ where
 
         self.handle_tick(&wait_group, Tick::start_of_slot(head_slot))?;
 
-        for (index, result) in blocks.chain(core::iter::once(Ok(last_block))).enumerate() {
+        for result in blocks.chain(core::iter::once(Ok(last_block))) {
             let block = result?;
             let origin = BlockOrigin::Persisted;
-            let submission_time = Instant::now();
+            let processing_timings = ProcessingTimings::new();
 
             // There is no point in spawning `BlockTask`s to validate persisted blocks.
             // State transitions within a single fork must be performed sequentially.
             // Other validations may be performed in parallel, but they take very little time.
-            let result = self.block_processor.validate_block(
-                &self.store,
-                &block,
-                origin.state_root_policy(),
-                origin.data_availability_policy(),
-                &self.execution_engine,
-                NullVerifier,
-            );
+            let result = self
+                .block_processor
+                .validate_block(
+                    &self.store,
+                    &block,
+                    origin.state_root_policy(),
+                    origin.data_availability_policy(),
+                    &self.execution_engine,
+                    NullVerifier,
+                )
+                .into();
 
-            let rejected_block_root = result.is_err().then(|| block.message().hash_tree_root());
+            let block_root = block.message().hash_tree_root();
 
             self.handle_block(
                 wait_group.clone(),
                 result,
                 origin,
-                submission_time,
-                rejected_block_root,
+                processing_timings,
+                block_root,
+                tracing::debug_span!("handle_unfinalized_block"),
             )?;
-
-            if index % (P::SlotsPerEpoch::USIZE / 4) == 0 {
-                self.store.prune_state_cache(true);
-            }
         }
 
         self.finished_loading_from_storage = true;
@@ -340,7 +405,7 @@ where
             let checkpoint = self.store.unrealized_justified_checkpoint();
 
             if !self.store.contains_checkpoint_state(checkpoint) {
-                debug!(
+                debug_with_peers!(
                     "tick waiting for checkpoint state \
                      (tick: {tick:?}, checkpoint: {checkpoint:?})",
                 );
@@ -373,9 +438,9 @@ where
 
             if head.is_optimistic() {
                 if let Some(execution_payload) = head.block.as_ref().clone().execution_payload() {
-                    let mut params = None;
-
-                    if let Some(body) = head.block.message().body().post_electra() {
+                    let params = if let Some(body) =
+                        head.block.message().body().with_blob_kzg_commitments()
+                    {
                         let versioned_hashes = body
                             .blob_kzg_commitments()
                             .iter()
@@ -383,24 +448,21 @@ where
                             .map(misc::kzg_commitment_to_versioned_hash)
                             .collect();
 
-                        params = Some(ExecutionPayloadParams::Electra {
-                            versioned_hashes,
-                            parent_beacon_block_root: head.block.message().parent_root(),
-                            execution_requests: body.execution_requests().clone(),
-                        });
-                    } else if let Some(body) = head.block.message().body().post_deneb() {
-                        let versioned_hashes = body
-                            .blob_kzg_commitments()
-                            .iter()
-                            .copied()
-                            .map(misc::kzg_commitment_to_versioned_hash)
-                            .collect();
-
-                        params = Some(ExecutionPayloadParams::Deneb {
-                            versioned_hashes,
-                            parent_beacon_block_root: head.block.message().parent_root(),
-                        });
-                    }
+                        if let Some(body) = body.with_execution_requests() {
+                            Some(ExecutionPayloadParams::Electra {
+                                versioned_hashes,
+                                parent_beacon_block_root: head.block.message().parent_root(),
+                                execution_requests: body.execution_requests().clone(),
+                            })
+                        } else {
+                            Some(ExecutionPayloadParams::Deneb {
+                                versioned_hashes,
+                                parent_beacon_block_root: head.block.message().parent_root(),
+                            })
+                        }
+                    } else {
+                        None
+                    };
 
                     self.execution_engine.notify_new_payload(
                         head.block_root,
@@ -419,6 +481,25 @@ where
         if changes.is_finalized_checkpoint_updated() {
             self.archive_finalized(wait_group)?;
             self.prune_delayed_until_payload();
+            self.persist_pubkey_cache(wait_group);
+
+            let finalized_slot = self.store.finalized_slot();
+
+            self.event_channels.prune_after_finalization(finalized_slot);
+
+            if self.store.head().block.phase().is_peerdas_activated() {
+                self.try_spawn_persist_data_columns_task(finalized_slot, wait_group.clone());
+            }
+        } else if changes.is_slot_updated()
+            && self.store.head().block.phase().is_peerdas_activated()
+        {
+            self.try_spawn_persist_data_columns_task(
+                self.store
+                    .head()
+                    .slot()
+                    .saturating_sub(DATA_COLUMN_RETAIN_DURATION_IN_SLOTS),
+                wait_group.clone(),
+            )
         }
 
         self.update_store_snapshot();
@@ -429,7 +510,7 @@ where
         if changes.is_slot_updated() {
             let slot = tick.slot;
 
-            debug!("retrying objects delayed until slot {slot}");
+            debug_with_peers!("retrying objects delayed until slot {slot}");
 
             for delayed in self.take_delayed_until_slot(slot) {
                 self.retry_delayed(delayed, wait_group);
@@ -447,7 +528,7 @@ where
         }
 
         if let ApplyTickChanges::Reorganized { old_head, .. } = changes {
-            self.notify_about_reorganization(wait_group.clone(), &old_head);
+            self.notify_about_reorganization(wait_group.clone(), &old_head, ReorgSource::Tick);
             self.spawn_preprocess_head_state_for_next_slot_task();
         } else if self.store.tick().kind == TickKind::Attest {
             self.spawn_preprocess_head_state_for_next_slot_task();
@@ -490,22 +571,86 @@ where
         drop(wait_group);
     }
 
+    fn try_spawn_persist_data_columns_task(&mut self, slot: Slot, wait_group: W) {
+        if self.storage.prune_storage_enabled() {
+            return self.store_mut().prune_data_columns(slot);
+        }
+
+        self.spawn(PersistDataColumnSidecarsTask {
+            slot,
+            store_snapshot: self.owned_store(),
+            storage: self.storage.clone_arc(),
+            mutator_tx: self.owned_mutator_tx(),
+            wait_group,
+            metrics: self.metrics.clone(),
+        });
+    }
+
+    #[expect(clippy::cognitive_complexity)]
     #[expect(clippy::too_many_lines)]
+    #[instrument(
+        skip_all,
+        parent = &tracing_span,
+        level = "debug",
+        fields(
+            block_root = ?block_root,
+        ),
+    )]
     fn handle_block(
         &mut self,
         wait_group: W,
-        result: Result<BlockAction<P>>,
+        result: Box<Result<BlockAction<P>>>,
         origin: BlockOrigin,
-        submission_time: Instant,
-        rejected_block_root: Option<H256>,
+        processing_timings: ProcessingTimings,
+        block_root: H256,
+        tracing_span: Span,
     ) -> Result<()> {
-        match result {
-            Ok(BlockAction::Accept(chain_link, attester_slashing_results)) => {
+        match *result {
+            Ok(BlockAction::Accept(mut chain_link, attester_slashing_results)) => {
+                let block_root = chain_link.block_root;
+                let parent_root = chain_link.block.message().parent_root();
+
+                if let Some(delayed) = self.delayed_until_block.get_mut(&block_root) {
+                    if let Some((payload_status, _)) = delayed.payload_status.take() {
+                        debug_with_peers!(
+                            "applying delayed payload status \
+                            (payload_status: {payload_status:?}, beacon_block_root: {block_root:?})",
+                        );
+
+                        if let Some(valid_hash) = payload_status.latest_valid_hash {
+                            if let Some(parent) = self.store.chain_link(parent_root) {
+                                let parent_execution_block_hash =
+                                    parent.block.execution_block_hash();
+
+                                self.store_mut().update_chain_payload_statuses(
+                                    valid_hash,
+                                    parent_execution_block_hash,
+                                );
+
+                                self.update_store_snapshot();
+                            }
+                        }
+
+                        if payload_status.status.is_valid() {
+                            chain_link.payload_status = PayloadStatus::Valid;
+                        }
+
+                        if payload_status.status.is_invalid() {
+                            self.reject_block(
+                                Error::<P>::InvalidExecutionPayload.into(),
+                                block_root,
+                                origin,
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let pending_chain_link = PendingChainLink {
                     chain_link,
                     attester_slashing_results,
                     origin,
-                    submission_time,
+                    processing_timings,
                 };
 
                 self.accept_block(&wait_group, pending_chain_link)?;
@@ -522,55 +667,200 @@ where
                     Ok(ValidationOutcome::Ignore(publishable)),
                 );
             }
-            Ok(BlockAction::DelayUntilBlobs(block)) => {
-                let block_root = block.message().hash_tree_root();
+            Ok(BlockAction::DelayUntilBlobs(block, state)) => {
+                let processing_timings = processing_timings.delayed();
 
                 let pending_block = PendingBlock {
                     block,
                     origin,
-                    submission_time,
+                    processing_timings,
+                    tracing_span,
                 };
 
-                let missing_blob_indices =
-                    self.store.indices_of_missing_blobs(&pending_block.block);
+                if pending_block.block.phase().is_peerdas_activated() {
+                    let block_data_column_availability = self.block_data_column_availability(
+                        &pending_block.block,
+                        self.delayed_until_state
+                            .get(&(block_root, state.slot()))
+                            .iter()
+                            .flat_map(|delayed| delayed.data_column_sidecars.iter())
+                            .map(|pending| pending.data_column_sidecar.as_ref()),
+                    );
 
-                if missing_blob_indices.is_empty() {
-                    self.retry_block(wait_group, pending_block);
-                } else {
-                    debug!("block delayed until blobs: {pending_block:?}");
+                    debug_with_peers!(
+                        "availability for block: {:?} with origin: {:?} at slot: {}: {block_data_column_availability:?}",
+                        pending_block.block.message().hash_tree_root(),
+                        pending_block.origin,
+                        pending_block.block.message().slot(),
+                    );
 
-                    if let Some(gossip_id) = pending_block.origin.gossip_id() {
-                        self.send_to_p2p(P2pMessage::Accept(gossip_id));
+                    match block_data_column_availability {
+                        BlockDataColumnAvailability::Complete => {
+                            self.retry_block(wait_group, pending_block);
+                        }
+                        BlockDataColumnAvailability::AnyPending => {
+                            self.delay_block_until_blobs(block_root, pending_block);
+
+                            self.take_delayed_until_state(block_root, state.slot())
+                                .unwrap_or_default()
+                                .data_column_sidecars
+                                .into_iter()
+                                .for_each(|pending_data_column| {
+                                    self.retry_data_column_sidecar(
+                                        wait_group.clone(),
+                                        pending_data_column,
+                                        Some(state.clone_arc()),
+                                    );
+                                });
+                        }
+                        BlockDataColumnAvailability::CompleteWithReconstruction => {
+                            if let Some(gossip_id) = pending_block.origin.gossip_id() {
+                                self.send_to_p2p(P2pMessage::Accept(gossip_id));
+                            }
+
+                            if self
+                                .store
+                                .indices_of_missing_data_columns(&pending_block.block)
+                                .is_empty()
+                            {
+                                self.retry_block(wait_group, pending_block);
+                            } else {
+                                // TODO(peerdas-fulu): NEED REVIEW! if block proposed by itself, therefore all sampling
+                                // columns should be arrived soon or later, so no need to trigger reconstruction.
+                                if !matches!(pending_block.origin, BlockOrigin::Own)
+                                    && !self.store.is_sidecars_construction_started(&block_root)
+                                {
+                                    self.send_to_pool(PoolMessage::ReconstructDataColumns {
+                                        wait_group,
+                                        block_root,
+                                        block: pending_block.block.clone_arc(),
+                                        slot: pending_block.block.message().slot(),
+                                    })
+                                }
+
+                                self.delay_block_until_blobs(block_root, pending_block);
+                            }
+                        }
+                        BlockDataColumnAvailability::Missing(missing_column_indices) => {
+                            debug_with_peers!(
+                                "block delayed until sufficient data column sidecars are available \
+                                 (missing columns: {missing_column_indices:?}, pending block root: {block_root:?})",
+                            );
+
+                            if let Some(gossip_id) = pending_block.origin.gossip_id() {
+                                self.send_to_p2p(P2pMessage::Accept(gossip_id));
+                            }
+
+                            let pending_block = reply_delayed_block_validation_result(
+                                pending_block,
+                                Ok(ValidationOutcome::Ignore(false)),
+                            );
+
+                            if self.store.is_forward_synced()
+                                && !self.store.has_requested_blobs_from_el(&block_root)
+                                && !self.store.is_sidecars_construction_started(&block_root)
+                            {
+                                self.store_mut().mark_requested_blobs_from_el(
+                                    block_root,
+                                    pending_block.block.message().slot(),
+                                );
+                                self.update_store_snapshot();
+
+                                let data_column_identifiers = missing_column_indices
+                                    .into_iter()
+                                    .map(|index| DataColumnIdentifier { block_root, index })
+                                    .collect_vec();
+
+                                self.request_blobs_from_execution_engine(
+                                    EngineGetBlobsV2Params {
+                                        block_or_sidecar: pending_block.block.clone_arc().into(),
+                                        data_column_identifiers,
+                                    }
+                                    .into(),
+                                );
+                            }
+
+                            self.delay_block_until_blobs(block_root, pending_block);
+                        }
+                        BlockDataColumnAvailability::Irrelevant => {
+                            unreachable!("block without blobs should not be delayed until blobs")
+                        }
                     }
-
-                    let pending_block = reply_delayed_block_validation_result(
-                        pending_block,
-                        Ok(ValidationOutcome::Ignore(false)),
+                } else {
+                    let block_blob_availability = self.block_blob_availability(
+                        &pending_block.block,
+                        self.delayed_until_state
+                            .get(&(block_root, state.slot()))
+                            .iter()
+                            .flat_map(|delayed| delayed.blob_sidecars.iter())
+                            .map(|pending_blob_sidecar| pending_blob_sidecar.blob_sidecar.as_ref()),
                     );
 
-                    let blob_ids = missing_blob_indices
-                        .into_iter()
-                        .map(|index| BlobIdentifier { block_root, index })
-                        .collect_vec();
+                    match block_blob_availability {
+                        BlockBlobAvailability::Complete => {
+                            self.retry_block(wait_group, pending_block);
+                        }
+                        BlockBlobAvailability::CompleteWithPending => {
+                            self.delay_block_until_blobs(block_root, pending_block);
 
-                    let peer_id = pending_block.origin.peer_id();
+                            self.take_delayed_until_state(block_root, state.slot())
+                                .unwrap_or_default()
+                                .blob_sidecars
+                                .into_iter()
+                                .for_each(|pending_blob| {
+                                    self.retry_blob_sidecar(
+                                        wait_group.clone(),
+                                        pending_blob,
+                                        Some(state.clone_arc()),
+                                    );
+                                });
+                        }
+                        BlockBlobAvailability::Missing(missing_blob_indices) => {
+                            debug_with_peers!("block delayed until blobs: {block_root:?}");
+                            trace_with_peers!("block delayed until blobs: {pending_block:?}");
 
-                    self.request_blobs_from_execution_engine(
-                        pending_block.block.clone_arc(),
-                        blob_ids,
-                        peer_id,
-                    );
+                            if let Some(gossip_id) = pending_block.origin.gossip_id() {
+                                self.send_to_p2p(P2pMessage::Accept(gossip_id));
+                            }
 
-                    self.delay_block_until_blobs(block_root, pending_block);
+                            let pending_block = reply_delayed_block_validation_result(
+                                pending_block,
+                                Ok(ValidationOutcome::Ignore(false)),
+                            );
+
+                            let blob_identifiers = missing_blob_indices
+                                .into_iter()
+                                .map(|index| BlobIdentifier { block_root, index })
+                                .collect_vec();
+
+                            let peer_id = pending_block.origin.peer_id();
+
+                            self.request_blobs_from_execution_engine(
+                                EngineGetBlobsV1Params {
+                                    block: pending_block.block.clone_arc(),
+                                    blob_identifiers,
+                                    peer_id,
+                                }
+                                .into(),
+                            );
+
+                            self.delay_block_until_blobs(block_root, pending_block);
+                        }
+                        BlockBlobAvailability::Irrelevant => {
+                            unreachable!("block without blobs should not be delayed until blobs")
+                        }
+                    }
                 }
             }
             Ok(BlockAction::DelayUntilParent(block)) => {
+                let processing_timings = processing_timings.delayed();
                 let parent_root = block.message().parent_root();
 
                 let pending_block = PendingBlock {
                     block,
                     origin,
-                    submission_time,
+                    processing_timings,
+                    tracing_span,
                 };
 
                 if self.store.contains_block(parent_root) {
@@ -581,7 +871,8 @@ where
                         Ok(ValidationOutcome::Ignore(false)),
                     );
 
-                    debug!("block delayed until parent: {pending_block:?}");
+                    debug_with_peers!("block delayed until parent: {block_root:?}");
+                    trace_with_peers!("block delayed until parent: {pending_block:?}");
 
                     let peer_id = pending_block.origin.peer_id();
 
@@ -591,12 +882,14 @@ where
                 }
             }
             Ok(BlockAction::DelayUntilSlot(block)) => {
+                let processing_timings = processing_timings.delayed();
                 let slot = block.message().slot();
 
                 let pending_block = PendingBlock {
                     block,
                     origin,
-                    submission_time,
+                    processing_timings,
+                    tracing_span,
                 };
 
                 if slot <= self.store.slot() {
@@ -607,7 +900,8 @@ where
                         Ok(ValidationOutcome::Ignore(false)),
                     );
 
-                    debug!("block delayed until slot: {pending_block:?}");
+                    debug_with_peers!("block delayed until slot: {block_root:?}");
+                    trace_with_peers!("block delayed until slot: {pending_block:?}");
 
                     self.delay_block_until_slot(pending_block);
                 }
@@ -617,17 +911,24 @@ where
                 attester_slashing_results,
                 checkpoint,
             )) => {
+                let processing_timings = processing_timings.delayed();
                 let pending_chain_link = PendingChainLink {
                     chain_link,
                     attester_slashing_results,
                     origin,
-                    submission_time,
+                    processing_timings,
                 };
 
                 if self.store.contains_checkpoint_state(checkpoint) {
                     self.accept_block(&wait_group, pending_chain_link)?;
                 } else {
-                    debug!(
+                    debug_with_peers!(
+                        "block waiting for checkpoint state \
+                         (block_root: {:?}, checkpoint: {checkpoint:?})",
+                        pending_chain_link.chain_link.block_root,
+                    );
+
+                    trace_with_peers!(
                         "block waiting for checkpoint state \
                          (block_root: {:?}, block: {:?}, checkpoint: {checkpoint:?})",
                         pending_chain_link.chain_link.block_root,
@@ -648,25 +949,7 @@ where
                     }
                 }
             }
-            Err(error) => {
-                warn!("block rejected (error: {error}, origin: {origin:?})");
-
-                let (gossip_id, sender) = origin.split();
-
-                if gossip_id.is_some() {
-                    self.send_to_p2p(P2pMessage::Reject(
-                        gossip_id,
-                        MutatorRejectionReason::InvalidBlock,
-                    ));
-                }
-
-                if let Some(block_root) = rejected_block_root {
-                    self.store_mut().register_rejected_block(block_root);
-                    self.update_store_snapshot();
-                }
-
-                reply_block_validation_result_to_http_api(sender, Err(error));
-            }
+            Err(error) => self.reject_block(error, block_root, origin),
         }
 
         Ok(())
@@ -690,7 +973,7 @@ where
                     metrics.register_mutator_aggregate_and_proof(&["accepted"]);
                 }
 
-                debug!(
+                trace_with_peers!(
                     "aggregate and proof accepted \
                      (aggregate_and_proof: {aggregate_and_proof:?}, origin: {origin:?})",
                 );
@@ -727,7 +1010,12 @@ where
                 self.update_store_snapshot();
 
                 if let Some(old_head) = old_head {
-                    self.notify_about_reorganization(wait_group.clone(), &old_head);
+                    self.notify_about_reorganization(
+                        wait_group.clone(),
+                        &old_head,
+                        ReorgSource::AggregateAndProof,
+                    );
+
                     self.spawn_preprocess_head_state_for_next_slot_task();
                 }
             }
@@ -806,7 +1094,21 @@ where
                     metrics.register_mutator_aggregate_and_proof(&["rejected"]);
                 }
 
-                warn!("aggregate and proof rejected (error: {error}, origin: {origin:?})");
+                let downcasted_error = error.downcast_ref::<Error<P>>();
+
+                if matches!(
+                    downcasted_error,
+                    Some(Error::AggregatorNotInCommittee { .. }),
+                ) || matches!(downcasted_error, Some(Error::ValidatorNotAggregator { .. }))
+                {
+                    debug_with_peers!(
+                        "aggregate and proof rejected (error: {error}, origin: {origin:?})"
+                    );
+                } else {
+                    warn_with_peers!(
+                        "aggregate and proof rejected (error: {error}, origin: {origin:?})"
+                    );
+                }
 
                 let (gossip_id, sender) = origin.split();
 
@@ -851,11 +1153,11 @@ where
                     metrics.register_mutator_attestation(&["accepted"]);
                 }
 
-                debug!("attestation accepted (attestation: {attestation:?})");
+                trace_with_peers!("attestation accepted (attestation: {attestation:?})");
 
                 if attestation.origin.should_generate_event() {
                     self.event_channels
-                        .send_attestation_event(&attestation.item);
+                        .send_attestation_event(attestation.item.clone_arc());
                 }
 
                 if attestation.origin.send_to_validator() {
@@ -894,7 +1196,12 @@ where
                 self.update_store_snapshot();
 
                 if let Some(old_head) = old_head {
-                    self.notify_about_reorganization(wait_group.clone(), &old_head);
+                    self.notify_about_reorganization(
+                        wait_group.clone(),
+                        &old_head,
+                        ReorgSource::Attestation,
+                    );
+
                     self.spawn_preprocess_head_state_for_next_slot_task();
                 }
             }
@@ -955,7 +1262,7 @@ where
                 }
 
                 let source = error.to_string();
-                warn!("attestation rejected (error: {error:?})",);
+                warn_with_peers!("attestation rejected (error: {error:?})",);
 
                 let attestation = error.attestation();
                 let (gossip_id, sender) = attestation.origin.split();
@@ -1036,8 +1343,7 @@ where
                     None
                 }
                 Err(error) => {
-                    let origin = AttestationOrigin::<GossipId>::Block;
-                    warn!("attestation rejected (error: {error}, origin: {origin:?})");
+                    warn_with_peers!("block attestation rejected (error: {error})");
                     None
                 }
             })
@@ -1048,7 +1354,12 @@ where
         self.update_store_snapshot();
 
         if let Some(old_head) = old_head {
-            self.notify_about_reorganization(wait_group.clone(), &old_head);
+            self.notify_about_reorganization(
+                wait_group.clone(),
+                &old_head,
+                ReorgSource::BlockAttestation,
+            );
+
             self.spawn_preprocess_head_state_for_next_slot_task();
         }
 
@@ -1070,16 +1381,24 @@ where
                 self.update_store_snapshot();
 
                 if let Some(old_head) = old_head {
-                    self.notify_about_reorganization(wait_group.clone(), &old_head);
+                    self.notify_about_reorganization(
+                        wait_group.clone(),
+                        &old_head,
+                        ReorgSource::AttesterSlashing,
+                    );
+
                     self.spawn_preprocess_head_state_for_next_slot_task();
                 }
             }
-            Err(error) => debug!("attester slashing rejected (error: {error}, origin: {origin:?})"),
+            Err(error) => {
+                debug_with_peers!("attester slashing rejected (error: {error}, origin: {origin:?})")
+            }
         }
 
         Ok(())
     }
 
+    #[expect(clippy::too_many_lines)]
     fn handle_blob_sidecar(
         &mut self,
         wait_group: W,
@@ -1114,6 +1433,52 @@ where
 
                 reply_to_http_api(sender, Ok(ValidationOutcome::Ignore(publishable)));
             }
+            Ok(BlobSidecarAction::DelayUntilState(blob_sidecar, block_root)) => {
+                let slot = blob_sidecar.signed_block_header.message.slot;
+
+                let pending_blob_sidecar = PendingBlobSidecar {
+                    blob_sidecar,
+                    block_seen,
+                    origin,
+                    submission_time,
+                };
+
+                if let Some(state) =
+                    self.state_cache
+                        .existing_state_at_slot(&self.store, block_root, slot)
+                {
+                    self.retry_blob_sidecar(wait_group, pending_blob_sidecar, Some(state));
+                } else {
+                    debug_with_peers!(
+                        "blob sidecar delayed until state at same slot is ready \
+                         (block_root: {block_root:?}, slot: {slot})",
+                    );
+                    trace_with_peers!(
+                        "blob sidecar delayed until state at same slot is ready \
+                         (blob_sidecar: {:?}, block_root: {block_root:?}, slot: {slot})",
+                        pending_blob_sidecar.blob_sidecar,
+                    );
+
+                    let peer_id = pending_blob_sidecar.origin.peer_id();
+
+                    let pending_blob_sidecar = reply_delayed_blob_sidecar_validation_result(
+                        pending_blob_sidecar,
+                        Ok(ValidationOutcome::Ignore(false)),
+                    );
+
+                    self.delay_blob_sidecar_until_state(pending_blob_sidecar, block_root);
+
+                    // During block validation the necessary beacon state should have been built
+                    // and stored in state cache despite block being delayed due to incomplete data availability.
+                    // If there is a delayed until blobs block and no corresponding state in state cache,
+                    // it means cache got pruned and it needs to rebuild necessary beacon state.
+                    if let Some(delayed_block) = self.take_delayed_until_blobs(block_root) {
+                        self.retry_block(wait_group, delayed_block);
+                    } else {
+                        self.send_to_p2p(P2pMessage::BlockNeeded(block_root, peer_id));
+                    }
+                }
+            }
             Ok(BlobSidecarAction::DelayUntilParent(blob_sidecar)) => {
                 let parent_root = blob_sidecar.signed_block_header.message.parent_root;
 
@@ -1125,9 +1490,9 @@ where
                 };
 
                 if self.store.contains_block(parent_root) {
-                    self.retry_blob_sidecar(wait_group, pending_blob_sidecar);
+                    self.retry_blob_sidecar(wait_group, pending_blob_sidecar, None);
                 } else {
-                    debug!("blob sidecar delayed until block parent: {parent_root:?}");
+                    debug_with_peers!("blob sidecar delayed until block parent: {parent_root:?}");
 
                     let peer_id = pending_blob_sidecar.origin.peer_id();
 
@@ -1152,9 +1517,9 @@ where
                 };
 
                 if slot <= self.store.slot() {
-                    self.retry_blob_sidecar(wait_group, pending_blob_sidecar);
+                    self.retry_blob_sidecar(wait_group, pending_blob_sidecar, None);
                 } else {
-                    debug!("blob sidecar delayed until slot: {slot}");
+                    debug_with_peers!("blob sidecar delayed until slot: {slot}");
 
                     let pending_blob_sidecar = reply_delayed_blob_sidecar_validation_result(
                         pending_blob_sidecar,
@@ -1165,13 +1530,223 @@ where
                 }
             }
             Err(error) => {
-                warn!("blob sidecar rejected (error: {error}, origin: {origin:?})");
+                warn_with_peers!("blob sidecar rejected (error: {error}, origin: {origin:?})");
 
                 let (gossip_id, sender) = origin.split();
 
                 self.send_to_p2p(P2pMessage::Reject(
                     gossip_id,
                     MutatorRejectionReason::InvalidBlobSidecar { blob_identifier },
+                ));
+
+                reply_to_http_api(sender, Err(error));
+            }
+        }
+    }
+
+    #[expect(clippy::too_many_lines)]
+    fn handle_data_column_sidecar(
+        &mut self,
+        wait_group: W,
+        result: Result<DataColumnSidecarAction<P>>,
+        origin: DataColumnSidecarOrigin,
+        data_column_identifier: DataColumnIdentifier,
+        block_seen: bool,
+        submission_time: Instant,
+    ) {
+        match result {
+            Ok(DataColumnSidecarAction::Accept(data_column_sidecar)) => {
+                if origin.is_from_el() {
+                    self.send_to_p2p(P2pMessage::PublishDataColumnSidecar(
+                        data_column_sidecar.clone_arc(),
+                    ));
+                }
+
+                if self.store.accepted_data_column_sidecar(
+                    data_column_sidecar.signed_block_header.message,
+                    data_column_sidecar.index,
+                ) {
+                    let (_, sender) = origin.split();
+
+                    reply_to_http_api(sender, Ok(ValidationOutcome::Accept));
+                } else {
+                    let block_root = data_column_sidecar
+                        .signed_block_header
+                        .message
+                        .hash_tree_root();
+
+                    if self.store.is_forward_synced()
+                        && !matches!(
+                            origin,
+                            DataColumnSidecarOrigin::Own | DataColumnSidecarOrigin::ExecutionLayer
+                        )
+                        && !self.store.has_requested_blobs_from_el(&block_root)
+                        && !self.store.is_sidecars_construction_started(&block_root)
+                    {
+                        self.store_mut()
+                            .mark_requested_blobs_from_el(block_root, data_column_sidecar.slot());
+                        self.update_store_snapshot();
+
+                        let data_column_identifiers = self
+                            .store
+                            .sampling_columns()
+                            .iter()
+                            .map(|index| DataColumnIdentifier {
+                                block_root,
+                                index: *index,
+                            })
+                            .collect::<Vec<_>>();
+
+                        self.request_blobs_from_execution_engine(
+                            EngineGetBlobsV2Params {
+                                block_or_sidecar: data_column_sidecar.clone_arc().into(),
+                                data_column_identifiers,
+                            }
+                            .into(),
+                        )
+                    }
+
+                    let origin =
+                        self.accept_data_column_sidecar(&wait_group, &data_column_sidecar, origin);
+
+                    let (gossip_id, sender) = origin.split();
+
+                    if let Some(gossip_id) = gossip_id {
+                        self.send_to_p2p(P2pMessage::Accept(gossip_id));
+                    }
+
+                    reply_to_http_api(sender, Ok(ValidationOutcome::Accept));
+                }
+            }
+            Ok(DataColumnSidecarAction::Ignore(publishable)) => {
+                debug_with_peers!(
+                    "data column sidecar ignored (identifier: {data_column_identifier:?})"
+                );
+
+                let (gossip_id, sender) = origin.split();
+
+                if let Some(gossip_id) = gossip_id {
+                    self.send_to_p2p(P2pMessage::Ignore(gossip_id));
+                }
+
+                reply_to_http_api(sender, Ok(ValidationOutcome::Ignore(publishable)));
+            }
+            Ok(DataColumnSidecarAction::DelayUntilState(data_column_sidecar, block_root)) => {
+                let slot = data_column_sidecar.signed_block_header.message.slot;
+
+                let pending_data_column_sidecar = PendingDataColumnSidecar {
+                    data_column_sidecar,
+                    block_seen,
+                    origin,
+                    submission_time,
+                };
+
+                if let Some(state) =
+                    self.state_cache
+                        .existing_state_at_slot(&self.store, block_root, slot)
+                {
+                    self.retry_data_column_sidecar(
+                        wait_group,
+                        pending_data_column_sidecar,
+                        Some(state),
+                    );
+                } else {
+                    debug_with_peers!(
+                        "data column sidecar delayed until state at same slot is ready \
+                        (identifier: {data_column_identifier:?}, slot: {slot})",
+                    );
+
+                    let peer_id = pending_data_column_sidecar.origin.peer_id();
+
+                    let pending_data_column_sidecar =
+                        reply_delayed_data_column_sidecar_validation_result(
+                            pending_data_column_sidecar,
+                            Ok(ValidationOutcome::Ignore(false)),
+                        );
+
+                    self.delay_data_column_sidecar_until_state(
+                        pending_data_column_sidecar,
+                        block_root,
+                    );
+
+                    // During block validation the necessary beacon state should have been built
+                    // and stored in state cache despite block being delayed due to incomplete data availability.
+                    // If there is a delayed until blobs block and no corresponding state in state cache,
+                    // it means cache got pruned and it needs to rebuild necessary beacon state.
+                    if let Some(delayed_block) = self.take_delayed_until_blobs(block_root) {
+                        self.retry_block(wait_group, delayed_block);
+                    } else {
+                        self.send_to_p2p(P2pMessage::BlockNeeded(block_root, peer_id));
+                    }
+                }
+            }
+            Ok(DataColumnSidecarAction::DelayUntilParent(data_column_sidecar)) => {
+                let parent_root = data_column_sidecar.signed_block_header.message.parent_root;
+
+                let pending_data_column_sidecar = PendingDataColumnSidecar {
+                    data_column_sidecar,
+                    block_seen,
+                    origin,
+                    submission_time,
+                };
+
+                if self.store.contains_block(parent_root) {
+                    self.retry_data_column_sidecar(wait_group, pending_data_column_sidecar, None);
+                } else {
+                    debug_with_peers!(
+                        "data column sidecar delayed until block parent: \
+                        {parent_root:?}, identifier: {data_column_identifier:?}",
+                    );
+
+                    let peer_id = pending_data_column_sidecar.origin.peer_id();
+
+                    self.send_to_p2p(P2pMessage::BlockNeeded(parent_root, peer_id));
+
+                    let pending_data_column_sidecar =
+                        reply_delayed_data_column_sidecar_validation_result(
+                            pending_data_column_sidecar,
+                            Ok(ValidationOutcome::Ignore(false)),
+                        );
+
+                    self.delay_data_column_sidecar_until_parent(pending_data_column_sidecar);
+                }
+            }
+            Ok(DataColumnSidecarAction::DelayUntilSlot(data_column_sidecar)) => {
+                let slot = data_column_sidecar.signed_block_header.message.slot;
+
+                let pending_data_column_sidecar = PendingDataColumnSidecar {
+                    data_column_sidecar,
+                    block_seen,
+                    origin,
+                    submission_time,
+                };
+
+                if slot <= self.store.slot() {
+                    self.retry_data_column_sidecar(wait_group, pending_data_column_sidecar, None);
+                } else {
+                    debug_with_peers!("data column sidecar delayed until slot: {slot}");
+
+                    let pending_data_column_sidecar =
+                        reply_delayed_data_column_sidecar_validation_result(
+                            pending_data_column_sidecar,
+                            Ok(ValidationOutcome::Ignore(false)),
+                        );
+
+                    self.delay_data_column_sidecar_until_slot(pending_data_column_sidecar);
+                }
+            }
+            Err(error) => {
+                warn_with_peers!(
+                    "data column sidecar rejected (error: {error}, origin: {origin:?})"
+                );
+
+                let (gossip_id, sender) = origin.split();
+
+                self.send_to_p2p(P2pMessage::Reject(
+                    gossip_id,
+                    MutatorRejectionReason::InvalidDataColumnSidecar {
+                        data_column_identifier,
+                    },
                 ));
 
                 reply_to_http_api(sender, Err(error));
@@ -1251,6 +1826,55 @@ where
         }
     }
 
+    fn handle_finish_persisting_data_column_sidecars(
+        &mut self,
+        _wait_group: W,
+        persisted_data_column_ids: Vec<DataColumnIdentifier>,
+        slot: Slot,
+    ) {
+        self.store_mut()
+            .mark_persisted_data_columns(persisted_data_column_ids);
+
+        self.store_mut().prune_persisted_data_columns(slot);
+
+        self.update_store_snapshot();
+    }
+
+    fn handle_reconstructed_missing_columns(
+        &mut self,
+        wait_group: &W,
+        block_root: H256,
+        block: &SignedBeaconBlock<P>,
+        mut data_column_sidecars: Vec<Arc<DataColumnSidecar<P>>>,
+    ) {
+        let missing_indices = self.store.indices_of_missing_data_columns(block);
+
+        if missing_indices.is_empty() {
+            return;
+        }
+
+        // > The following data column sidecars, where they exist, MUST be sent in (slot, column_index) order.
+        data_column_sidecars.sort_by_key(|sidecar| (sidecar.slot(), sidecar.index));
+
+        debug_with_peers!(
+            "storing data column sidecars from reconstruction (block: {block_root:?}, columns: {missing_indices:?})",
+        );
+
+        for data_column_sidecar in data_column_sidecars {
+            if missing_indices.contains(&data_column_sidecar.index) {
+                self.accept_data_column_sidecar(
+                    wait_group,
+                    &data_column_sidecar,
+                    DataColumnSidecarOrigin::Own,
+                );
+            }
+
+            if self.store.is_forward_synced() {
+                self.send_to_p2p(P2pMessage::PublishDataColumnSidecar(data_column_sidecar));
+            }
+        }
+    }
+
     fn handle_notified_forkchoice_update_result(
         &mut self,
         wait_group: &W,
@@ -1273,20 +1897,26 @@ where
     fn handle_notified_new_payload(
         &mut self,
         wait_group: &W,
+        beacon_block_root: H256,
         execution_block_hash: ExecutionBlockHash,
         payload_status: PayloadStatusV1,
     ) {
+        if !self.store.contains_block(beacon_block_root) {
+            self.delay_payload_status_until_block(beacon_block_root, payload_status);
+
+            return;
+        }
+
         let old_head = self.store.head().clone();
         let head_was_optimistic = old_head.is_optimistic();
         let latest_valid_hash = payload_status.latest_valid_hash;
 
-        let mut payload_action = PayloadAction::Accept;
-
-        if let Some(valid_hash) = latest_valid_hash {
-            payload_action = self
-                .store_mut()
-                .update_chain_payload_statuses(valid_hash, Some(execution_block_hash));
-        }
+        let payload_action = if let Some(valid_hash) = latest_valid_hash {
+            self.store_mut()
+                .update_chain_payload_statuses(valid_hash, Some(execution_block_hash))
+        } else {
+            PayloadAction::Accept
+        };
 
         let status = payload_status.status;
 
@@ -1296,7 +1926,7 @@ where
             //
             // [Engine API specification]: https://github.com/ethereum/execution-apis/blob/b7c5d3420e00648f456744d121ffbd929862924d/src/engine/paris.md#payload-validation
             if latest_valid_hash != Some(execution_block_hash) {
-                warn!(
+                warn_with_peers!(
                     "execution engine returned inconsistent response \
                      (execution_block_hash: {execution_block_hash:?}, \
                      payload_status: {payload_status:?})",
@@ -1306,15 +1936,8 @@ where
             // The call to `Store::update_chain_payload_statuses` above will set the payload
             // statuses of the block and its ancestors to `PayloadStatus::Valid`.
         } else if status.is_invalid() {
-            // The call to `Store::update_chain_payload_statuses` above will set the payload
-            // statuses of the block and its descendants to `PayloadStatus::Invalid`,
-            // but only if `latest_valid_hash` is present.
-            if latest_valid_hash.is_none() || latest_valid_hash == Some(ExecutionBlockHash::zero())
-            {
-                payload_action = self
-                    .store_mut()
-                    .invalidate_block_and_descendant_payload_statuses(execution_block_hash);
-            }
+            self.store_mut()
+                .invalidate_block_and_descendant_payloads(beacon_block_root);
         } else {
             return;
         }
@@ -1362,19 +1985,22 @@ where
 
         // Do not send API events about optimistic blocks.
         // Vouch treats all head events as non-optimistic.
-        if (head_changed || head_was_optimistic) && head.is_valid() {
+        if !head_changed && head_was_optimistic && head.is_valid() {
             self.event_channels
                 .send_head_event(head, |head| self.calculate_dependent_roots(head));
 
-            if !head_changed {
-                // The call to `Store::notify_about_reorganization` below sends
-                // a `ValidatorMessage::Head` message if the head changed.
-                self.send_to_validator(ValidatorMessage::Head(wait_group.clone(), head.clone()));
-            }
+            // The call to `Store::notify_about_reorganization` below sends
+            // a `ValidatorMessage::Head` message if the head changed.
+            self.send_to_validator(ValidatorMessage::Head(wait_group.clone(), head.clone()));
         }
 
         if head_changed {
-            self.notify_about_reorganization(wait_group.clone(), old_head);
+            self.notify_about_reorganization(
+                wait_group.clone(),
+                old_head,
+                ReorgSource::PayloadResponse,
+            );
+
             self.spawn_preprocess_head_state_for_next_slot_task();
         }
     }
@@ -1397,20 +2023,31 @@ where
                 &self.store,
             )?;
 
-            info!(
+            info_with_peers!(
                 "chain saved (finalized blocks: {}, unfinalized blocks: {})",
                 slots.finalized.len(),
                 slots.unfinalized.len(),
             );
 
-            debug!("appended block slots: {slots:?}");
+            debug_with_peers!("appended block slots: {slots:?}");
         }
 
         Ok(())
     }
 
+    fn handle_store_sampling_columns(&mut self, sampling_columns: HashSet<ColumnIndex>) {
+        debug_with_peers!(
+            "storing index of column sidecars to sample: {sampling_columns:?} \
+            for further data availability check",
+        );
+
+        self.store_mut().store_sampling_columns(sampling_columns);
+        self.update_store_snapshot();
+    }
+
     #[expect(clippy::cognitive_complexity)]
     #[expect(clippy::too_many_lines)]
+    #[instrument(level = "debug", skip_all)]
     fn accept_block(
         &mut self,
         wait_group: &W,
@@ -1420,9 +2057,10 @@ where
             chain_link,
             attester_slashing_results,
             origin,
-            submission_time,
+            processing_timings,
         } = pending_chain_link;
 
+        let processing_timings = processing_timings.processing();
         let block_root = chain_link.block_root;
         let block = &chain_link.block;
 
@@ -1443,7 +2081,13 @@ where
         // A block may become orphaned while being processed.
         // The fork choice store is not designed to accommodate blocks like that.
         if block.message().slot() <= self.store.finalized_slot() {
-            debug!(
+            debug_with_peers!(
+                "block became orphaned while being processed \
+                 (block_root: {block_root:?}, \
+                  origin: {origin:?}, finalized slot: {})",
+                self.store.finalized_slot(),
+            );
+            trace_with_peers!(
                 "block became orphaned while being processed \
                  (block_root: {block_root:?}, block: {block:?}, \
                   origin: {origin:?}, finalized slot: {})",
@@ -1461,17 +2105,21 @@ where
             return Ok(());
         }
 
-        debug!("block accepted (block_root: {block_root:?}, block: {block:?}, origin: {origin:?})");
+        debug_with_peers!("block accepted (block_root: {block_root:?}, origin: {origin:?})");
+        trace_with_peers!(
+            "block accepted (block_root: {block_root:?}, block: {block:?}, origin: {origin:?})"
+        );
 
         let block_slot = chain_link.slot();
 
         if let Some(existing_link) = self.store.chain_link_before_or_at(block_slot) {
             if block_slot == existing_link.slot() {
-                warn!(
+                warn_with_peers!(
                     "the store accepted a new block at slot {block_slot}, \
                     although it already contains one at the same slot on the canonical chain \
                     (existing canonical block: {:?}, new block: {:?})",
-                    existing_link.block, chain_link.block,
+                    existing_link.block,
+                    chain_link.block,
                 );
             }
         }
@@ -1484,21 +2132,75 @@ where
         let unfinalized_states_in_memory = self.store.store_config().unfinalized_states_in_memory;
         let head_slot = self.store.head().slot();
 
-        if misc::is_epoch_start::<P>(block.message().slot()) {
-            info!("unloading old beacon states (head slot: {head_slot})");
+        let block_epoch = misc::compute_epoch_at_slot::<P>(block_slot);
+        let parent_epoch = self
+            .store
+            .chain_link(block.message().parent_root())
+            .map(|chain_link| misc::compute_epoch_at_slot::<P>(chain_link.slot()));
 
-            self.store_mut()
+        if parent_epoch
+            .map(|epoch| epoch < block_epoch)
+            .unwrap_or(true)
+        {
+            self.store.prune_state_cache(true);
+
+            info_with_peers!("unloading old beacon states (head slot: {head_slot})");
+
+            let unloaded = self
+                .store_mut()
                 .unload_old_states(unfinalized_states_in_memory);
+
+            let store = self.owned_store();
+            let storage = self.storage.clone_arc();
+            let wait_group = wait_group.clone();
+
+            if !unloaded.is_empty() {
+                Builder::new()
+                .name("store-unloader".to_owned())
+                .spawn(move || {
+                    debug_with_peers!("persisting unloaded old beacon states…");
+
+                    let states_with_block_roots = unloaded
+                        .iter()
+                        .map(|chain_link| (chain_link.state(&store), chain_link.block_root));
+
+                    match storage.append_states(states_with_block_roots) {
+                        Ok(slots) => {
+                            debug_with_peers!(
+                                "unloaded old beacon states persisted \
+                                 (state slots: {slots:?})",
+                            )
+                        }
+                        Err(error) => {
+                            error_with_peers!("persisting unloaded old beacon states to storage failed: {error:?}")
+                        }
+                    }
+
+                    drop(wait_group);
+                })?;
+            }
         }
 
-        let processing_duration = insertion_time.duration_since(submission_time);
+        let ProcessingTimings {
+            delay_duration,
+            submission_time,
+            ..
+        } = processing_timings;
+
+        let insertion_duration = insertion_time.duration_since(submission_time);
+        let processing_duration = insertion_duration.saturating_sub(delay_duration);
 
         features::log!(
             LogBlockProcessingTime,
-            "block {block_root:?} processed in {processing_duration:?}",
+            "block {block_root:?} inserted in {insertion_duration:?}, \
+            processed in {processing_duration:?}",
         );
 
         if let Some(metrics) = self.metrics.as_ref() {
+            metrics
+                .block_insertion_times
+                .observe(insertion_duration.as_secs_f64());
+
             metrics
                 .block_processing_times
                 .observe(processing_duration.as_secs_f64());
@@ -1507,7 +2209,7 @@ where
         if let Some(hash) = block.execution_block_hash() {
             if let Some(payload_statuses) = self.delayed_until_payload.remove(&hash) {
                 for (payload_status, _) in payload_statuses {
-                    self.handle_notified_new_payload(wait_group, hash, payload_status);
+                    self.handle_notified_new_payload(wait_group, block_root, hash, payload_status);
                 }
             }
         }
@@ -1555,11 +2257,20 @@ where
             reply_block_validation_result_to_http_api(sender, Ok(ValidationOutcome::Accept));
         }
 
-        self.maybe_spawn_block_attestations_task(wait_group, &block);
+        self.maybe_spawn_block_attestations_task(wait_group, block_root, &block);
 
         if changes.is_finalized_checkpoint_updated() {
             self.archive_finalized(wait_group)?;
             self.prune_delayed_until_payload();
+            self.persist_pubkey_cache(wait_group);
+
+            let finalized_slot = self.store.finalized_slot();
+
+            self.event_channels.prune_after_finalization(finalized_slot);
+
+            if block.phase().is_peerdas_activated() {
+                self.try_spawn_persist_data_columns_task(finalized_slot, wait_group.clone());
+            }
         }
 
         // Call `Store::apply_attester_slashing` after `Store::archive_finalized` to reduce the
@@ -1571,7 +2282,9 @@ where
 
                 result
                     .map_err(|error| {
-                        debug!("attester slashing rejected (error: {error}, origin: {origin:?})")
+                        debug_with_peers!(
+                            "attester slashing rejected (error: {error}, origin: {origin:?})"
+                        )
                     })
                     .unwrap_or_default()
             })
@@ -1589,7 +2302,11 @@ where
         self.update_store_snapshot();
 
         if let Some(objects) = self.take_delayed_until_block(block_root) {
-            debug!("retrying objects delayed until block {block_root:?}");
+            debug_with_peers!("retrying objects delayed until block {block_root:?}");
+            debug_with_peers!(
+                "retrying {} pending data column sidecars after block {block_root:?} imported",
+                objects.data_column_sidecars.len(),
+            );
             self.retry_delayed(objects, wait_group);
         }
 
@@ -1618,16 +2335,13 @@ where
         match changes {
             ApplyBlockChanges::CanonicalChainExtended { .. } => {
                 let new_head = self.store.head().clone();
-                let state = new_head.state(&self.store);
 
                 if let Some(metrics) = self.metrics.as_ref() {
                     Self::track_head_metrics(&new_head, metrics);
                 }
 
-                self.send_to_p2p(P2pMessage::HeadState(state));
+                self.send_to_p2p(P2pMessage::HeadChanged(new_head.block_root));
 
-                // Do not send API events about optimistic blocks.
-                // Vouch treats all head events as non-optimistic.
                 if new_head.is_valid() {
                     self.event_channels
                         .send_head_event(&new_head, |head| self.calculate_dependent_roots(head));
@@ -1639,10 +2353,12 @@ where
                 }
 
                 self.notify_forkchoice_updated(&new_head);
+                self.maybe_spawn_preprocess_head_state_for_current_slot_task(block_slot);
                 self.spawn_preprocess_head_state_for_next_slot_task();
             }
             ApplyBlockChanges::Reorganized { old_head, .. } => {
-                self.notify_about_reorganization(wait_group.clone(), &old_head);
+                self.notify_about_reorganization(wait_group.clone(), &old_head, ReorgSource::Block);
+                self.maybe_spawn_preprocess_head_state_for_current_slot_task(block_slot);
                 self.spawn_preprocess_head_state_for_next_slot_task();
             }
             ApplyBlockChanges::AlternateChainExtended { .. } => {}
@@ -1664,9 +2380,43 @@ where
         Ok(())
     }
 
+    fn reject_block(&mut self, error: AnyhowError, block_root: H256, origin: BlockOrigin) {
+        warn_with_peers!(
+            "block rejected (error: {error}, block root: {block_root:?}, origin: {origin:?})"
+        );
+
+        let sender = match origin {
+            BlockOrigin::Gossip(gossip_id) => {
+                self.send_to_p2p(P2pMessage::Reject(
+                    Some(gossip_id),
+                    MutatorRejectionReason::InvalidBlock,
+                ));
+
+                None
+            }
+            BlockOrigin::Api(sender) => sender,
+            BlockOrigin::Requested(peer_id) => {
+                if let Some(peer_id) = peer_id {
+                    // During block sync (and especially during non-finality events)
+                    // it's important to drop peers that send invalid blocks
+                    self.send_to_p2p(P2pMessage::PenalizePeer(
+                        peer_id,
+                        MutatorRejectionReason::InvalidBlock,
+                    ));
+                }
+
+                None
+            }
+            BlockOrigin::Own | BlockOrigin::Persisted => None,
+        };
+
+        self.store_mut().register_rejected_block(block_root);
+        self.update_store_snapshot();
+
+        reply_block_validation_result_to_http_api(sender, Err(error));
+    }
+
     fn accept_blob_sidecar(&mut self, wait_group: &W, blob_sidecar: &Arc<BlobSidecar<P>>) {
-        let old_head = self.store.head().clone();
-        let head_was_optimistic = old_head.is_optimistic();
         let block_root = blob_sidecar.signed_block_header.message.hash_tree_root();
 
         self.store_mut()
@@ -1690,8 +2440,55 @@ where
                 metrics: self.metrics.clone(),
             });
         }
+    }
 
-        self.handle_potential_head_change(wait_group, &old_head, head_was_optimistic);
+    fn accept_data_column_sidecar(
+        &mut self,
+        wait_group: &W,
+        data_column_sidecar: &Arc<DataColumnSidecar<P>>,
+        origin: DataColumnSidecarOrigin,
+    ) -> DataColumnSidecarOrigin {
+        let block_header = data_column_sidecar.signed_block_header.message;
+        let block_root = block_header.hash_tree_root();
+
+        self.store_mut()
+            .apply_data_column_sidecar(data_column_sidecar.clone_arc());
+
+        self.update_store_snapshot();
+
+        let accepted_data_columns = self.store.accepted_data_column_sidecars_count(block_header);
+        let reconstruction_enabled = self.store.is_reconstruction_enabled_for(&block_root);
+
+        let should_retry_block = if reconstruction_enabled {
+            accepted_data_columns * 2 >= P::NumberOfColumns::USIZE
+        } else {
+            accepted_data_columns >= self.store.sampling_columns_count()
+        };
+
+        debug_with_peers!(
+            "accepted data column sidecar: {block_root:?}, index: {}, slot: {}, \
+            accepted data columns: {}, should_retry_block: {should_retry_block}, \
+            reconstruction enabled: {reconstruction_enabled}, sampling columns count: {}, \
+            reconstruction started: {}, origin: {origin:?}",
+            data_column_sidecar.index,
+            block_header.slot,
+            accepted_data_columns,
+            self.store.sampling_columns_count(),
+            self.store.is_sidecars_construction_started(&block_root),
+        );
+
+        // During syncing, if we retry everytime when receiving a sidecar, this might spamming the
+        // queue, leading to delaying other data column sidecar tasks
+        if should_retry_block {
+            if let Some(pending_block) = self.take_delayed_until_blobs(block_root) {
+                self.retry_block(wait_group.clone(), pending_block);
+            }
+        }
+
+        self.event_channels
+            .send_data_column_sidecar_event(block_root, data_column_sidecar);
+
+        origin
     }
 
     fn notify_about_finalized_checkpoint(&self) {
@@ -1699,7 +2496,7 @@ where
         let justified_checkpoint = self.store.justified_checkpoint();
         let head = self.store.head();
 
-        info!(
+        info_with_peers!(
             "new finalized checkpoint \
              (epoch: {}, root: {:?}, head slot: {}, head root: {:?})",
             finalized_checkpoint.epoch,
@@ -1719,13 +2516,6 @@ where
             metrics.set_beacon_previous_justified_epoch(previous_justified_checkpoint.epoch);
         }
 
-        let finalized_state = self.store.last_finalized().state(&self.store);
-
-        self.send_to_validator(ValidatorMessage::FinalizedEth1Data(
-            finalized_state.eth1_deposit_index(),
-            finalized_state.deposit_requests_start_index(),
-        ));
-
         self.event_channels.send_finalized_checkpoint_event(
             head.block_root,
             finalized_checkpoint,
@@ -1733,44 +2523,47 @@ where
         );
     }
 
-    fn notify_about_reorganization(&self, wait_group: W, old_head: &ChainLink<P>) {
+    fn notify_about_reorganization(
+        &self,
+        wait_group: W,
+        old_head: &ChainLink<P>,
+        reorg_source: ReorgSource,
+    ) {
         let new_head = self.store.head().clone();
 
         self.event_channels
-            .send_chain_reorg_event(&self.store, old_head);
+            .send_chain_reorg_event(&self.store, &new_head, old_head);
 
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.beacon_reorgs_total.inc();
         }
 
-        info!(
-            "chain reorganized (old head: {:?}, new head: {:?})",
-            old_head.block_root, new_head.block_root,
+        info_with_peers!(
+            "chain reorganized (old head: {:?}, new head: {:?}), cause: {reorg_source:?}",
+            old_head.block_root,
+            new_head.block_root,
         );
-
-        let state = new_head.state(&self.store);
 
         if let Some(metrics) = self.metrics.as_ref() {
             Self::track_head_metrics(&new_head, metrics);
         }
 
-        self.send_to_p2p(P2pMessage::HeadState(state));
+        self.send_to_p2p(P2pMessage::HeadChanged(new_head.block_root));
 
         if new_head.is_valid() {
+            // Do not send API events about optimistic blocks.
+            // Vouch treats all head events as non-optimistic.
+            self.event_channels
+                .send_head_event(&new_head, |head| self.calculate_dependent_roots(head));
+
             self.send_to_validator(ValidatorMessage::Head(wait_group, new_head.clone()));
         }
 
         self.notify_forkchoice_updated(&new_head);
     }
 
-    fn request_blobs_from_execution_engine(
-        &self,
-        block: Arc<SignedBeaconBlock<P>>,
-        missing_blobs: Vec<BlobIdentifier>,
-        peer_id: Option<PeerId>,
-    ) {
-        self.execution_engine
-            .get_blobs(block, missing_blobs, peer_id);
+    fn request_blobs_from_execution_engine(&self, params: EngineGetBlobsParams<P>) {
+        self.execution_engine.get_blobs(params);
     }
 
     fn notify_forkchoice_updated(&self, new_head: &ChainLink<P>) {
@@ -1820,6 +2613,10 @@ where
     }
 
     fn delay_block_until_blobs(&mut self, beacon_block_root: H256, pending_block: PendingBlock<P>) {
+        self.store_mut()
+            .delay_block_at_slot(pending_block.block.message().slot(), beacon_block_root);
+        self.update_store_snapshot();
+
         self.delayed_until_blobs
             .insert(beacon_block_root, pending_block);
     }
@@ -1844,7 +2641,7 @@ where
         if self.store.contains_block(block_root) {
             self.retry_aggregate_and_proof(wait_group.clone(), pending_aggregate_and_proof);
         } else {
-            debug!(
+            trace_with_peers!(
                 "aggregate and proof delayed until block \
                  (pending_aggregate_and_proof: {pending_aggregate_and_proof:?}, \
                   block_root: {block_root:?})",
@@ -1874,7 +2671,7 @@ where
         if self.store.contains_block(block_root) {
             self.retry_attestation(wait_group.clone(), pending_attestation);
         } else {
-            debug!(
+            trace_with_peers!(
                 "attestation delayed until block \
                  (pending_attestation: {pending_attestation:?}, block_root: {block_root:?})",
             );
@@ -1898,6 +2695,24 @@ where
                 .attestations
                 .push(pending_attestation);
         }
+    }
+
+    fn delay_payload_status_until_block(
+        &mut self,
+        beacon_block_root: H256,
+        payload_status: PayloadStatusV1,
+    ) {
+        debug_with_peers!(
+            "payload status handling delayed until block \
+             (payload_status: {payload_status:?}, beacon_block_root: {beacon_block_root:?})",
+        );
+
+        let pending_payload_status = (payload_status, self.store.head().slot());
+
+        self.delayed_until_block
+            .entry(beacon_block_root)
+            .or_default()
+            .payload_status = Some(pending_payload_status);
     }
 
     fn delay_block_until_slot(&mut self, pending_block: PendingBlock<P>) {
@@ -1927,7 +2742,9 @@ where
         if slot <= self.store.slot() {
             self.retry_aggregate_and_proof(wait_group.clone(), pending_aggregate_and_proof);
         } else {
-            debug!("aggregate and proof delayed until slot: {pending_aggregate_and_proof:?}");
+            trace_with_peers!(
+                "aggregate and proof delayed until slot: {pending_aggregate_and_proof:?}"
+            );
 
             self.delayed_until_slot
                 .entry(slot)
@@ -1947,14 +2764,14 @@ where
         if slot <= self.store.slot() {
             self.retry_attestation(wait_group.clone(), pending_attestation);
         } else {
-            debug!("attestation delayed until slot: {pending_attestation:?}");
+            trace_with_peers!("attestation delayed until slot: {pending_attestation:?}");
 
             // Attestations produced by the application itself should never be delayed.
             // Attestations included in blocks should never be delayed until a slot
             // because at least one slot must have passed since they were published.
             assert!(!matches!(
                 pending_attestation.origin,
-                AttestationOrigin::Own(_) | AttestationOrigin::Block,
+                AttestationOrigin::Own(_) | AttestationOrigin::Block(_),
             ));
 
             self.delayed_until_slot
@@ -1963,6 +2780,24 @@ where
                 .attestations
                 .push(pending_attestation);
         }
+    }
+
+    fn delay_blob_sidecar_until_state(
+        &mut self,
+        pending_blob_sidecar: PendingBlobSidecar<P>,
+        block_root: H256,
+    ) {
+        let slot = pending_blob_sidecar
+            .blob_sidecar
+            .signed_block_header
+            .message
+            .slot;
+
+        self.delayed_until_state
+            .entry((block_root, slot))
+            .or_default()
+            .blob_sidecars
+            .push(pending_blob_sidecar);
     }
 
     fn delay_blob_sidecar_until_parent(&mut self, pending_blob_sidecar: PendingBlobSidecar<P>) {
@@ -1993,6 +2828,58 @@ where
             .push(pending_blob_sidecar);
     }
 
+    fn delay_data_column_sidecar_until_state(
+        &mut self,
+        pending_data_column_sidecar: PendingDataColumnSidecar<P>,
+        block_root: H256,
+    ) {
+        let slot = pending_data_column_sidecar
+            .data_column_sidecar
+            .signed_block_header
+            .message
+            .slot;
+
+        self.delayed_until_state
+            .entry((block_root, slot))
+            .or_default()
+            .data_column_sidecars
+            .push(pending_data_column_sidecar);
+    }
+
+    fn delay_data_column_sidecar_until_parent(
+        &mut self,
+        pending_data_column_sidecar: PendingDataColumnSidecar<P>,
+    ) {
+        self.delayed_until_block
+            .entry(
+                pending_data_column_sidecar
+                    .data_column_sidecar
+                    .signed_block_header
+                    .message
+                    .parent_root,
+            )
+            .or_default()
+            .data_column_sidecars
+            .push(pending_data_column_sidecar);
+    }
+
+    fn delay_data_column_sidecar_until_slot(
+        &mut self,
+        pending_data_column_sidecar: PendingDataColumnSidecar<P>,
+    ) {
+        self.delayed_until_slot
+            .entry(
+                pending_data_column_sidecar
+                    .data_column_sidecar
+                    .signed_block_header
+                    .message
+                    .slot,
+            )
+            .or_default()
+            .data_column_sidecars
+            .push(pending_data_column_sidecar);
+    }
+
     fn take_delayed_until_blobs(&mut self, block_root: H256) -> Option<PendingBlock<P>> {
         self.delayed_until_blobs.remove(&block_root)
     }
@@ -2012,14 +2899,22 @@ where
         .into_values()
     }
 
+    fn take_delayed_until_state(&mut self, block_root: H256, slot: Slot) -> Option<Delayed<P>> {
+        self.delayed_until_state.remove(&(block_root, slot))
+    }
+
     // `wait_group` is a reference not just to pass Clippy lints but for correctness as well.
     // The referenced value must not be dropped before the current message is handled.
     fn retry_delayed(&self, delayed: Delayed<P>, wait_group: &W) {
         let Delayed {
             blocks,
+            // Delayed payload status update is applied before accepting block,
+            // so a bit earlier than the other delayed items.
+            payload_status: _,
             aggregates,
             attestations,
             blob_sidecars,
+            data_column_sidecars,
         } = delayed;
 
         for pending_block in blocks {
@@ -2035,18 +2930,29 @@ where
         }
 
         for pending_blob_sidecar in blob_sidecars {
-            self.retry_blob_sidecar(wait_group.clone(), pending_blob_sidecar);
+            self.retry_blob_sidecar(wait_group.clone(), pending_blob_sidecar, None);
+        }
+
+        for pending_data_column_sidecar in data_column_sidecars {
+            self.retry_data_column_sidecar(wait_group.clone(), pending_data_column_sidecar, None);
         }
     }
 
+    #[instrument(skip_all, level = "debug", parent = &pending_block.tracing_span)]
     fn retry_block(&self, wait_group: W, pending_block: PendingBlock<P>) {
-        debug!("retrying delayed block: {pending_block:?}");
+        debug_with_peers!(
+            "retrying delayed block: {:?}",
+            pending_block.block.message().hash_tree_root(),
+        );
 
         let PendingBlock {
             block,
             origin,
-            submission_time,
+            processing_timings,
+            tracing_span,
         } = pending_block;
+
+        let processing_timings = processing_timings.processing();
 
         self.spawn(BlockTask {
             store_snapshot: self.owned_store(),
@@ -2056,13 +2962,14 @@ where
             wait_group,
             block,
             origin,
-            submission_time,
+            processing_timings,
             metrics: self.metrics.clone(),
+            tracing_span,
         });
     }
 
     fn retry_attestation(&self, wait_group: W, attestation: PendingAttestation<P>) {
-        debug!("retrying delayed attestation: {attestation:?}");
+        trace_with_peers!("retrying delayed attestation: {attestation:?}");
 
         if attestation.verify_signatures() {
             self.send_to_attestation_verifier(AttestationVerifierMessage::Attestation {
@@ -2081,7 +2988,7 @@ where
     }
 
     fn retry_tick(&mut self, wait_group: &W, tick: Tick) -> Result<()> {
-        debug!("retrying delayed tick: {tick:?}");
+        debug_with_peers!("retrying delayed tick: {tick:?}");
 
         self.handle_tick(wait_group, tick)
     }
@@ -2091,7 +2998,7 @@ where
         wait_group: W,
         pending_aggregate_and_proof: PendingAggregateAndProof<P>,
     ) {
-        debug!("retrying delayed aggregate and proof: {pending_aggregate_and_proof:?}");
+        trace_with_peers!("retrying delayed aggregate and proof: {pending_aggregate_and_proof:?}");
 
         let PendingAggregateAndProof {
             aggregate_and_proof,
@@ -2105,8 +3012,13 @@ where
         });
     }
 
-    fn retry_blob_sidecar(&self, wait_group: W, pending_blob_sidecar: PendingBlobSidecar<P>) {
-        debug!("retrying delayed blob sidecar: {pending_blob_sidecar:?}");
+    fn retry_blob_sidecar(
+        &self,
+        wait_group: W,
+        pending_blob_sidecar: PendingBlobSidecar<P>,
+        state: Option<Arc<BeaconState<P>>>,
+    ) {
+        trace_with_peers!("retrying delayed blob sidecar: {pending_blob_sidecar:?}");
 
         let PendingBlobSidecar {
             blob_sidecar,
@@ -2120,10 +3032,41 @@ where
             mutator_tx: self.owned_mutator_tx(),
             wait_group,
             blob_sidecar,
+            state,
             block_seen,
             origin,
             submission_time,
             metrics: self.metrics.clone(),
+        });
+    }
+
+    fn retry_data_column_sidecar(
+        &self,
+        wait_group: W,
+        pending_data_column_sidecar: PendingDataColumnSidecar<P>,
+        state: Option<Arc<BeaconState<P>>>,
+    ) {
+        trace_with_peers!("retrying delayed data column sidecar: {pending_data_column_sidecar:?}");
+
+        let PendingDataColumnSidecar {
+            data_column_sidecar,
+            block_seen,
+            origin,
+            submission_time,
+        } = pending_data_column_sidecar;
+
+        self.spawn(RetryDataColumnSidecarTask {
+            task: DataColumnSidecarTask {
+                store_snapshot: self.owned_store(),
+                mutator_tx: self.owned_mutator_tx(),
+                wait_group,
+                data_column_sidecar,
+                state,
+                block_seen,
+                origin,
+                submission_time,
+                metrics: self.metrics.clone(),
+            },
         });
     }
 
@@ -2159,27 +3102,34 @@ where
 
         let mut gossip_ids = vec![];
 
-        // Use `drain_filter_polyfill` because `Vec::extract_if` is not stable as of Rust 1.82.0.
         self.delayed_until_block.retain(|_, delayed| {
             let Delayed {
                 blocks,
+                payload_status,
                 aggregates,
                 attestations,
                 blob_sidecars,
+                data_column_sidecars,
             } = delayed;
 
             gossip_ids.extend(
                 blocks
-                    .drain_filter(|pending| {
+                    .extract_if(.., |pending| {
                         // The parent of a delayed block cannot be in a finalized slot.
                         pending.block.message().slot() - 1 <= finalized_slot
                     })
                     .filter_map(|pending| pending.origin.gossip_id()),
             );
 
+            if let Some((_, slot)) = payload_status {
+                if *slot <= finalized_slot {
+                    payload_status.take();
+                }
+            }
+
             gossip_ids.extend(
                 aggregates
-                    .drain_filter(|pending| {
+                    .extract_if(.., |pending| {
                         let epoch = pending
                             .aggregate_and_proof
                             .message()
@@ -2195,7 +3145,7 @@ where
 
             gossip_ids.extend(
                 attestations
-                    .drain_filter(|pending| {
+                    .extract_if(.., |pending| {
                         let epoch = pending.data().target.epoch;
 
                         epoch < previous_epoch
@@ -2206,9 +3156,19 @@ where
             // TODO(feature/deneb): Does the condition and comment apply to blob sidecars?
             gossip_ids.extend(
                 blob_sidecars
-                    .drain_filter(|pending| {
+                    .extract_if(.., |pending| {
                         // The parent of a delayed block cannot be in a finalized slot.
                         pending.blob_sidecar.signed_block_header.message.slot - 1 <= finalized_slot
+                    })
+                    .filter_map(|pending| pending.origin.gossip_id()),
+            );
+
+            gossip_ids.extend(
+                data_column_sidecars
+                    .extract_if(.., |pending| {
+                        // The parent of a delayed block cannot be in a finalized slot.
+                        pending.data_column_sidecar.signed_block_header.message.slot - 1
+                            <= finalized_slot
                     })
                     .filter_map(|pending| pending.origin.gossip_id()),
             );
@@ -2231,44 +3191,31 @@ where
     fn prune_waiting_for_checkpoint_states(&mut self) -> Vec<GossipId> {
         let finalized_epoch = self.store.finalized_epoch();
 
-        let mut gossip_ids = vec![];
-
-        // Use `HashMap::retain` because `HashMap::extract_if` is not stable as of Rust 1.82.0.
         self.waiting_for_checkpoint_states
-            .retain(|target, waiting| {
-                let prune = target.epoch < finalized_epoch;
+            .extract_if(|target, _| target.epoch < finalized_epoch)
+            .flat_map(|(_, waiting)| {
+                let WaitingForCheckpointState {
+                    ticks: _,
+                    chain_links,
+                    aggregates,
+                    attestations,
+                } = waiting;
 
-                if prune {
-                    let WaitingForCheckpointState {
-                        ticks: _,
-                        chain_links,
-                        aggregates,
-                        attestations,
-                    } = waiting;
+                let chain_link_ids = chain_links
+                    .into_iter()
+                    .filter_map(|pending| pending.origin.gossip_id());
 
-                    gossip_ids.extend(
-                        core::mem::take(chain_links)
-                            .into_iter()
-                            .filter_map(|pending| pending.origin.gossip_id()),
-                    );
+                let aggregate_ids = aggregates
+                    .into_iter()
+                    .filter_map(|pending| pending.origin.gossip_id());
 
-                    gossip_ids.extend(
-                        core::mem::take(aggregates)
-                            .into_iter()
-                            .filter_map(|pending| pending.origin.gossip_id()),
-                    );
+                let attestation_ids = attestations
+                    .into_iter()
+                    .filter_map(|pending| pending.origin.gossip_id());
 
-                    gossip_ids.extend(
-                        core::mem::take(attestations)
-                            .into_iter()
-                            .filter_map(|pending| pending.origin.gossip_id()),
-                    );
-                }
-
-                !prune
-            });
-
-        gossip_ids
+                chain_link_ids.chain(aggregate_ids).chain(attestation_ids)
+            })
+            .collect()
     }
 
     // Attestations in blocks must be processed just like gossiped ones.
@@ -2280,6 +3227,7 @@ where
     fn maybe_spawn_block_attestations_task(
         &self,
         wait_group: &W,
+        block_root: H256,
         block: &Arc<SignedBeaconBlock<P>>,
     ) {
         // `BlockAttestationsTask`s have a surprisingly large amount of overhead.
@@ -2292,6 +3240,7 @@ where
             store_snapshot: self.owned_store(),
             mutator_tx: self.owned_mutator_tx(),
             wait_group: wait_group.clone(),
+            block_root,
             block: block.clone_arc(),
             metrics: self.metrics.clone(),
         });
@@ -2323,8 +3272,33 @@ where
             mutator_tx: self.owned_mutator_tx(),
             wait_group,
             checkpoint,
+            pubkey_cache: self.pubkey_cache.clone_arc(),
             metrics: self.metrics.clone(),
         });
+    }
+
+    fn maybe_spawn_preprocess_head_state_for_current_slot_task(&self, block_slot: Slot) {
+        if !self.store.is_forward_synced() {
+            return;
+        }
+
+        let current_tick = self.store.tick();
+
+        if current_tick.slot == (block_slot + 1) && current_tick.is_before_attesting_interval() {
+            debug_with_peers!(
+                "spawn preprocess state task for current slot: {block_slot}: {current_tick:?}"
+            );
+
+            self.spawn(PreprocessStateTask {
+                store_snapshot: self.owned_store(),
+                state_cache: self.state_cache.clone_arc(),
+                mutator_tx: self.owned_mutator_tx(),
+                head_block_root: self.store.head().block_root,
+                next_slot: self.store.slot(),
+                pubkey_cache: self.pubkey_cache.clone_arc(),
+                metrics: self.metrics.clone(),
+            })
+        }
     }
 
     fn spawn_preprocess_head_state_for_next_slot_task(&self) {
@@ -2338,13 +3312,28 @@ where
             mutator_tx: self.owned_mutator_tx(),
             head_block_root: self.store.head().block_root,
             next_slot: self.store.slot() + 1,
+            pubkey_cache: self.pubkey_cache.clone_arc(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
+    fn spawn_pubkey_cache_persist_task(
+        &self,
+        pubkey_cache: Arc<PubkeyCache>,
+        wait_group: W,
+        state: Arc<BeaconState<P>>,
+    ) {
+        self.spawn(PersistPubkeyCacheTask {
+            pubkey_cache,
+            state,
+            wait_group,
             metrics: self.metrics.clone(),
         })
     }
 
     fn archive_finalized(&mut self, wait_group: &W) -> Result<()> {
         if let Some(latest_archivable_index) = self.store.latest_archivable_index() {
-            debug!("archiving finalized blocks and anchor state…");
+            debug_with_peers!("archiving finalized blocks and anchor state…");
 
             let store = self.owned_store();
             let storage = self.storage.clone_arc();
@@ -2355,10 +3344,12 @@ where
             let mut archived = self.store_mut().archive_finalized(latest_archivable_index);
             archived.push_back(self.store.anchor().clone());
 
+            let last_finalized_slot = self.store.last_finalized().slot();
+
             Builder::new()
                 .name("store-archiver".to_owned())
                 .spawn(move || {
-                    debug!("saving finalized blocks and anchor state…");
+                    debug_with_peers!("saving finalized blocks and anchor state…");
 
                     match storage.append(core::iter::empty(), archived.iter(), &store) {
                         Ok(slots) => {
@@ -2370,12 +3361,27 @@ where
                                 }
                             }
 
-                            debug!(
+                            debug_with_peers!(
                                 "finalized blocks and anchor state saved \
                                  (appended block slots: {slots:?})",
                             )
                         }
-                        Err(error) => error!("saving to storage failed: {error:?}"),
+                        Err(error) => error_with_peers!("saving to storage failed: {error:?}"),
+                    }
+
+                    debug_with_peers!("removing unfinalized blocks");
+
+                    if !storage.archive_storage_enabled() {
+                        match storage.prune_unfinalized_blocks(last_finalized_slot) {
+                            Ok(slots) => {
+                                debug_with_peers!(
+                                    "unfinalized block pruning complete: pruned slots: {slots:?}"
+                                );
+                            }
+                            Err(error) => {
+                                error_with_peers!("unfinalized block pruning failed: {error:?}")
+                            }
+                        }
                     }
 
                     drop(wait_group);
@@ -2391,55 +3397,87 @@ where
         }
 
         let storage = self.storage.clone_arc();
-        let blobs_up_to_epoch = self.store.min_checked_data_availability_epoch();
-        let blobs_up_to_slot = misc::compute_start_slot_at_epoch::<P>(blobs_up_to_epoch);
+        let data_up_to_epoch = self
+            .store
+            .min_checked_data_availability_epoch(self.store.slot());
+        let data_up_to_slot = misc::compute_start_slot_at_epoch::<P>(data_up_to_epoch);
         let blocks_up_to_epoch = self.store.min_checked_block_availability_epoch();
         let blocks_up_to_slot = misc::compute_start_slot_at_epoch::<P>(blocks_up_to_epoch);
+        let data_phase = self
+            .store
+            .chain_config()
+            .phase_at_slot::<P>(data_up_to_slot);
 
         Builder::new()
             .name("old-data-pruner".to_owned())
             .spawn(move || {
-                debug!("pruning old blob sidecars from storage up to slot {blobs_up_to_slot}…");
+                if data_phase.is_peerdas_activated() {
+                    debug_with_peers!("pruning old data column sidecars from storage up to slot {data_up_to_slot}…");
 
-                match storage.prune_old_blob_sidecars(blobs_up_to_slot) {
-                    Ok(()) => {
-                        debug!(
-                            "pruned old blob sidecars from storage up to slot {blobs_up_to_slot}"
-                        );
+                    match storage.prune_old_data_column_sidecars(data_up_to_slot) {
+                        Ok(()) => {
+                            debug_with_peers!(
+                                "pruned old data column sidecars from storage up to slot {data_up_to_slot}"
+                            );
+                        }
+                        Err(error) => {
+                            error_with_peers!("pruning old data column sidecars from storage failed: {error:?}")
+                        }
                     }
-                    Err(error) => {
-                        error!("pruning old blob sidecars from storage failed: {error:?}")
+                } else {
+                    debug_with_peers!("pruning old blob sidecars from storage up to slot {data_up_to_slot}…");
+
+                    match storage.prune_old_blob_sidecars(data_up_to_slot) {
+                        Ok(()) => {
+                            debug_with_peers!(
+                                "pruned old blob sidecars from storage up to slot {data_up_to_slot}"
+                            );
+                        }
+                        Err(error) => {
+                            error_with_peers!("pruning old blob sidecars from storage failed: {error:?}")
+                        }
                     }
                 }
 
-                debug!("pruning old blocks and states from storage up to slot {blocks_up_to_slot}…");
+                debug_with_peers!("pruning old blocks and states from storage up to slot {blocks_up_to_slot}…");
 
                 match storage.prune_old_blocks_and_states(blocks_up_to_slot) {
                     Ok(()) => {
-                        debug!(
+                        debug_with_peers!(
                             "pruned old blocks and states from storage up to slot {blocks_up_to_slot}"
                         );
                     }
                     Err(error) => {
-                        error!("pruning old blocks and states from storage failed: {error:?}")
+                        error_with_peers!("pruning old blocks and states from storage failed: {error:?}")
                     }
                 }
 
-                debug!("pruning old state roots from storage up to slot {blocks_up_to_slot}…");
+                debug_with_peers!("pruning old state roots from storage up to slot {blocks_up_to_slot}…");
 
                 match storage.prune_old_state_roots(blocks_up_to_slot) {
                     Ok(()) => {
-                        debug!(
+                        debug_with_peers!(
                             "pruned old state roots from storage up to slot {blocks_up_to_slot}"
                         );
                     }
                     Err(error) => {
-                        error!("pruning old state roots from storage failed: {error:?}")
+                        error_with_peers!("pruning old state roots from storage failed: {error:?}")
                     }
                 }
             })?;
 
         Ok(())
+    }
+
+    fn persist_pubkey_cache(&self, wait_group: &W) {
+        let store = &self.store;
+        let chain_link = store.last_finalized();
+
+        self.spawn_pubkey_cache_persist_task(
+            self.pubkey_cache.clone_arc(),
+            wait_group.clone(),
+            chain_link.state(store),
+        );
     }
 
     // This method should only be called when `Mutator.store` is in a consistent state.
@@ -2452,7 +3490,7 @@ where
         self.thread_pool.spawn(task);
     }
 
-    fn store_mut(&mut self) -> &mut Store<P> {
+    fn store_mut(&mut self) -> &mut Store<P, Storage<P>> {
         self.store.make_mut()
     }
 
@@ -2461,7 +3499,7 @@ where
     // faster to clone a `Store` with all the `Arc`s inside it and allocate another `Arc`.
     //
     // As a result, this method should only be called when `Mutator.store` is in a consistent state.
-    fn owned_store(&self) -> Arc<Store<P>> {
+    fn owned_store(&self) -> Arc<Store<P, Storage<P>>> {
         self.store.clone_arc()
     }
 
@@ -2481,7 +3519,7 @@ where
         }
     }
 
-    fn send_to_pool(&self, message: PoolMessage) {
+    fn send_to_pool(&self, message: PoolMessage<P, W>) {
         if self.finished_loading_from_storage {
             message.send(&self.pool_tx);
         }
@@ -2511,11 +3549,13 @@ where
         metrics.set_beacon_head_slot(head.slot());
     }
 
+    #[expect(clippy::too_many_lines)]
     fn track_collection_metrics(&self) {
         if let Some(metrics) = self.metrics.as_ref() {
             let type_name = tynm::type_name::<Self>();
 
-            let (high_priority_tasks, low_priority_tasks) = self.thread_pool.task_counts();
+            let (high_priority_tasks, mid_priority_tasks, low_priority_tasks) =
+                self.thread_pool.task_counts();
 
             metrics.set_collection_length(
                 module_path!(),
@@ -2529,6 +3569,16 @@ where
                 &type_name,
                 "delayed_until_block",
                 self.delayed_until_block.len(),
+            );
+
+            metrics.set_collection_length(
+                module_path!(),
+                &type_name,
+                "delayed_until_block_blob_sidecars",
+                self.delayed_until_block
+                    .values()
+                    .map(|delayed| delayed.blob_sidecars.len())
+                    .sum(),
             );
 
             metrics.set_collection_length(
@@ -2559,6 +3609,13 @@ where
                     .values()
                     .map(|delayed| delayed.aggregates.len())
                     .sum(),
+            );
+
+            metrics.set_collection_length(
+                module_path!(),
+                &type_name,
+                "delayed_until_payload",
+                self.delayed_until_payload.len(),
             );
 
             metrics.set_collection_length(
@@ -2601,8 +3658,22 @@ where
             metrics.set_collection_length(
                 module_path!(),
                 &type_name,
+                "delayed_until_state",
+                self.delayed_until_state.len(),
+            );
+
+            metrics.set_collection_length(
+                module_path!(),
+                &type_name,
                 "high_priority_tasks",
                 high_priority_tasks,
+            );
+
+            metrics.set_collection_length(
+                module_path!(),
+                &type_name,
+                "mid_priority_tasks",
+                mid_priority_tasks,
             );
 
             metrics.set_collection_length(
@@ -2612,8 +3683,90 @@ where
                 low_priority_tasks,
             );
 
+            self.event_channels.track_collection_metrics(metrics);
+            self.pubkey_cache.track_collection_metrics(metrics);
             self.store.track_collection_metrics(metrics);
         }
+    }
+
+    fn block_blob_availability<'blob>(
+        &self,
+        block: &SignedBeaconBlock<P>,
+        pending_blobs_for_block: impl Iterator<Item = &'blob BlobSidecar<P>>,
+    ) -> BlockBlobAvailability {
+        let Some(body) = block.message().body().with_blob_kzg_commitments() else {
+            return BlockBlobAvailability::Irrelevant;
+        };
+
+        let missing_blob_indices = self.store.indices_of_missing_blobs(block);
+
+        if missing_blob_indices.is_empty() {
+            return BlockBlobAvailability::Complete;
+        }
+
+        let pending_missing_blobs = pending_blobs_for_block
+            .filter(|blob_sidecar| missing_blob_indices.contains(&blob_sidecar.index))
+            .collect_vec();
+
+        let all_blobs_downloaded = body
+            .blob_kzg_commitments()
+            .into_iter()
+            .zip(0..)
+            .filter(|(_, index)| missing_blob_indices.contains(index))
+            .all(|(block_commitment, index)| {
+                pending_missing_blobs.iter().any(|blob_sidecar| {
+                    blob_sidecar.index == index && blob_sidecar.kzg_commitment == *block_commitment
+                })
+            });
+
+        if all_blobs_downloaded {
+            return BlockBlobAvailability::CompleteWithPending;
+        }
+
+        BlockBlobAvailability::Missing(missing_blob_indices)
+    }
+
+    fn block_data_column_availability<'column>(
+        &self,
+        block: &SignedBeaconBlock<P>,
+        mut pending_data_columns_for_block: impl Iterator<Item = &'column DataColumnSidecar<P>>,
+    ) -> BlockDataColumnAvailability {
+        if !block.phase().is_peerdas_activated() {
+            return BlockDataColumnAvailability::Irrelevant;
+        }
+
+        let Some(body) = block.message().body().with_blob_kzg_commitments() else {
+            return BlockDataColumnAvailability::Irrelevant;
+        };
+
+        let missing_indices = self.store.indices_of_missing_data_columns(block);
+
+        if missing_indices.is_empty() {
+            return BlockDataColumnAvailability::Complete;
+        }
+
+        let any_pending_columns = pending_data_columns_for_block.any(|data_column_sidecar| {
+            missing_indices.contains(&data_column_sidecar.index)
+                && data_column_sidecar.kzg_commitments == *body.blob_kzg_commitments()
+        });
+
+        if any_pending_columns {
+            return BlockDataColumnAvailability::AnyPending;
+        }
+
+        let available_columns_count = self
+            .store
+            .sampling_columns_count()
+            .saturating_sub(missing_indices.len());
+
+        if available_columns_count * 2 >= P::NumberOfColumns::USIZE
+            && (self.store.is_forward_synced()
+                || !self.store.store_config().sync_without_reconstruction)
+        {
+            return BlockDataColumnAvailability::CompleteWithReconstruction;
+        }
+
+        BlockDataColumnAvailability::Missing(missing_indices)
     }
 }
 
@@ -2623,7 +3776,9 @@ fn reply_to_http_api(
 ) {
     if let Some(sender) = sender {
         if let Err(reply) = sender.send(reply) {
-            debug!("reply to HTTP API failed because the receiver was dropped: {reply:?}");
+            debug_with_peers!(
+                "reply to HTTP API failed because the receiver was dropped: {reply:?}"
+            );
         }
     }
 }
@@ -2634,7 +3789,9 @@ fn reply_block_validation_result_to_http_api(
 ) {
     if let Some(mut sender) = sender {
         if let Err(reply) = sender.try_send(reply) {
-            debug!("reply to HTTP API failed because the receiver was dropped: {reply:?}");
+            debug_with_peers!(
+                "reply to HTTP API failed because the receiver was dropped: {reply:?}"
+            );
         }
     }
 }
@@ -2646,7 +3803,8 @@ fn reply_delayed_block_validation_result<P: Preset>(
     let PendingBlock {
         block,
         origin,
-        submission_time,
+        processing_timings,
+        tracing_span,
     } = pending_block;
 
     if let BlockOrigin::Api(Some(sender)) = origin {
@@ -2655,13 +3813,15 @@ fn reply_delayed_block_validation_result<P: Preset>(
         PendingBlock {
             block,
             origin: BlockOrigin::Api(None),
-            submission_time,
+            processing_timings,
+            tracing_span,
         }
     } else {
         PendingBlock {
             block,
             origin,
-            submission_time,
+            processing_timings,
+            tracing_span,
         }
     }
 }
@@ -2689,6 +3849,36 @@ fn reply_delayed_blob_sidecar_validation_result<P: Preset>(
     } else {
         PendingBlobSidecar {
             blob_sidecar,
+            block_seen,
+            origin,
+            submission_time,
+        }
+    }
+}
+
+fn reply_delayed_data_column_sidecar_validation_result<P: Preset>(
+    pending_data_column_sidecar: PendingDataColumnSidecar<P>,
+    reply: Result<ValidationOutcome>,
+) -> PendingDataColumnSidecar<P> {
+    let PendingDataColumnSidecar {
+        data_column_sidecar,
+        block_seen,
+        origin,
+        submission_time,
+    } = pending_data_column_sidecar;
+
+    if let DataColumnSidecarOrigin::Api(Some(sender)) = origin {
+        reply_to_http_api(Some(sender), reply);
+
+        PendingDataColumnSidecar {
+            data_column_sidecar,
+            block_seen,
+            origin: DataColumnSidecarOrigin::Api(None),
+            submission_time,
+        }
+    } else {
+        PendingDataColumnSidecar {
+            data_column_sidecar,
             block_seen,
             origin,
             submission_time,

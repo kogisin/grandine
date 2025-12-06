@@ -8,15 +8,16 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Result};
 use arithmetic::U64Ext as _;
 use bit_field::BitField as _;
-use bls::{
-    traits::{CachedPublicKey as _, PublicKey as _},
-    AggregatePublicKey, CachedPublicKey, PublicKeyBytes,
-};
+use bls::{traits::PublicKey as _, AggregatePublicKey, PublicKeyBytes};
+#[cfg(not(target_os = "zkvm"))]
 use im::HashMap;
 use itertools::{EitherOrBoth, Itertools as _};
 use num_integer::Roots as _;
+use pubkey_cache::PubkeyCache;
 use rc_box::ArcBox;
 use ssz::{ContiguousVector, FitsInU64, Hc, SszHash as _};
+#[cfg(target_os = "zkvm")]
+use std::collections::HashMap;
 use std_ext::CopyExt as _;
 use tap::{Pipe as _, TryConv as _};
 use try_from_iterator::TryFromIterator as _;
@@ -47,7 +48,7 @@ use types::{
     },
 };
 
-use crate::{error::Error, misc, predicates};
+use crate::{error::Error, misc, par_utils, predicates};
 
 #[cfg(feature = "metrics")]
 use prometheus_metrics::METRICS;
@@ -180,17 +181,17 @@ pub fn get_randao_mix<P: Preset>(state: &(impl BeaconState<P> + ?Sized), epoch: 
 pub fn public_key<P: Preset>(
     state: &(impl BeaconState<P> + ?Sized),
     validator_index: ValidatorIndex,
-) -> Result<&CachedPublicKey> {
+) -> Result<&PublicKeyBytes> {
     Ok(&state.validators().get(validator_index)?.pubkey)
 }
 
 #[must_use]
 pub fn index_of_public_key<P: Preset>(
     state: &(impl BeaconState<P> + ?Sized),
-    public_key: PublicKeyBytes,
+    public_key: &PublicKeyBytes,
 ) -> Option<ValidatorIndex> {
     get_or_init_validator_indices(state, true)
-        .get(&public_key)
+        .get(public_key)
         .copied()
 }
 
@@ -209,7 +210,7 @@ pub fn get_or_init_validator_indices<P: Preset>(
         state
             .validators()
             .into_iter()
-            .map(|validator| validator.pubkey.to_bytes())
+            .map(|validator| validator.pubkey)
             .zip(0..)
             .collect()
     })
@@ -391,7 +392,7 @@ fn get_seed_by_epoch<P: Preset>(
 ) -> H256 {
     let mix = get_randao_mix(
         state,
-        epoch + P::EpochsPerHistoricalVector::U64 - P::MIN_SEED_LOOKAHEAD - 1,
+        epoch + P::EpochsPerHistoricalVector::U64 - P::MinSeedLookahead::U64 - 1,
     );
 
     hashing::hash_32_64_256(domain_type.to_fixed_bytes(), epoch, mix)
@@ -419,7 +420,7 @@ pub fn beacon_committee<P: Preset>(
     state: &impl BeaconState<P>,
     slot: Slot,
     committee_index: CommitteeIndex,
-) -> Result<IndexSlice> {
+) -> Result<IndexSlice<'_>> {
     let epoch = misc::compute_epoch_at_slot::<P>(slot);
     let relative_epoch = relative_epoch(state, epoch)?;
     let committees_per_slot = get_committee_count_per_slot(state, relative_epoch);
@@ -443,7 +444,7 @@ pub fn beacon_committee<P: Preset>(
 pub fn beacon_committees<P: Preset>(
     state: &impl BeaconState<P>,
     slot: Slot,
-) -> Result<impl Iterator<Item = IndexSlice>> {
+) -> Result<impl Iterator<Item = IndexSlice<'_>>> {
     let epoch = misc::compute_epoch_at_slot::<P>(slot);
     let relative_epoch = relative_epoch(state, epoch)?;
     let committees_per_slot = get_committee_count_per_slot(state, relative_epoch);
@@ -454,11 +455,22 @@ pub fn beacon_committees<P: Preset>(
     }))
 }
 
-pub fn get_beacon_proposer_index<P: Preset>(state: &impl BeaconState<P>) -> Result<ValidatorIndex> {
-    get_or_try_init_beacon_proposer_index(state, true)
+pub fn get_beacon_proposer_index<P: Preset>(
+    config: &Config,
+    state: &impl BeaconState<P>,
+) -> Result<ValidatorIndex> {
+    if let Some(proposer_lookahead) = state.proposer_lookahead() {
+        proposer_lookahead
+            .get(state.slot() % P::SlotsPerEpoch::U64)
+            .copied()
+            .map_err(Into::into)
+    } else {
+        get_or_try_init_beacon_proposer_index(config, state, true)
+    }
 }
 
 pub fn get_or_try_init_beacon_proposer_index<P: Preset>(
+    config: &Config,
     state: &impl BeaconState<P>,
     report_cache_miss: bool,
 ) -> Result<ValidatorIndex> {
@@ -475,29 +487,42 @@ pub fn get_or_try_init_beacon_proposer_index<P: Preset>(
                 }
             }
 
-            get_beacon_proposer_index_at_slot(state, state.slot())
+            get_beacon_proposer_index_at_slot(config, state, state.slot())
         })
         .copied()
 }
 
 pub fn get_beacon_proposer_index_at_slot<P: Preset>(
+    config: &Config,
     state: &impl BeaconState<P>,
     slot: Slot,
 ) -> Result<ValidatorIndex> {
     let epoch = misc::compute_epoch_at_slot::<P>(slot);
     let relative_epoch = relative_epoch(state, epoch)?;
-    let seed = get_seed(state, relative_epoch, DOMAIN_BEACON_PROPOSER);
 
-    // Cause a compilation error if a new variant is added to `RelativeEpoch`.
-    // Proposer selection is not reliable for epochs after the next one or in the distant past.
-    match relative_epoch {
-        RelativeEpoch::Previous | RelativeEpoch::Current | RelativeEpoch::Next => {}
+    if let Some(proposer_lookahead) = state.proposer_lookahead() {
+        match relative_epoch {
+            RelativeEpoch::Current => {
+                return proposer_lookahead
+                    .get(slot % P::SlotsPerEpoch::U64)
+                    .copied()
+                    .map_err(Into::into);
+            }
+            RelativeEpoch::Next => {
+                return proposer_lookahead
+                    .get(P::SlotsPerEpoch::U64 + slot % P::SlotsPerEpoch::U64)
+                    .copied()
+                    .map_err(Into::into);
+            }
+            RelativeEpoch::Previous => {}
+        }
     }
 
     let indices = active_validator_indices_ordered(state, relative_epoch);
+    let seed = get_seed(state, relative_epoch, DOMAIN_BEACON_PROPOSER);
     let seed = hashing::hash_256_64(seed, slot);
 
-    misc::compute_proposer_index(state, indices, seed)
+    misc::compute_proposer_index(config, state, indices, seed, epoch)
 }
 
 pub fn get_domain<P: Preset>(
@@ -663,11 +688,12 @@ fn get_next_sync_committee_indices_post_electra<P: Preset>(
 }
 
 pub fn get_next_sync_committee<P: Preset>(
+    pubkey_cache: &PubkeyCache,
     state: &(impl BeaconState<P> + ?Sized),
 ) -> Result<Arc<Hc<SyncCommittee<P>>>> {
     let indices = get_next_sync_committee_indices(state)?;
 
-    let mut pubkeys = Box::<ContiguousVector<CachedPublicKey, _>>::default();
+    let mut pubkeys = Box::<ContiguousVector<PublicKeyBytes, _>>::default();
 
     for (pubkey, validator_index) in pubkeys.iter_mut().zip(indices) {
         let validator = state.validators().get(validator_index)?;
@@ -675,8 +701,10 @@ pub fn get_next_sync_committee<P: Preset>(
     }
 
     let aggregate_pubkey = itertools::process_results(
-        pubkeys.iter().map(CachedPublicKey::decompress),
-        |public_keys| AggregatePublicKey::aggregate_nonempty(public_keys.copied()),
+        pubkeys
+            .iter()
+            .map(|bytes| pubkey_cache.get_or_insert(*bytes)),
+        |public_keys| AggregatePublicKey::aggregate_nonempty(public_keys),
     )??
     .into();
 
@@ -759,7 +787,7 @@ pub fn get_attestation_participation_flags<P: Preset>(
 pub fn get_sync_subcommittee_pubkeys<P: Preset>(
     state: &(impl PostAltairBeaconState<P> + ?Sized),
     subcommittee_index: SubcommitteeIndex,
-) -> Result<&[CachedPublicKey]> {
+) -> Result<&[PublicKeyBytes]> {
     let current_epoch = get_current_epoch(state);
     let next_slot_epoch = misc::compute_epoch_at_slot::<P>(state.slot() + 1);
 
@@ -843,7 +871,7 @@ pub fn initialize_shuffled_indices<'attestations, P: Preset>(
         need_current && !have_current,
     ) {
         (true, true) => {
-            rayon::join(initialize_previous, initialize_current);
+            par_utils::join(initialize_previous, initialize_current);
         }
         (true, false) => {
             initialize_previous();
@@ -899,6 +927,23 @@ pub fn get_pending_balance_to_withdraw<P: Preset>(
         .filter(|withdrawal| withdrawal.validator_index == validator_index)
         .map(|withdrawal| withdrawal.amount)
         .sum()
+}
+
+pub fn get_beacon_proposer_indices<P: Preset>(
+    config: &Config,
+    state: &impl BeaconState<P>,
+    epoch: Epoch,
+) -> Result<Vec<ValidatorIndex>> {
+    let indices = get_active_validator_indices_by_epoch(state, epoch);
+    let seed = get_seed_by_epoch(state, epoch, DOMAIN_BEACON_PROPOSER);
+
+    misc::compute_proposer_indices(
+        config,
+        state,
+        epoch,
+        seed,
+        &PackedIndices::U64(indices.into_iter().collect()),
+    )
 }
 
 #[cfg(test)]

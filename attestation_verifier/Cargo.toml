@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+debug_info = { workspace = true }
 dedicated_executor = { workspace = true }
 eth1_api = { workspace = true }
 eth2_libp2p = { workspace = true }
@@ -17,8 +18,10 @@ fork_choice_store = { workspace = true }
 futures = { workspace = true }
 helper_functions = { workspace = true }
 itertools = { workspace = true }
-log = { workspace = true }
+logging ={ workspace = true }
 prometheus_metrics = { workspace = true }
+pubkey_cache = { workspace = true }
 rayon = { workspace = true }
 std_ext = { workspace = true }
+tracing = { workspace = true }
 types = { workspace = true }

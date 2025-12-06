@@ -13,6 +13,7 @@ bls = { workspace = true }
 dashmap = { workspace = true }
 dedicated_executor = { workspace = true }
 derive_more = { workspace = true }
+eip_7594 = { workspace = true }
 either = { workspace = true }
 enum-iterator = { workspace = true }
 eth2_libp2p = { workspace = true }
@@ -22,23 +23,26 @@ features = { workspace = true }
 fork_choice_control = { workspace = true }
 fs-err = { workspace = true }
 futures = { workspace = true }
+grandine_version = { workspace = true }
 helper_functions = { workspace = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 itertools = { workspace = true }
 jwt-simple = { workspace = true }
-log = { workspace = true }
+logging = { workspace = true }
 memoffset = { workspace = true }
 panics = { workspace = true }
 prometheus_metrics = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_utils = { workspace = true }
 ssz = { workspace = true }
 static_assertions = { workspace = true }
 std_ext = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing ={ workspace = true }
 typenum = { workspace = true }
 types = { workspace = true }
 web3 = { workspace = true }

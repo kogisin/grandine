@@ -3,20 +3,22 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
 use attestation_verifier::AttestationVerifier;
+use binary_utils::TracingHandle;
 use block_producer::BlockProducer;
 use builder_api::{BuilderApi, BuilderConfig};
 use bytesize::ByteSize;
 use clock::Tick;
 use dashmap::DashMap;
-use database::{Database, DatabaseMode};
+use data_dumper::DataDumper;
+use database::{Database, DatabaseMode, RestartMessage};
 use dedicated_executor::DedicatedExecutor;
 use doppelganger_protection::DoppelgangerProtection;
-use eth1::{Eth1Chain, Eth1Config};
+use eth1::Eth1Config;
 use eth1_api::{
     Eth1Api, Eth1ApiToMetrics, Eth1ConnectionData, Eth1ExecutionEngine, Eth1Metrics,
     ExecutionBlobFetcher, ExecutionService, RealController,
 };
-use fork_choice_control::{Controller, StateLoadStrategy, Storage};
+use fork_choice_control::{Controller, EventChannels, StateLoadStrategy, Storage};
 use fork_choice_store::StoreConfig;
 use futures::{
     channel::{
@@ -28,18 +30,21 @@ use futures::{
     stream::StreamExt as _,
 };
 use genesis::AnchorCheckpointProvider;
+use grandine_version::APPLICATION_NAME_WITH_VERSION_AND_COMMIT;
+use helper_functions::misc;
 use http_api::{Channels as HttpApiChannels, HttpApi, HttpApiConfig};
-use http_api_utils::EventChannels;
 use keymanager::KeyManager;
 use liveness_tracker::LivenessTracker;
-use log::{info, warn};
+use logging::{info_with_peers, warn_with_peers};
 use metrics::{run_metrics_server, MetricsChannels, MetricsService};
 use operation_pools::{
-    AttestationAggPool, BlsToExecutionChangePool, Manager, SyncCommitteeAggPool,
+    AttestationAggPool, BlobReconstructionPool, BlsToExecutionChangePool, Manager,
+    SyncCommitteeAggPool,
 };
 use p2p::{
     BlockSyncService, BlockSyncServiceChannels, Channels, Network, NetworkConfig, SubnetService,
 };
+use pubkey_cache::PubkeyCache;
 use signer::Signer;
 use slasher::{Databases, Slasher, SlasherConfig};
 use slashing_protection::SlashingProtector;
@@ -47,20 +52,20 @@ use std_ext::ArcExt as _;
 use tokio::select;
 use types::{
     config::Config as ChainConfig,
-    phase0::consts::GENESIS_SLOT,
+    phase0::{consts::GENESIS_SLOT, primitives::H256},
     preset::Preset,
     traits::{BeaconState as _, SignedBeaconBlock as _},
 };
 use validator::{
     run_validator_api, Validator, ValidatorApiConfig, ValidatorChannels, ValidatorConfig,
 };
+use validator_statistics::ValidatorStatistics;
 
 use crate::misc::{MetricsConfig, StorageConfig};
 
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
 
-#[expect(clippy::module_name_repetitions)]
 #[expect(clippy::struct_excessive_bools)]
 pub struct RuntimeConfig {
     pub back_sync_enabled: bool,
@@ -75,6 +80,7 @@ pub struct RuntimeConfig {
 #[expect(clippy::too_many_lines)]
 pub async fn run_after_genesis<P: Preset>(
     chain_config: Arc<ChainConfig>,
+    pubkey_cache: Arc<PubkeyCache>,
     runtime_config: RuntimeConfig,
     store_config: StoreConfig,
     validator_api_config: Option<ValidatorApiConfig>,
@@ -82,16 +88,20 @@ pub async fn run_after_genesis<P: Preset>(
     network_config: NetworkConfig,
     anchor_checkpoint_provider: AnchorCheckpointProvider<P>,
     state_load_strategy: StateLoadStrategy<P>,
-    eth1_chain: Eth1Chain,
     eth1_config: Arc<Eth1Config>,
     storage_config: StorageConfig,
     builder_config: Option<BuilderConfig>,
     signer: Arc<Signer>,
     slasher_config: Option<SlasherConfig>,
-    http_api_config: HttpApiConfig,
+    http_api_config: Option<HttpApiConfig>,
     metrics_config: MetricsConfig,
+    blacklisted_blocks: HashSet<H256>,
+    report_validator_performance: bool,
+    tracing_handle: Option<TracingHandle>,
     eth1_api_to_metrics_tx: Option<UnboundedSender<Eth1ApiToMetrics>>,
     eth1_api_to_metrics_rx: Option<UnboundedReceiver<Eth1ApiToMetrics>>,
+    restart_tx: UnboundedSender<RestartMessage>,
+    restart_rx: UnboundedReceiver<RestartMessage>,
 ) -> Result<()> {
     let RuntimeConfig {
         back_sync_enabled,
@@ -119,9 +129,9 @@ pub async fn run_after_genesis<P: Preset>(
     let signer_snapshot = signer.load();
 
     if !signer_snapshot.is_empty() {
-        info!("loaded {} validator key(s)", signer_snapshot.keys().len());
+        info_with_peers!("loaded {} validator key(s)", signer_snapshot.keys().len());
     } else if validator_enabled {
-        warn!("failed to load validator keys");
+        warn_with_peers!("failed to load validator keys");
     }
 
     let (blob_fetcher_to_p2p_tx, blob_fetcher_to_p2p_rx) = mpsc::unbounded();
@@ -172,6 +182,9 @@ pub async fn run_after_genesis<P: Preset>(
         metrics.clone(),
     ));
 
+    let dedicated_executor_for_reconstruction =
+        DedicatedExecutor::new("de-reconstruct", 1, None, metrics.clone());
+
     let eth1_api = Arc::new(Eth1Api::new(
         chain_config.clone_arc(),
         signer_snapshot.client().clone(),
@@ -181,7 +194,7 @@ pub async fn run_after_genesis<P: Preset>(
         metrics.clone(),
     ));
 
-    eth1_api::spawn_exchange_capabilities_task(
+    eth1_api::spawn_exchange_capabilities_and_versions_task(
         eth1_api.clone_arc(),
         &dedicated_executor_low_priority,
     );
@@ -195,11 +208,16 @@ pub async fn run_after_genesis<P: Preset>(
     let storage_database = if in_memory {
         Database::in_memory()
     } else {
-        storage_config.beacon_fork_choice_database(None, DatabaseMode::ReadWrite)?
+        storage_config.beacon_fork_choice_database(
+            None,
+            DatabaseMode::ReadWrite,
+            Some(restart_tx),
+        )?
     };
 
     let storage = Arc::new(Storage::new(
         chain_config.clone_arc(),
+        pubkey_cache.clone_arc(),
         storage_database,
         archival_epoch_interval,
         storage_mode,
@@ -240,8 +258,11 @@ pub async fn run_after_genesis<P: Preset>(
 
     let event_channels = Arc::new(EventChannels::new(max_events));
 
+    let sidecars_construction_started = Arc::new(DashMap::new());
+
     let (controller, mutator_handle) = Controller::new(
         chain_config.clone_arc(),
+        pubkey_cache.clone_arc(),
         store_config,
         anchor_block,
         anchor_state.clone_arc(),
@@ -258,9 +279,12 @@ pub async fn run_after_genesis<P: Preset>(
         storage.clone_arc(),
         unfinalized_blocks,
         !back_sync_enabled || is_anchor_genesis,
+        blacklisted_blocks,
+        sidecars_construction_started.clone_arc(),
     )?;
 
     let received_blob_sidecars = Arc::new(DashMap::new());
+    let received_data_column_sidecars = Arc::new(DashMap::new());
 
     let execution_service = ExecutionService::new(
         eth1_api.clone_arc(),
@@ -274,6 +298,8 @@ pub async fn run_after_genesis<P: Preset>(
         eth1_api.clone_arc(),
         controller.clone_arc(),
         received_blob_sidecars.clone_arc(),
+        received_data_column_sidecars.clone_arc(),
+        metrics.clone(),
         blob_fetcher_to_p2p_tx,
         execution_service_to_blob_fetcher_rx,
     );
@@ -320,30 +346,30 @@ pub async fn run_after_genesis<P: Preset>(
         )
     });
 
-    let (liveness_tracker, doppelganger_protection) = track_liveness
-        .then(|| {
-            let (api_tx, api_to_liveness_rx) = mpsc::unbounded();
-            let (pool_tx, pool_to_liveness_rx) = mpsc::unbounded();
-            let (validator_tx, validator_to_liveness_rx) = mpsc::unbounded();
+    let (liveness_tracker, doppelganger_protection) = if track_liveness {
+        let (api_tx, api_to_liveness_rx) = mpsc::unbounded();
+        let (pool_tx, pool_to_liveness_rx) = mpsc::unbounded();
+        let (validator_tx, validator_to_liveness_rx) = mpsc::unbounded();
 
-            api_to_liveness_tx = Some(api_tx.clone());
-            pool_to_liveness_tx = Some(pool_tx);
-            validator_to_liveness_tx = Some(validator_tx);
+        api_to_liveness_tx = Some(api_tx.clone());
+        pool_to_liveness_tx = Some(pool_tx);
+        validator_to_liveness_tx = Some(validator_tx);
 
-            let liveness_tracker = Some(LivenessTracker::new(
-                controller.clone_arc(),
-                metrics.clone(),
-                api_to_liveness_rx,
-                pool_to_liveness_rx,
-                validator_to_liveness_rx,
-            ));
+        let liveness_tracker = Some(LivenessTracker::new(
+            controller.clone_arc(),
+            metrics.clone(),
+            api_to_liveness_rx,
+            pool_to_liveness_rx,
+            validator_to_liveness_rx,
+        ));
 
-            let doppelganger_protection =
-                detect_doppelgangers.then(|| Arc::new(DoppelgangerProtection::new(api_tx)));
+        let doppelganger_protection =
+            detect_doppelgangers.then(|| Arc::new(DoppelgangerProtection::new(api_tx)));
 
-            (liveness_tracker, doppelganger_protection)
-        })
-        .unwrap_or((None, None));
+        (liveness_tracker, doppelganger_protection)
+    } else {
+        (None, None)
+    };
 
     if let Some(doppelganger_protection) = doppelganger_protection.as_ref() {
         signer.enable_doppelganger_protection(doppelganger_protection);
@@ -354,39 +380,15 @@ pub async fn run_after_genesis<P: Preset>(
         );
     }
 
-    let block_sync_service_channels = BlockSyncServiceChannels {
-        fork_choice_to_sync_rx,
-        p2p_to_sync_rx,
-        sync_to_p2p_tx,
-        sync_to_api_tx,
-        sync_to_metrics_tx,
-    };
+    let data_dumper = Arc::new(DataDumper::new(&controller.chain_config().config_name)?);
 
-    let block_sync_database = if in_memory {
-        Database::in_memory()
-    } else {
-        storage_config.sync_database(None, DatabaseMode::ReadWrite)?
-    };
-
-    let mut block_sync_service = BlockSyncService::new(
-        chain_config.clone_arc(),
-        block_sync_database,
-        anchor_checkpoint_provider.clone(),
-        controller.clone_arc(),
-        metrics.clone(),
-        block_sync_service_channels,
-        back_sync_enabled,
-        loaded_from_remote,
-        storage_config.storage_mode,
-        network_config.target_peers,
-        received_blob_sidecars,
-    )?;
-
-    block_sync_service.try_to_spawn_back_sync_states_archiver()?;
+    let validator_statistics =
+        report_validator_performance.then(|| Arc::new(ValidatorStatistics::new(metrics.clone())));
 
     let builder_api = builder_config.map(|builder_config| {
         Arc::new(BuilderApi::new(
             builder_config,
+            pubkey_cache,
             signer_snapshot.client().clone(),
             metrics.clone(),
         ))
@@ -417,6 +419,7 @@ pub async fn run_after_genesis<P: Preset>(
                             .join(format!("slasher_attestation_votes_{fork_version:?}_db")),
                         db_size,
                         DatabaseMode::ReadWrite,
+                        None,
                     )?,
                     attestations_db: Database::persistent(
                         "SLASHER_INDEXED_ATTESTATIONS",
@@ -427,6 +430,7 @@ pub async fn run_after_genesis<P: Preset>(
                             .join(format!("slasher_indexed_attestations_{fork_version:?}_db")),
                         db_size,
                         DatabaseMode::ReadWrite,
+                        None,
                     )?,
                     min_targets_db: Database::persistent(
                         "SLASHER_MIN_TARGETS",
@@ -437,6 +441,7 @@ pub async fn run_after_genesis<P: Preset>(
                             .join(format!("slasher_min_targets_{fork_version:?}_db")),
                         db_size,
                         DatabaseMode::ReadWrite,
+                        None,
                     )?,
                     max_targets_db: Database::persistent(
                         "SLASHER_MAX_TARGETS",
@@ -447,6 +452,7 @@ pub async fn run_after_genesis<P: Preset>(
                             .join(format!("slasher_max_targets_{fork_version:?}_db")),
                         db_size,
                         DatabaseMode::ReadWrite,
+                        None,
                     )?,
                     blocks_db: Database::persistent(
                         "SLASHER_BLOCKS",
@@ -457,6 +463,7 @@ pub async fn run_after_genesis<P: Preset>(
                             .join(format!("slasher_blocks_{fork_version:?}_db")),
                         db_size,
                         DatabaseMode::ReadWrite,
+                        None,
                     )?,
                 }
             };
@@ -485,7 +492,13 @@ pub async fn run_after_genesis<P: Preset>(
         .graffiti
         .first()
         .copied()
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            if validator_config.disable_blockprint_graffiti {
+                H256::default()
+            } else {
+                misc::parse_graffiti(APPLICATION_NAME_WITH_VERSION_AND_COMMIT).unwrap_or_default()
+            }
+        });
 
     let keymanager = if in_memory {
         Arc::new(KeyManager::new_in_memory(
@@ -513,6 +526,13 @@ pub async fn run_after_genesis<P: Preset>(
         controller.clone_arc(),
         dedicated_executor_normal_priority.clone_arc(),
         metrics.clone(),
+        validator_statistics.clone(),
+    );
+
+    let blob_reconstruction_pool = BlobReconstructionPool::new(
+        controller.clone_arc(),
+        dedicated_executor_for_reconstruction,
+        metrics.clone(),
     );
 
     let sync_committee_agg_pool = SyncCommitteeAggPool::new(
@@ -521,6 +541,7 @@ pub async fn run_after_genesis<P: Preset>(
         pool_to_liveness_tx,
         pool_to_p2p_tx.clone(),
         metrics.clone(),
+        validator_statistics.clone(),
     );
 
     let (bls_to_execution_change_pool, bls_to_execution_change_pool_service) =
@@ -533,6 +554,7 @@ pub async fn run_after_genesis<P: Preset>(
 
     let pool_manager = Manager::new(
         attestation_agg_pool.clone_arc(),
+        blob_reconstruction_pool,
         bls_to_execution_change_pool.clone_arc(),
         sync_committee_agg_pool.clone_arc(),
         fork_choice_to_pool_rx,
@@ -543,7 +565,6 @@ pub async fn run_after_genesis<P: Preset>(
         builder_api.clone(),
         controller.clone_arc(),
         dedicated_executor_normal_priority.clone_arc(),
-        eth1_chain,
         execution_engine,
         attestation_agg_pool.clone_arc(),
         bls_to_execution_change_pool.clone_arc(),
@@ -576,7 +597,10 @@ pub async fn run_after_genesis<P: Preset>(
         slashing_protector,
         sync_committee_agg_pool.clone_arc(),
         metrics.clone(),
+        validator_statistics.clone(),
         validator_channels,
+        network_config.network_dir.as_deref(),
+        network_config.subscribe_all_data_column_subnets,
     );
 
     let p2p_channels = Channels {
@@ -609,8 +633,44 @@ pub async fn run_after_genesis<P: Preset>(
         bls_to_execution_change_pool.clone_arc(),
         metrics.clone(),
         registry.as_mut(),
+        data_dumper.clone_arc(),
+        validator_config.backfill_custody_groups,
     )
     .await?;
+
+    let block_sync_service_channels = BlockSyncServiceChannels {
+        fork_choice_to_sync_rx,
+        p2p_to_sync_rx,
+        sync_to_p2p_tx,
+        sync_to_api_tx,
+        sync_to_metrics_tx,
+    };
+
+    let block_sync_database = if in_memory {
+        Database::in_memory()
+    } else {
+        storage_config.sync_database(None, DatabaseMode::ReadWrite)?
+    };
+
+    let mut block_sync_service = BlockSyncService::new(
+        chain_config.clone_arc(),
+        block_sync_database,
+        anchor_checkpoint_provider.clone(),
+        controller.clone_arc(),
+        metrics.clone(),
+        validator_statistics,
+        block_sync_service_channels,
+        back_sync_enabled,
+        loaded_from_remote,
+        storage_config.storage_mode,
+        network_config.target_peers,
+        received_blob_sidecars,
+        received_data_column_sidecars,
+        data_dumper,
+        network.network_globals().clone_arc(),
+    )?;
+
+    block_sync_service.try_to_spawn_back_sync_states_archiver()?;
 
     let subnet_service = SubnetService::new(
         attestation_agg_pool.clone_arc(),
@@ -628,21 +688,29 @@ pub async fn run_after_genesis<P: Preset>(
         sync_to_api_rx,
     };
 
-    let http_api = HttpApi {
-        block_producer,
-        controller: controller.clone_arc(),
-        anchor_checkpoint_provider,
-        eth1_api,
-        event_channels,
-        validator_keys,
-        validator_config,
-        network_config,
-        http_api_config,
-        attestation_agg_pool,
-        sync_committee_agg_pool,
-        bls_to_execution_change_pool,
-        channels: http_api_channels,
-        metrics: metrics.clone(),
+    let run_http_api = match http_api_config {
+        Some(http_api_config) => {
+            let http_api = HttpApi {
+                block_producer,
+                controller: controller.clone_arc(),
+                anchor_checkpoint_provider,
+                eth1_api,
+                event_channels,
+                validator_keys,
+                validator_config,
+                network_config,
+                http_api_config,
+                attestation_agg_pool,
+                sync_committee_agg_pool,
+                bls_to_execution_change_pool,
+                channels: http_api_channels,
+                metrics: metrics.clone(),
+                tracing_handle,
+            };
+
+            Either::Left(http_api.run())
+        }
+        None => Either::Right(core::future::pending()),
     };
 
     let join_mutator = async { tokio::task::spawn_blocking(|| mutator_handle.join()).await? };
@@ -696,7 +764,7 @@ pub async fn run_after_genesis<P: Preset>(
         result = spawn_fallible(attestation_verifier.run()) => result,
         result = spawn_fallible(block_sync_service.run()) => result,
         result = spawn_fallible(network.run()) => result,
-        result = spawn_fallible(http_api.run()) => result,
+        result = spawn_fallible(run_http_api) => result,
         result = spawn_fallible(run_clock) => result,
         result = spawn_fallible(run_slasher) => result.map(from_never),
         result = spawn_fallible(bls_to_execution_change_pool_service.run()) => result,
@@ -706,16 +774,16 @@ pub async fn run_after_genesis<P: Preset>(
         result = spawn_fallible(run_liveness_tracker) => result,
         result = spawn_fallible(run_validator_api) => result,
         result = spawn_fallible(subnet_service.run()) => result,
-        result = wait_for_signal() => result,
+        result = wait_for_signal_or_restart(restart_rx) => result,
     }?;
 
     if stop_clock_tx.send(()).is_err() {
-        warn!("failed to send the message to stop the clock");
+        warn_with_peers!("failed to send the message to stop the clock");
     }
 
     controller.stop();
 
-    info!("saving current chain before exit…");
+    info_with_peers!("saving current chain before exit…");
 
     Ok(())
 }
@@ -734,6 +802,23 @@ async fn run_clock<P: Preset>(
             _ = &mut stop_clock_rx => {
                 break;
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn wait_for_signal_or_restart(error_rx: UnboundedReceiver<RestartMessage>) -> Result<()> {
+    select! {
+        result = wait_for_restart(error_rx) => result,
+        result = wait_for_signal() => result,
+    }
+}
+
+async fn wait_for_restart(mut rx: UnboundedReceiver<RestartMessage>) -> Result<()> {
+    if let Some(message) = rx.next().await {
+        match message {
+            RestartMessage::StorageMapFull(error) => return Err(error.into()),
         }
     }
 

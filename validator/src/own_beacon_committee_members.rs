@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 use bls::{PublicKeyBytes, SignatureBytes};
 use helper_functions::{accessors, misc, predicates, signing::SignForSingleFork as _};
-use log::warn;
+use logging::warn_with_peers;
 use p2p::BeaconCommitteeSubscription;
 use signer::{Signer, SigningMessage, SigningTriple};
 use std_ext::ArcExt as _;
@@ -94,7 +94,9 @@ impl OwnBeaconCommitteeMembers {
         *slot_members_opt = match self.compute_members_at_slot(state, slot).await {
             Ok(members) => members.map(|members| SlotBeaconCommitteeMembers { slot, members }),
             Err(error) => {
-                warn!("failed to compute own beacon committee members at slot {slot}: {error:?}");
+                warn_with_peers!(
+                    "failed to compute own beacon committee members at slot {slot}: {error:?}"
+                );
                 None
             }
         };
@@ -131,7 +133,7 @@ impl OwnBeaconCommitteeMembers {
             .keys()
             .copied()
             .filter_map(|public_key| {
-                let validator_index = accessors::index_of_public_key(state, public_key)?;
+                let validator_index = accessors::index_of_public_key(state, &public_key)?;
                 Some((validator_index, public_key))
             })
             .collect::<HashMap<_, _>>();
@@ -242,6 +244,7 @@ fn slot_index_from_slot(slot: Slot) -> usize {
 #[cfg(test)]
 mod tests {
     use bls::traits::SecretKey as _;
+    use pubkey_cache::PubkeyCache;
     use reqwest::Client;
     use signer::{KeyOrigin, Web3SignerConfig};
     use types::preset::Minimal;
@@ -280,7 +283,8 @@ mod tests {
         ));
 
         let config = Arc::new(ChainConfig::minimal());
-        let (state, _) = factory::min_genesis_state::<Minimal>(&config)?;
+        let pubkey_cache = PubkeyCache::default();
+        let (state, _) = factory::min_genesis_state::<Minimal>(&config, &pubkey_cache)?;
 
         let own_members = OwnBeaconCommitteeMembers::new(config, signer);
 

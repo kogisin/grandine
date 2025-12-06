@@ -1,24 +1,27 @@
-use core::{cmp::Ordering, num::NonZeroU64};
+use core::{cmp::Ordering, num::NonZeroU64, time::Duration};
 use std::{borrow::Cow, collections::BTreeMap};
 
+use derive_more::Constructor;
 use enum_iterator::Sequence as _;
 use hex_literal::hex;
+use itertools::Itertools as _;
 use nonzero_ext::nonzero;
-use serde::{
-    de::IgnoredAny,
-    {Deserialize, Serialize},
-};
+use once_cell::sync::OnceCell;
+use serde::{de::IgnoredAny, Deserialize, Serialize};
+use serde_with::{As, DurationMilliSeconds};
+use ssz::{ContiguousList, DynamicList, SszWrite};
 use thiserror::Error;
 use typenum::Unsigned as _;
 
 use crate::{
     bellatrix::primitives::Difficulty,
+    fulu::containers::DataColumnsByRootIdentifier,
     nonstandard::{Phase, Toption},
     phase0::{
         consts::{FAR_FUTURE_EPOCH, GENESIS_EPOCH},
         primitives::{
             ChainId, DomainType, Epoch, ExecutionAddress, ExecutionBlockHash, Gwei, NetworkId,
-            Slot, UnixSeconds, Version, H160, H32,
+            Slot, UnixSeconds, Version, H160, H256, H32,
         },
     },
     preset::{Preset, PresetName},
@@ -73,7 +76,8 @@ pub struct Config {
     pub electra_fork_epoch: Epoch,
     pub electra_fork_version: Version,
     #[serde(with = "serde_utils::string_or_native")]
-    pub eip7594_fork_epoch: Epoch,
+    pub fulu_fork_epoch: Epoch,
+    pub fulu_fork_version: Version,
 
     // Time parameters
     #[serde(with = "serde_utils::string_or_native")]
@@ -82,10 +86,13 @@ pub struct Config {
     pub min_validator_withdrawability_delay: u64,
     #[serde(with = "serde_utils::string_or_native")]
     pub seconds_per_eth1_block: u64,
+    #[deprecated = "use `Config::slot_duration_ms` instead"]
     #[serde(with = "serde_utils::string_or_native")]
     pub seconds_per_slot: NonZeroU64,
     #[serde(with = "serde_utils::string_or_native")]
     pub shard_committee_period: u64,
+    #[serde(with = "As::<DurationMilliSeconds<String>>")]
+    pub slot_duration_ms: Duration,
 
     // Validator cycle
     #[serde(with = "serde_utils::string_or_native")]
@@ -125,11 +132,7 @@ pub struct Config {
     pub max_payload_size: usize,
     pub message_domain_valid_snappy: DomainType,
     #[serde(with = "serde_utils::string_or_native")]
-    pub resp_timeout: u64,
-    #[serde(with = "serde_utils::string_or_native")]
     pub subnets_per_node: u64,
-    #[serde(with = "serde_utils::string_or_native")]
-    pub ttfb_timeout: u64,
     #[serde(with = "serde_utils::string_or_native")]
     pub max_blobs_per_block: usize,
     #[serde(with = "serde_utils::string_or_native")]
@@ -149,11 +152,16 @@ pub struct Config {
     #[serde(with = "serde_utils::string_or_native")]
     pub blob_sidecar_subnet_count: NonZeroU64,
     #[serde(with = "serde_utils::string_or_native")]
+    pub min_epochs_for_data_column_sidecars_requests: u64,
+    #[serde(with = "serde_utils::string_or_native")]
     pub data_column_sidecar_subnet_count: u64,
     #[serde(with = "serde_utils::string_or_native")]
     pub max_request_blob_sidecars_electra: u64,
     #[serde(with = "serde_utils::string_or_native")]
     pub blob_sidecar_subnet_count_electra: NonZeroU64,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub max_request_blob_sidecars_fulu: u64,
+    pub blob_schedule: Vec<BlobScheduleEntry>,
 
     // Transition
     pub terminal_block_hash: ExecutionBlockHash,
@@ -165,7 +173,20 @@ pub struct Config {
     #[serde(with = "serde_utils::string_or_native")]
     pub custody_requirement: u64,
     #[serde(with = "serde_utils::string_or_native")]
+    pub number_of_custody_groups: u64,
+    #[serde(with = "serde_utils::string_or_native")]
     pub samples_per_slot: u64,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub validator_custody_requirement: u64,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub balance_per_additional_custody_group: Gwei,
+
+    #[serde(skip_serializing)]
+    pub blacklisted_blocks: Vec<H256>,
+
+    // Derived
+    #[serde(skip)]
+    pub max_data_columns_by_root_request: OnceCell<usize>,
 
     // Later phases and other unknown variables
     //
@@ -180,6 +201,10 @@ pub struct Config {
 }
 
 impl Default for Config {
+    #[expect(
+        deprecated,
+        reason = "seconds_per_slot is still present in the consensus specs as of v1.6.0-alpha.5"
+    )]
     fn default() -> Self {
         Self {
             // Meta
@@ -207,7 +232,8 @@ impl Default for Config {
             deneb_fork_version: H32(hex!("04000000")),
             electra_fork_epoch: FAR_FUTURE_EPOCH,
             electra_fork_version: H32(hex!("05000000")),
-            eip7594_fork_epoch: FAR_FUTURE_EPOCH,
+            fulu_fork_epoch: FAR_FUTURE_EPOCH,
+            fulu_fork_version: H32(hex!("06000000")),
 
             // Time parameters
             eth1_follow_distance: 2048,
@@ -215,6 +241,7 @@ impl Default for Config {
             seconds_per_eth1_block: 14,
             seconds_per_slot: nonzero!(12_u64),
             shard_committee_period: 256,
+            slot_duration_ms: Duration::from_millis(12000),
 
             // Validator cycle
             churn_limit_quotient: nonzero!(1_u64 << 16),
@@ -239,9 +266,7 @@ impl Default for Config {
             epochs_per_subnet_subscription: nonzero!(256_u64),
             max_payload_size: 10_485_760,
             message_domain_valid_snappy: H32(hex!("01000000")),
-            resp_timeout: 10,
             subnets_per_node: 2,
-            ttfb_timeout: 5,
             max_blobs_per_block: 6,
             max_blobs_per_block_electra: 9,
             max_request_blocks: 1024,
@@ -251,9 +276,12 @@ impl Default for Config {
             min_epochs_for_blob_sidecars_requests: 4096,
             min_epochs_for_block_requests: 33024,
             blob_sidecar_subnet_count: nonzero!(6_u64),
-            data_column_sidecar_subnet_count: 64,
+            min_epochs_for_data_column_sidecars_requests: 4096,
+            data_column_sidecar_subnet_count: 128,
             max_request_blob_sidecars_electra: 1152,
             blob_sidecar_subnet_count_electra: nonzero!(9_u64),
+            max_request_blob_sidecars_fulu: 1536,
+            blob_schedule: vec![],
 
             // Transition
             terminal_block_hash: ExecutionBlockHash::zero(),
@@ -264,7 +292,14 @@ impl Default for Config {
 
             // Custody
             custody_requirement: 4,
-            samples_per_slot: 16,
+            number_of_custody_groups: 128,
+            samples_per_slot: 8,
+            validator_custody_requirement: 8,
+            balance_per_additional_custody_group: 32_000_000_000,
+
+            blacklisted_blocks: vec![],
+
+            max_data_columns_by_root_request: OnceCell::new(),
 
             // Later phases and other unknown variables
             unknown: BTreeMap::new(),
@@ -272,13 +307,20 @@ impl Default for Config {
     }
 }
 
+#[derive(Constructor, Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct BlobScheduleEntry {
+    #[serde(with = "serde_utils::string_or_native")]
+    pub epoch: Epoch,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub max_blobs_per_block: usize,
+}
+
 // TODO(Grandine Team): Consider adding the linked repositories as submodules and adding
 //                      tests that verify built-in configurations match YAML files in them.
 
 impl Config {
-    /// [Mainnet configuration](https://github.com/ethereum/consensus-specs/blob/4e2578dfe4097e2a6b6284ff6991089057d48776/configs/mainnet.yaml).
-    ///
-    /// Also available at <https://github.com/eth-clients/eth2-networks/blob/934c948e69205dcf2deb87e4ae6cc140c335f94d/shared/mainnet/config.yaml>.
+    /// [Mainnet configuration](https://github.com/eth-clients/mainnet/blob/e94bf5f2b5032ddba01d030173be89039f980e28/metadata/config.yaml).
     #[must_use]
     pub fn mainnet() -> Self {
         Self {
@@ -293,11 +335,25 @@ impl Config {
             bellatrix_fork_epoch: 144_896,
             capella_fork_epoch: 194_048,
             deneb_fork_epoch: 269_568,
+            electra_fork_epoch: 364_032,
+            fulu_fork_epoch: 411_392,
 
             // Deposit contract
             deposit_chain_id: 1,
             deposit_contract_address: H160(hex!("00000000219ab540356cBB839Cbe05303d7705Fa")),
             deposit_network_id: 1,
+
+            // Networking
+            blob_schedule: vec![
+                BlobScheduleEntry {
+                    epoch: 412_672,
+                    max_blobs_per_block: 15,
+                },
+                BlobScheduleEntry {
+                    epoch: 419_072,
+                    max_blobs_per_block: 21,
+                },
+            ],
 
             // Transition
             terminal_total_difficulty: Difficulty::from_u128(58_750_000_000_000_000_000_000),
@@ -309,6 +365,10 @@ impl Config {
     /// [Minimal configuration](https://github.com/ethereum/consensus-specs/blob/aac851f860fa384916f62027b2dbe3318a354c5b/configs/minimal.yaml).
     #[must_use]
     pub fn minimal() -> Self {
+        #[expect(
+            deprecated,
+            reason = "seconds_per_slot is still present in the consensus specs as of v1.6.0-alpha.5"
+        )]
         Self {
             // Meta
             config_name: Cow::Borrowed("minimal"),
@@ -326,11 +386,13 @@ impl Config {
             capella_fork_version: H32(hex!("03000001")),
             deneb_fork_version: H32(hex!("04000001")),
             electra_fork_version: H32(hex!("05000001")),
+            fulu_fork_version: H32(hex!("06000001")),
 
             // Time parameters
             eth1_follow_distance: 16,
             seconds_per_slot: nonzero!(6_u64),
             shard_committee_period: 64,
+            slot_duration_ms: Duration::from_millis(6000),
 
             // Validator cycle
             churn_limit_quotient: nonzero!(32_u64),
@@ -417,7 +479,7 @@ impl Config {
         }
     }
 
-    /// [Sepolia configuration](https://github.com/eth-clients/sepolia/blob/2b65b51eb3b4cf20cde37f88c50a5fec3100bc76/bepolia/config.yaml)
+    /// [Sepolia configuration](https://github.com/eth-clients/sepolia/blob/56f0bff41cecab6c661251d72b73ceecc52c5701/metadata/config.yaml)
     #[must_use]
     pub fn sepolia() -> Self {
         Self {
@@ -441,6 +503,8 @@ impl Config {
             deneb_fork_version: H32(hex!("90000073")),
             electra_fork_epoch: 222_464,
             electra_fork_version: H32(hex!("90000074")),
+            fulu_fork_epoch: 272_640,
+            fulu_fork_version: H32(hex!("90000075")),
 
             // Deposit contract
             deposit_chain_id: 11_155_111,
@@ -449,6 +513,18 @@ impl Config {
 
             // Transition
             terminal_total_difficulty: Difficulty::from_u128(17_000_000_000_000_000),
+
+            // Networking
+            blob_schedule: vec![
+                BlobScheduleEntry {
+                    epoch: 274_176,
+                    max_blobs_per_block: 15,
+                },
+                BlobScheduleEntry {
+                    epoch: 275_712,
+                    max_blobs_per_block: 21,
+                },
+            ],
 
             ..Self::default()
         }
@@ -526,7 +602,7 @@ impl Config {
         }
     }
 
-    /// [Holesky configuration](https://github.com/eth-clients/holesky/blob/9d9aabf2d4de51334ee5fed6c79a4d55097d1a43/custom_config_data/config.yaml)
+    /// [Holesky configuration](https://github.com/eth-clients/holesky/blob/8aec65f11f0c986d6b76b2eb902420635eb9b815/metadata/config.yaml)
     #[must_use]
     pub fn holesky() -> Self {
         Self {
@@ -549,6 +625,8 @@ impl Config {
             deneb_fork_version: H32(hex!("05017000")),
             electra_fork_epoch: 115_968,
             electra_fork_version: H32(hex!("06017000")),
+            fulu_fork_epoch: 165_120,
+            fulu_fork_version: H32(hex!("07017000")),
 
             // Validator cycle
             ejection_balance: 28_000_000_000,
@@ -560,6 +638,22 @@ impl Config {
 
             // Transition
             terminal_total_difficulty: Difficulty::ZERO,
+
+            // Networking
+            blob_schedule: vec![
+                BlobScheduleEntry {
+                    epoch: 166_400,
+                    max_blobs_per_block: 15,
+                },
+                BlobScheduleEntry {
+                    epoch: 167_936,
+                    max_blobs_per_block: 21,
+                },
+            ],
+
+            blacklisted_blocks: vec![H256(hex!(
+                "2db899881ed8546476d0b92c6aa9110bea9a4cd0dbeb5519eb0ea69575f1f359"
+            ))],
 
             ..Self::default()
         }
@@ -609,7 +703,7 @@ impl Config {
         }
     }
 
-    /// [Hoodi configuration](https://github.com/eth-clients/hoodi/blob/2b03cffba84b50759b3476a69334fac8412e217c/metadata/config.yaml)
+    /// [Hoodi configuration](https://github.com/eth-clients/hoodi/blob/21a110a60e6558a2ba7c819fa4b80029d49ab205/metadata/config.yaml)
     #[must_use]
     pub fn hoodi() -> Self {
         Self {
@@ -632,6 +726,8 @@ impl Config {
             deneb_fork_version: H32(hex!("50000910")),
             electra_fork_epoch: 2048,
             electra_fork_version: H32(hex!("60000910")),
+            fulu_fork_epoch: 50_688,
+            fulu_fork_version: H32(hex!("70000910")),
 
             // Time parameters
             seconds_per_eth1_block: 12,
@@ -646,9 +742,73 @@ impl Config {
 
             // Networking
             data_column_sidecar_subnet_count: 128,
+            blob_schedule: vec![
+                BlobScheduleEntry {
+                    epoch: 52_480,
+                    max_blobs_per_block: 15,
+                },
+                BlobScheduleEntry {
+                    epoch: 54_016,
+                    max_blobs_per_block: 21,
+                },
+            ],
 
             // Transition
             terminal_total_difficulty: Difficulty::ZERO,
+            // Custody
+            samples_per_slot: 8,
+
+            ..Self::default()
+        }
+    }
+
+    // [Pectra devnet 6 configuration](https://github.com/ethpandaops/pectra-devnets/blob/8bb780acb223896287ffb034db571455c876e56d/network-configs/devnet-6/metadata/config.yaml)
+    #[must_use]
+    pub fn pectra_devnet_6() -> Self {
+        Self {
+            // Meta
+            config_name: Cow::Borrowed("testnet"),
+
+            // Genesis
+            genesis_delay: 60,
+            genesis_fork_version: H32(hex!("10585557")),
+            min_genesis_active_validator_count: nonzero!(71_000_u64),
+            min_genesis_time: 1_738_603_800,
+
+            // Forking
+            altair_fork_epoch: 0,
+            altair_fork_version: H32(hex!("20585557")),
+            bellatrix_fork_epoch: 0,
+            bellatrix_fork_version: H32(hex!("30585557")),
+            capella_fork_epoch: 0,
+            capella_fork_version: H32(hex!("40585557")),
+            deneb_fork_epoch: 0,
+            deneb_fork_version: H32(hex!("50585557")),
+            electra_fork_epoch: 10,
+            electra_fork_version: H32(hex!("60585557")),
+
+            // Time parameters
+            min_validator_withdrawability_delay: 2,
+            seconds_per_eth1_block: 12,
+            shard_committee_period: 256,
+
+            // Validator cycle
+            churn_limit_quotient: nonzero!(128_u64),
+
+            // Deposit contract
+            deposit_chain_id: 7_072_151_312,
+            deposit_contract_address: H160(hex!("4242424242424242424242424242424242424242")),
+            deposit_network_id: 7_072_151_312,
+
+            // Networking
+            max_request_blocks: 1024,
+
+            // Transition
+            terminal_block_hash: ExecutionBlockHash::zero(),
+            terminal_block_hash_activation_epoch: FAR_FUTURE_EPOCH,
+            terminal_total_difficulty: Difficulty::from_be_bytes(hex!(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
 
             // Custody
             samples_per_slot: 8,
@@ -726,7 +886,14 @@ impl Config {
             Phase::Capella => self.capella_fork_version,
             Phase::Deneb => self.deneb_fork_version,
             Phase::Electra => self.electra_fork_version,
+            Phase::Fulu => self.fulu_fork_version,
         }
+    }
+
+    #[must_use]
+    pub fn version_at_epoch(&self, epoch: Epoch) -> Version {
+        let phase = self.phase_at_epoch(epoch);
+        self.version(phase)
     }
 
     #[inline]
@@ -739,6 +906,7 @@ impl Config {
             Phase::Capella => self.capella_fork_epoch,
             Phase::Deneb => self.deneb_fork_epoch,
             Phase::Electra => self.electra_fork_epoch,
+            Phase::Fulu => self.fulu_fork_epoch,
         }
     }
 
@@ -754,7 +922,8 @@ impl Config {
         self.fork_slot::<P>(phase).into_option().is_some()
     }
 
-    fn phase_at_epoch(&self, epoch: Epoch) -> Phase {
+    #[must_use]
+    pub fn phase_at_epoch(&self, epoch: Epoch) -> Phase {
         self.fork_epochs()
             .take_while(|(_, fork_epoch)| *fork_epoch <= epoch)
             .map(|(phase, _)| phase)
@@ -779,13 +948,8 @@ impl Config {
     }
 
     #[must_use]
-    pub const fn is_eip7594_fork(&self, epoch: Epoch) -> bool {
-        epoch >= self.eip7594_fork_epoch
-    }
-
-    #[must_use]
-    pub const fn is_eip7594_fork_epoch_set(&self) -> bool {
-        self.eip7594_fork_epoch != FAR_FUTURE_EPOCH
+    pub const fn is_peerdas_scheduled(&self) -> bool {
+        self.fulu_fork_epoch != FAR_FUTURE_EPOCH
     }
 
     #[must_use]
@@ -794,7 +958,7 @@ impl Config {
             Phase::Phase0 | Phase::Altair | Phase::Bellatrix | Phase::Capella => {
                 self.max_request_blocks
             }
-            Phase::Deneb | Phase::Electra => self.max_request_blocks_deneb,
+            Phase::Deneb | Phase::Electra | Phase::Fulu => self.max_request_blocks_deneb,
         }
     }
 
@@ -804,7 +968,7 @@ impl Config {
             Phase::Phase0 | Phase::Altair | Phase::Bellatrix | Phase::Capella | Phase::Deneb => {
                 self.blob_sidecar_subnet_count
             }
-            Phase::Electra => self.blob_sidecar_subnet_count_electra,
+            Phase::Electra | Phase::Fulu => self.blob_sidecar_subnet_count_electra,
         }
     }
 
@@ -814,8 +978,112 @@ impl Config {
             Phase::Phase0 | Phase::Altair | Phase::Bellatrix | Phase::Capella | Phase::Deneb => {
                 self.max_request_blob_sidecars
             }
-            Phase::Electra => self.max_request_blob_sidecars_electra,
+            Phase::Electra | Phase::Fulu => self.max_request_blob_sidecars_electra,
         }
+    }
+
+    #[must_use]
+    pub fn max_message_size(&self) -> usize {
+        core::cmp::max(
+            self.max_payload_size_compressed()
+                .checked_add(1024)
+                .expect("max_message_size should not overflow"),
+            1024 * 1024,
+        )
+    }
+
+    #[must_use]
+    pub fn max_payload_size_compressed(&self) -> usize {
+        Self::max_compressed_len(self.max_payload_size)
+            .expect("max_compressed_len for max_payload_size should not overflow")
+    }
+
+    #[must_use]
+    pub fn max_compressed_len(n: usize) -> Option<usize> {
+        32_usize.checked_add(n)?.checked_add(n / 6)
+    }
+
+    #[must_use]
+    pub fn max_blob_sideacar_subnet_count(&self) -> u64 {
+        self.blob_sidecar_subnet_count
+            .get()
+            .max(self.blob_sidecar_subnet_count_electra.get())
+    }
+
+    #[must_use]
+    pub const fn custody_group_count(&self, subscribe_all_data_column_subnets: bool) -> u64 {
+        if subscribe_all_data_column_subnets {
+            self.number_of_custody_groups
+        } else {
+            self.custody_requirement
+        }
+    }
+
+    /// Return the number of custody group to sample per slot.
+    #[must_use]
+    pub fn sampling_size_custody_groups(&self, custody_group_count: u64) -> u64 {
+        core::cmp::max(custody_group_count, self.samples_per_slot)
+    }
+
+    /// Return the number of data column sidecar to download per slot.
+    #[must_use]
+    pub fn sampling_column_count<P: Preset>(&self, custody_group_count: u64) -> u64 {
+        let sampling_size = self.sampling_size_custody_groups(custody_group_count);
+
+        sampling_size.saturating_mul(self.columns_per_group::<P>())
+    }
+
+    #[must_use]
+    pub const fn custody_size<P: Preset>(&self, sampling_column_count: u64) -> u64 {
+        sampling_column_count.saturating_div(self.columns_per_group::<P>())
+    }
+
+    #[must_use]
+    pub const fn columns_per_group<P: Preset>(&self) -> u64 {
+        P::NumberOfColumns::U64.saturating_div(self.number_of_custody_groups)
+    }
+
+    #[must_use]
+    pub fn get_blob_schedule_entry(&self, epoch: Epoch) -> BlobScheduleEntry {
+        self.blob_schedule
+            .iter()
+            .sorted_by(|a, b| b.epoch.cmp(&a.epoch))
+            .find_map(|entry| (epoch >= entry.epoch).then_some(entry.clone()))
+            .unwrap_or_else(|| {
+                BlobScheduleEntry::new(self.electra_fork_epoch, self.max_blobs_per_block_electra)
+            })
+    }
+
+    #[must_use]
+    pub fn max_blobs_per_block(&self, epoch: Epoch) -> u64 {
+        let phase = self.phase_at_epoch(epoch);
+        let max_blobs = match phase {
+            Phase::Phase0 | Phase::Altair | Phase::Bellatrix | Phase::Capella | Phase::Deneb => {
+                self.max_blobs_per_block
+            }
+            Phase::Electra => self.max_blobs_per_block_electra,
+            Phase::Fulu => self.get_blob_schedule_entry(epoch).max_blobs_per_block,
+        };
+
+        max_blobs
+            .try_into()
+            .expect("number of max blobs in block should fit in u64")
+    }
+
+    #[must_use]
+    pub fn max_data_columns_by_root_request<P: Preset>(&self) -> usize {
+        *self.max_data_columns_by_root_request.get_or_init(|| {
+            DynamicList::<DataColumnsByRootIdentifier<P>>::full(
+                DataColumnsByRootIdentifier {
+                    block_root: H256::zero(),
+                    columns: ContiguousList::full(0),
+                },
+                usize::try_from(self.max_request_blocks_deneb).expect("u64 to usize"),
+            )
+            .to_ssz()
+            .expect("Unable to get DataColumnSidecarsByRoot full length")
+            .len()
+        })
     }
 
     fn fork_slots<P: Preset>(&self) -> impl Iterator<Item = (Phase, Toption<Slot>)> + '_ {
@@ -831,6 +1099,7 @@ impl Config {
             self.capella_fork_epoch,
             self.deneb_fork_epoch,
             self.electra_fork_epoch,
+            self.fulu_fork_epoch,
         ];
 
         enum_iterator::all().skip(1).zip(fields)
@@ -845,6 +1114,7 @@ impl Config {
             &mut self.capella_fork_epoch,
             &mut self.deneb_fork_epoch,
             &mut self.electra_fork_epoch,
+            &mut self.fulu_fork_epoch,
         ];
 
         enum_iterator::all().skip(1).zip(fields)
@@ -857,6 +1127,8 @@ pub enum Error {
     NameEmpty,
     #[error("configuration name contains illegal characters")]
     NameContainsIllegalCharacters,
+    #[error("blob schedule is not defined")]
+    BlobScheduleUndefined,
 }
 
 #[expect(

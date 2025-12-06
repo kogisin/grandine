@@ -1,17 +1,16 @@
 use std::{path::Path, str};
 
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use bls::PublicKeyBytes;
 use bytesize::ByteSize;
 use database::{Database, DatabaseMode};
 use derive_more::Display;
+use helper_functions::misc;
 use serde::{de::DeserializeOwned, Serialize};
 use types::{
     bellatrix::primitives::Gas,
     phase0::primitives::{ExecutionAddress, H256},
 };
-
-use crate::misc::Error;
 
 const DB_MAX_SIZE: ByteSize = ByteSize::gib(1);
 
@@ -50,6 +49,7 @@ impl ProposerConfigs {
             validator_directory,
             DB_MAX_SIZE,
             DatabaseMode::ReadWrite,
+            None,
         )?;
 
         Ok(Self {
@@ -107,14 +107,14 @@ impl ProposerConfigs {
     }
 
     pub fn set_graffiti(&self, pubkey: PublicKeyBytes, graffiti: &str) -> Result<()> {
-        self.db_put(GraffitiByPubkey(pubkey), &parse_graffiti(graffiti)?)
+        self.db_put(GraffitiByPubkey(pubkey), &misc::parse_graffiti(graffiti)?)
     }
 
     pub fn delete_graffiti(&self, pubkey: PublicKeyBytes) -> Result<()> {
         self.db_remove(GraffitiByPubkey(pubkey))
     }
 
-    fn db_get<V: DeserializeOwned>(&self, key: impl Display) -> Result<Option<V>> {
+    fn db_get<V: DeserializeOwned>(&self, key: impl core::fmt::Display) -> Result<Option<V>> {
         let key_string = key.to_string();
 
         if let Some(value_bytes) = self.database.get(key_string)? {
@@ -125,23 +125,14 @@ impl ProposerConfigs {
         Ok(None)
     }
 
-    fn db_put(&self, key: impl Display, value: &impl Serialize) -> Result<()> {
+    fn db_put(&self, key: impl core::fmt::Display, value: &impl Serialize) -> Result<()> {
         self.database
             .put(key.to_string(), serde_json::to_string(value)?)
     }
 
-    fn db_remove(&self, key: impl Display) -> Result<()> {
+    fn db_remove(&self, key: impl core::fmt::Display) -> Result<()> {
         self.database.delete(key.to_string())
     }
-}
-
-fn parse_graffiti(string: &str) -> Result<H256> {
-    ensure!(string.len() <= H256::len_bytes(), Error::GraffitiTooLong);
-
-    let mut graffiti = H256::zero();
-    graffiti[..string.len()].copy_from_slice(string.as_bytes());
-
-    Ok(graffiti)
 }
 
 #[derive(Display)]
@@ -176,12 +167,12 @@ mod tests {
 
     const DEFAULT_GRAFFITI: &str = "Grandine";
     const DEFAULT_FEE_RECIPIENT: ExecutionAddress = ExecutionAddress::repeat_byte(1);
-    const DEFAULT_GAS_LIMIT: Gas = 36_000_000;
+    const DEFAULT_GAS_LIMIT: Gas = 60_000_000;
     const TEST_FEE_RECIPIENT: ExecutionAddress = ExecutionAddress::repeat_byte(2);
     const PUBKEY: PublicKeyBytes = PublicKeyBytes::repeat_byte(1);
 
     fn build_proposer_configs(validator_dir: Option<&Path>) -> Result<ProposerConfigs> {
-        let graffiti_bytes = parse_graffiti(DEFAULT_GRAFFITI)?;
+        let graffiti_bytes = misc::parse_graffiti(DEFAULT_GRAFFITI)?;
 
         match validator_dir {
             Some(dir) => ProposerConfigs::new_persistent(
@@ -319,7 +310,7 @@ mod tests {
             .rand_bytes(10)
             .tempdir()?;
 
-        let proposer_configs = build_proposer_configs(Some(&tempdir.into_path()))?;
+        let proposer_configs = build_proposer_configs(Some(&tempdir.keep()))?;
 
         proposer_configs.set_gas_limit(PUBKEY, 12345)?;
 

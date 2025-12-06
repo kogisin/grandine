@@ -4,8 +4,11 @@ use std::sync::Arc;
 use bls::PublicKeyBytes;
 use duplicate::duplicate;
 use enum_map::EnumMap;
+#[cfg(not(target_os = "zkvm"))]
 use im::HashMap;
 use once_cell::sync::OnceCell;
+#[cfg(target_os = "zkvm")]
+use std::collections::HashMap;
 
 use crate::{
     altair::primitives::NonZeroGwei, nonstandard::RelativeEpoch, phase0::primitives::ValidatorIndex,
@@ -96,7 +99,7 @@ impl PackedIndices {
     // This cannot be an `Index` impl because this has to return an owned value.
     #[inline]
     #[must_use]
-    pub fn slice(&self, range: Range<usize>) -> IndexSlice {
+    pub fn slice(&self, range: Range<usize>) -> IndexSlice<'_> {
         match self {
             Self::U8(indices) => IndexSlice::U8(&indices[range]),
             Self::U16(indices) => IndexSlice::U16(&indices[range]),

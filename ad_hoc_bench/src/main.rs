@@ -1,24 +1,31 @@
 use core::ops::RangeInclusive;
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
 
 use allocator as _;
 use anyhow::Result;
+use bytesize::ByteSize;
 use clap::{Parser, ValueEnum};
+use database::{Database, DatabaseMode};
 use eth2_cache_utils::{goerli, holesky, holesky_devnet, mainnet, medalla, withdrawal_devnet_4};
 use fork_choice_control::AdHocBenchController;
 use fork_choice_store::StoreConfig;
-use log::info;
+use itertools::Itertools as _;
+use logging::info_with_peers;
+use pubkey_cache::PubkeyCache;
 use rand::seq::SliceRandom as _;
 use types::{
     combined::{BeaconState, SignedBeaconBlock},
     config::Config as ChainConfig,
     deneb::containers::BlobSidecar,
-    phase0::{consts::GENESIS_SLOT, primitives::Slot},
+    phase0::{
+        consts::GENESIS_SLOT,
+        primitives::{Slot, H256},
+    },
     preset::Preset,
     traits::SignedBeaconBlock as _,
 };
 
-#[derive(Clone, Copy, Parser)]
+#[derive(Clone, Parser)]
 struct Options {
     #[clap(value_enum)]
     blocks: Blocks,
@@ -28,6 +35,17 @@ struct Options {
     mode: Mode,
     #[clap(long)]
     unfinalized_states_in_memory: Option<u64>,
+    /// Specifies the directory where benchmark database files will be stored.
+    /// If not provided, a temporary directory will be used by default.
+    #[clap(long)]
+    database_directory: Option<PathBuf>,
+    /// Number of blocks to process in batches.
+    #[clap(long, default_value_t = 64)]
+    batch_size: usize,
+    /// A list beacon block roots that beacon node rejects unconditionally.
+    /// Defaults to a list of default blacklisted blocks of the specified `Config`.
+    #[clap(long)]
+    blacklisted_blocks: Option<Vec<H256>>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -82,6 +100,10 @@ enum Blocks {
     Holesky,
     #[clap(name = "holesky-devnet")]
     HoleskyDevnet,
+    #[clap(name = "holesky-non-finality")]
+    HoleskyNonFinality,
+    #[clap(name = "holesky-non-finality-full")]
+    HoleskyNonFinalityFull,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -137,13 +159,16 @@ impl From<Blocks> for Chain {
             | Blocks::GoerliGenesis8192
             | Blocks::GoerliGenesis16384 => Self::Goerli,
             Blocks::Withdrawals2368 | Blocks::Withdrawals2496 => Self::Withdrawals,
-            Blocks::Holesky => Self::Holesky,
+            Blocks::Holesky | Blocks::HoleskyNonFinality | Blocks::HoleskyNonFinalityFull => {
+                Self::Holesky
+            }
             Blocks::HoleskyDevnet => Self::HoleskyDevnet,
         }
     }
 }
 
 impl From<Blocks> for BlockParameters {
+    #[expect(clippy::too_many_lines)]
     fn from(blocks: Blocks) -> Self {
         match blocks {
             Blocks::MainnetGenesis128 | Blocks::GoerliGenesis128 => Self {
@@ -238,12 +263,28 @@ impl From<Blocks> for BlockParameters {
                 last_slot: 2584,
                 slot_width: 6,
             },
+            Blocks::HoleskyNonFinality => Self {
+                first_slot: 3_710_944,
+                last_slot: 3_736_998,
+                slot_width: 8,
+            },
+            Blocks::HoleskyNonFinalityFull => Self {
+                first_slot: 3_710_944,
+                last_slot: 3_810_977,
+                slot_width: 8,
+            },
         }
     }
 }
 
 fn main() -> Result<()> {
-    binary_utils::initialize_logger(module_path!(), false)?;
+    let data_dir = tempfile::Builder::new()
+        .prefix("ad_hoc_bench_")
+        .rand_bytes(10)
+        .tempdir()?
+        .keep();
+
+    binary_utils::initialize_tracing_logger(module_path!(), Some(&data_dir), None, false)?;
     binary_utils::initialize_rayon()?;
     #[cfg(not(target_os = "windows"))]
     print_jemalloc_stats()?;
@@ -302,8 +343,9 @@ fn main() -> Result<()> {
 
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::float_arithmetic)]
+#[expect(clippy::too_many_lines)]
 fn run<P: Preset>(
-    chain_config: ChainConfig,
+    mut chain_config: ChainConfig,
     options: Options,
     beacon_state: impl FnOnce(Slot, usize) -> Arc<BeaconState<P>>,
     beacon_blocks: impl FnOnce(RangeInclusive<Slot>, usize) -> Vec<Arc<SignedBeaconBlock<P>>>,
@@ -317,7 +359,15 @@ fn run<P: Preset>(
         order,
         mode,
         unfinalized_states_in_memory,
+        database_directory,
+        batch_size,
+        blacklisted_blocks,
     } = options;
+
+    if let Some(blacklisted_blocks) = blacklisted_blocks {
+        info_with_peers!("setting blacklisted blocks to: {blacklisted_blocks:?}");
+        chain_config.blacklisted_blocks = blacklisted_blocks;
+    }
 
     let BlockParameters {
         first_slot,
@@ -351,11 +401,33 @@ fn run<P: Preset>(
 
     let anchor_state = beacon_state(first_slot, slot_width);
 
+    let database_dir = database_directory
+        .map(Ok::<_, anyhow::Error>)
+        .unwrap_or_else(|| {
+            Ok(tempfile::Builder::new()
+                .prefix("ad_hoc_bench_db_")
+                .rand_bytes(10)
+                .tempdir()?
+                .keep())
+        })?;
+
+    info_with_peers!("database dir: {}", database_dir.as_path().display());
+
+    let database = Database::persistent(
+        "ad_hoc_bench_db",
+        database_dir,
+        ByteSize::gib(512),
+        DatabaseMode::ReadWrite,
+        None,
+    )?;
+
     let (controller, _mutator_handle) = AdHocBenchController::with_p2p_tx(
         chain_config,
+        Arc::new(PubkeyCache::default()),
         store_config,
         anchor_block,
         anchor_state,
+        database,
         futures::sink::drain(),
     );
 
@@ -371,28 +443,32 @@ fn run<P: Preset>(
     let block_count = blocks.len();
     let slot_count = last_slot - first_slot;
 
-    info!("processing {block_count} blocks in {slot_count} slots (not including anchor)");
+    info_with_peers!(
+        "processing {block_count} blocks in {slot_count} slots (not including anchor)"
+    );
 
     let start = Instant::now();
 
-    for block in blocks {
-        let slot = block.message().slot();
+    for chunk in &blocks.chunks(batch_size) {
+        for block in chunk {
+            let slot = block.message().slot();
 
-        controller.on_requested_block(block, None);
+            controller.on_requested_block(block, None);
 
-        if let Some(block_blobs) = blobs.remove(&slot) {
-            for blob in block_blobs {
-                controller.on_api_blob_sidecar(blob, None)
+            if let Some(block_blobs) = blobs.remove(&slot) {
+                for blob in block_blobs {
+                    controller.on_api_blob_sidecar(blob, None)
+                }
+            }
+
+            if mode == Mode::Synchronous {
+                controller.wait_for_tasks();
             }
         }
 
-        if mode == Mode::Synchronous {
+        if mode == Mode::Asynchronous {
             controller.wait_for_tasks();
         }
-    }
-
-    if mode == Mode::Asynchronous {
-        controller.wait_for_tasks();
     }
 
     let time = start.elapsed().as_secs_f64();
@@ -406,19 +482,19 @@ fn run<P: Preset>(
     let block_throughput = time_per_block.recip();
     let slot_throughput = time_per_slot.recip();
 
-    info!("blocks processed:         {block_count}");
-    info!("slots processed:          {slot_count}");
-    info!("time taken:               {time:.3} s");
-    info!(
+    info_with_peers!("blocks processed:         {block_count}");
+    info_with_peers!("slots processed:          {slot_count}");
+    info_with_peers!("time taken:               {time:.3} s");
+    info_with_peers!(
         "average time per block:   {:.3} ms",
         time_per_block * 1000_f64,
     );
-    info!(
+    info_with_peers!(
         "average time per slot:    {:.3} ms",
         time_per_slot * 1000_f64,
     );
-    info!("average block throughput: {block_throughput:.3} blocks/s");
-    info!("average slot throughput:  {slot_throughput:.3} slots/s");
+    info_with_peers!("average block throughput: {block_throughput:.3} blocks/s");
+    info_with_peers!("average slot throughput:  {slot_throughput:.3} slots/s");
 
     #[cfg(not(target_os = "windows"))]
     print_jemalloc_stats()?;
@@ -428,28 +504,28 @@ fn run<P: Preset>(
 
 #[cfg(not(target_os = "windows"))]
 fn print_jemalloc_stats() -> Result<()> {
-    jemalloc_ctl::epoch::advance().map_err(anyhow::Error::msg)?;
+    tikv_jemalloc_ctl::epoch::advance().map_err(anyhow::Error::msg)?;
 
-    info!(
+    info_with_peers!(
         "allocated: {}, \
          active: {}, \
          metadata: {}, \
          resident: {}, \
          mapped: {}, \
          retained: {}",
-        human_readable_size(jemalloc_ctl::stats::allocated::read())?,
-        human_readable_size(jemalloc_ctl::stats::active::read())?,
-        human_readable_size(jemalloc_ctl::stats::metadata::read())?,
-        human_readable_size(jemalloc_ctl::stats::resident::read())?,
-        human_readable_size(jemalloc_ctl::stats::mapped::read())?,
-        human_readable_size(jemalloc_ctl::stats::retained::read())?,
+        human_readable_size(tikv_jemalloc_ctl::stats::allocated::read())?,
+        human_readable_size(tikv_jemalloc_ctl::stats::active::read())?,
+        human_readable_size(tikv_jemalloc_ctl::stats::metadata::read())?,
+        human_readable_size(tikv_jemalloc_ctl::stats::resident::read())?,
+        human_readable_size(tikv_jemalloc_ctl::stats::mapped::read())?,
+        human_readable_size(tikv_jemalloc_ctl::stats::retained::read())?,
     );
 
     Ok(())
 }
 #[cfg(not(target_os = "windows"))]
-fn human_readable_size(result: jemalloc_ctl::Result<usize>) -> Result<String> {
+fn human_readable_size(result: tikv_jemalloc_ctl::Result<usize>) -> Result<bytesize::Display> {
     let size = result.map_err(anyhow::Error::msg)?;
     let size = size.try_into()?;
-    Ok(bytesize::ByteSize(size).to_string_as(true))
+    Ok(ByteSize(size).display().si())
 }

@@ -6,7 +6,7 @@ The documentation is available [here](https://docs.grandine.io/). Feel free to r
 
 ## Performance
 
-Grandine is a optimised and parallelised client. There aren't many published performance comparisions, but a previous [research](https://arxiv.org/abs/2311.05252) by MigaLabs may give some insight. We run 50,000 Holesky validators on one of our developer's machine.
+Grandine is a optimised and parallelised client. There aren't many published performance comparisons, but a previous [research](https://arxiv.org/abs/2311.05252) by MigaLabs may give some insight. We run 50,000 Holesky validators on one of our developer's machine.
 
 ## Memory Usage
 
@@ -31,7 +31,7 @@ Then the build may take a few minutes:
 git clone https://github.com/grandinetech/grandine
 cd grandine
 git submodule update --init dedicated_executor eth2_libp2p
-cargo build --profile compact --features default-networks
+cargo build --profile compact --features default-networks --workspace --exclude zkvm_host --exclude zkvm_guest_risc0
 ```
 
 The compiled binary is available at `./target/compact/grandine`.
@@ -57,7 +57,10 @@ cross build \
     --bin grandine \
     --target x86_64-unknown-linux-gnu \
     --features default-networks \
-    --profile compact
+    --profile compact \
+    --workspace \
+    --exclude zkvm_host \
+    --exclude zkvm_guest_risc0
 ```
 
 Cross-compilation command for `arm64` architecture:
@@ -67,12 +70,15 @@ cross build \
     --bin grandine \
     --target aarch64-unknown-linux-gnu \
     --features default-networks \
-    --profile compact
+    --profile compact \
+    --workspace \
+    --exclude zkvm_host \
+    --exclude zkvm_guest_risc0
 ```
 
 ### Docker Cross builds
 
-Cross-compilated binaries can be used for Docker images.
+Cross-compiled binaries can be used for Docker images.
 
 Docker build command for `amd64` architecture:
 

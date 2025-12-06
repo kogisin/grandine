@@ -1,13 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc};
+use core::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use bitvec::vec::BitVec;
 use eth1_api::ApiController;
 use fork_choice_control::Wait;
+use fork_choice_store::StateCacheError;
 use futures::{channel::mpsc::UnboundedReceiver, select, StreamExt as _};
 use helper_functions::{electra, misc, phase0};
 use itertools::Itertools as _;
-use log::{debug, warn};
+use logging::{debug_with_peers, warn_with_peers};
 use operation_pools::PoolToLivenessMessage;
 use prometheus_metrics::Metrics;
 use types::{
@@ -24,11 +26,13 @@ pub use crate::messages::{ApiToLiveness, ValidatorToLiveness};
 mod messages;
 
 const EPOCHS_TO_KEEP_LIVE_VALIDATORS: u64 = 2;
+const TOO_MANY_EMPTY_SLOTS_MESSAGE_COOLDOWN: Duration = Duration::from_secs(3);
 
 pub struct LivenessTracker<P: Preset, W: Wait> {
     controller: ApiController<P, W>,
     live_validators: BTreeMap<Epoch, BitVec>,
     metrics: Option<Arc<Metrics>>,
+    too_many_empty_slots_message_shown_at: Option<Instant>,
     api_to_liveness_rx: UnboundedReceiver<ApiToLiveness>,
     pool_to_liveness_rx: UnboundedReceiver<PoolToLivenessMessage>,
     validator_to_liveness_rx: UnboundedReceiver<ValidatorToLiveness<P>>,
@@ -47,6 +51,7 @@ impl<P: Preset, W: Wait> LivenessTracker<P, W> {
             controller,
             live_validators: BTreeMap::new(),
             metrics,
+            too_many_empty_slots_message_shown_at: None,
             api_to_liveness_rx,
             pool_to_liveness_rx,
             validator_to_liveness_rx,
@@ -60,7 +65,7 @@ impl<P: Preset, W: Wait> LivenessTracker<P, W> {
                     match api_message {
                         ApiToLiveness::CheckLiveness(sender, epoch, validator_indices) => {
                             if let Err(error) = sender.send(self.check_liveness(epoch, validator_indices)) {
-                                warn!("unable to send liveness data: {error:?}");
+                                warn_with_peers!("unable to send liveness data: {error:?}");
                             }
                         }
                     }
@@ -70,7 +75,7 @@ impl<P: Preset, W: Wait> LivenessTracker<P, W> {
                     match pool_message {
                         PoolToLivenessMessage::SyncCommitteeMessage(sync_committee_message) => {
                             if let Err(error) = self.process_sync_committee_message(sync_committee_message) {
-                                warn!("Error while tracking liveness from sync committee message: {error:?}");
+                                warn_with_peers!("Error while tracking liveness from sync committee message: {error:?}");
                             }
                         },
                     }
@@ -84,7 +89,7 @@ impl<P: Preset, W: Wait> LivenessTracker<P, W> {
                         ValidatorToLiveness::Head(block, state) => {
                             self.track_collection_metrics();
 
-                            debug!(
+                            debug_with_peers!(
                                 "Tracked epochs: {:?}, Values: {}",
                                 self.live_validators.keys().collect_vec(),
                                 self.live_validators
@@ -94,17 +99,28 @@ impl<P: Preset, W: Wait> LivenessTracker<P, W> {
                             );
 
                             if let Err(error) = self.process_block(&block, &state) {
-                                warn!("Error while tracking liveness from block: {error:?}");
+                                warn_with_peers!("Error while tracking liveness from block: {error:?}");
                             }
                         }
                         ValidatorToLiveness::ValidAttestation(attestation) => {
                             let result = self
                                 .controller
-                                .preprocessed_state_at_current_slot()
+                                .preprocessed_state_at_current_slot().await
                                 .map(|state| self.process_attestation(&attestation, &state));
 
                             if let Err(error) = result {
-                                warn!("Error while tracking liveness from attestation: {error:?}");
+                                if let Some(StateCacheError::StateFarBehind { .. }) = error.downcast_ref() {
+                                    if self
+                                        .too_many_empty_slots_message_shown_at
+                                        .map(|instant| instant.elapsed() > TOO_MANY_EMPTY_SLOTS_MESSAGE_COOLDOWN)
+                                        .unwrap_or(true)
+                                    {
+                                        warn_with_peers!("Error while tracking liveness from attestation: {error:?}");
+                                        self.too_many_empty_slots_message_shown_at = Some(Instant::now());
+                                    }
+                                } else {
+                                     warn_with_peers!("Error while tracking liveness from attestation: {error:?}");
+                                }
                             }
                         }
                         ValidatorToLiveness::Stop => break Ok(()),

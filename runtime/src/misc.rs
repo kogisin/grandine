@@ -3,11 +3,12 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{ensure, Result};
 use bytesize::ByteSize;
-use database::{Database, DatabaseMode};
+use database::{Database, DatabaseMode, RestartMessage};
 use directories::Directories;
 use fork_choice_control::StorageMode;
 use fs_err::PathExt as _;
-use log::info;
+use futures::channel::mpsc::UnboundedSender;
+use logging::info_with_peers;
 use metrics::{MetricsServerConfig, MetricsServiceConfig};
 use prometheus_metrics::Metrics;
 
@@ -29,7 +30,7 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    pub fn eth1_database(&self) -> Result<Database> {
+    pub fn eth1_database(&self, restart_tx: UnboundedSender<RestartMessage>) -> Result<Database> {
         Database::persistent(
             "eth1",
             self.directories
@@ -39,6 +40,7 @@ impl StorageConfig {
                 .join("eth1_cache"),
             self.eth1_db_size,
             DatabaseMode::ReadWrite,
+            Some(restart_tx),
         )
     }
 
@@ -46,6 +48,7 @@ impl StorageConfig {
         &self,
         custom_path: Option<PathBuf>,
         mode: DatabaseMode,
+        restart_tx: Option<UnboundedSender<RestartMessage>>,
     ) -> Result<Database> {
         let path = custom_path.unwrap_or_else(|| {
             self.directories
@@ -58,11 +61,37 @@ impl StorageConfig {
         if mode.is_read_only() {
             ensure!(
                 path.fs_err_try_exists()?,
-                "beacon_fork_choice database path does not exist: {path:?}",
+                "beacon_fork_choice database path does not exist: {}",
+                path.display(),
             );
         }
 
-        Database::persistent("beacon_fork_choice", path, self.db_size, mode)
+        Database::persistent("beacon_fork_choice", path, self.db_size, mode, restart_tx)
+    }
+
+    pub fn pubkey_cache_database(
+        &self,
+        custom_path: Option<PathBuf>,
+        mode: DatabaseMode,
+        restart_tx: Option<UnboundedSender<RestartMessage>>,
+    ) -> Result<Database> {
+        let path = custom_path.unwrap_or_else(|| {
+            self.directories
+                .store_directory
+                .clone()
+                .unwrap_or_default()
+                .join("pubkey_cache")
+        });
+
+        if mode.is_read_only() {
+            ensure!(
+                path.fs_err_try_exists()?,
+                "pubkey_cache database path does not exist: {}",
+                path.display(),
+            );
+        }
+
+        Database::persistent("pubkey_cache", path, self.db_size, mode, restart_tx)
     }
 
     pub fn sync_database(
@@ -81,11 +110,12 @@ impl StorageConfig {
         if mode.is_read_only() {
             ensure!(
                 path.fs_err_try_exists()?,
-                "sync database path does not exist: {path:?}",
+                "sync database path does not exist: {}",
+                path.display(),
             );
         }
 
-        Database::persistent("sync", path, self.db_size, mode)
+        Database::persistent("sync", path, self.db_size, mode, None)
     }
 
     #[must_use]
@@ -124,14 +154,10 @@ impl StorageConfig {
     }
 
     pub fn print_db_sizes(&self) {
-        info!(
-            "Eth2 database upper limit: {}",
-            self.db_size.to_string_as(true)
-        );
-
-        info!(
+        info_with_peers!("Eth2 database upper limit: {}", self.db_size.display().si());
+        info_with_peers!(
             "Eth1 database upper limit: {}",
-            self.eth1_db_size.to_string_as(true),
+            self.eth1_db_size.display().si(),
         );
     }
 }

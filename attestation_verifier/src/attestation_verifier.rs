@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use debug_info::HealthCheck;
 use dedicated_executor::DedicatedExecutor;
 use eth1_api::ApiController;
 use eth2_libp2p::GossipId;
 use fork_choice_control::{
-    AttestationVerifierMessage, VerifyAggregateAndProofResult, VerifyAttestationResult, Wait,
+    AttestationVerifierMessage, Snapshot, VerifyAggregateAndProofResult, VerifyAttestationResult,
+    Wait,
 };
 use fork_choice_store::{
     AggregateAndProofAction, AggregateAndProofOrigin, AttestationAction, AttestationItem,
@@ -22,8 +24,9 @@ use helper_functions::{
     verifier::{MultiVerifier, Triple, Verifier},
 };
 use itertools::Either;
-use log::{debug, warn};
+use logging::{debug_with_peers, exception};
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
 use rayon::iter::{IntoParallelIterator as _, ParallelBridge as _, ParallelIterator as _};
 use std_ext::ArcExt as _;
 use types::{
@@ -37,15 +40,24 @@ const MAX_BATCH_SIZE: usize = 64;
 
 pub struct AttestationVerifier<P: Preset, W: Wait> {
     attestations: Vec<AttestationItem<P, GossipId>>,
+    batch_attestations: Vec<AttestationItem<P, GossipId>>,
     aggregates: Vec<AggregateWithOrigin<P>>,
     controller: ApiController<P, W>,
     dedicated_executor: Arc<DedicatedExecutor>,
-    active_task_count: usize,
-    max_active_tasks: usize,
+    active_aggregates_task_count: usize,
+    active_attestations_task_count: usize,
+    active_batch_attestations_task_count: usize,
+    max_aggregates_active_tasks: usize,
+    max_attestations_active_tasks: usize,
+    max_batch_attestations_active_tasks: usize,
     metrics: Option<Arc<Metrics>>,
     fc_to_verifier_rx: UnboundedReceiver<AttestationVerifierMessage<P, W>>,
-    task_to_verifier_rx: UnboundedReceiver<TaskMessage<W>>,
-    task_to_verifier_tx: UnboundedSender<TaskMessage<W>>,
+    aggregates_task_to_verifier_rx: UnboundedReceiver<TaskMessage<W>>,
+    aggregates_task_to_verifier_tx: UnboundedSender<TaskMessage<W>>,
+    attestations_task_to_verifier_rx: UnboundedReceiver<TaskMessage<W>>,
+    attestations_task_to_verifier_tx: UnboundedSender<TaskMessage<W>>,
+    batch_attestations_task_to_verifier_rx: UnboundedReceiver<TaskMessage<W>>,
+    batch_attestations_task_to_verifier_tx: UnboundedSender<TaskMessage<W>>,
 }
 
 impl<P: Preset, W: Wait> AttestationVerifier<P, W> {
@@ -56,36 +68,69 @@ impl<P: Preset, W: Wait> AttestationVerifier<P, W> {
         metrics: Option<Arc<Metrics>>,
         fc_to_verifier_rx: UnboundedReceiver<AttestationVerifierMessage<P, W>>,
     ) -> Self {
-        let (task_to_verifier_tx, task_to_verifier_rx) = mpsc::unbounded();
+        let (aggregates_task_to_verifier_tx, aggregates_task_to_verifier_rx) = mpsc::unbounded();
+        let (attestations_task_to_verifier_tx, attestations_task_to_verifier_rx) =
+            mpsc::unbounded();
+        let (batch_attestations_task_to_verifier_tx, batch_attestations_task_to_verifier_rx) =
+            mpsc::unbounded();
 
         Self {
             attestations: vec![],
+            batch_attestations: vec![],
             aggregates: vec![],
             controller,
             dedicated_executor,
-            active_task_count: 0,
+            active_aggregates_task_count: 0,
+            active_attestations_task_count: 0,
+            active_batch_attestations_task_count: 0,
             // `blst` already parallelizes signature verification. For non parallelized BLS
             // libraries use `num_cpus::get()`
-            max_active_tasks: 1,
+            max_aggregates_active_tasks: 1,
+            max_attestations_active_tasks: 1,
+            max_batch_attestations_active_tasks: 1,
             metrics,
             fc_to_verifier_rx,
-            task_to_verifier_rx,
-            task_to_verifier_tx,
+            aggregates_task_to_verifier_rx,
+            aggregates_task_to_verifier_tx,
+            attestations_task_to_verifier_rx,
+            attestations_task_to_verifier_tx,
+            batch_attestations_task_to_verifier_rx,
+            batch_attestations_task_to_verifier_tx,
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
+        let mut health_check = HealthCheck::new("attestation_verifier");
+
         loop {
             select! {
-                message = self.task_to_verifier_rx.select_next_some() => {
+                _ = health_check.interval.select_next_some() => {
+                    health_check.check();
+                },
+                message = self.aggregates_task_to_verifier_rx.select_next_some() => {
                     match message {
                         TaskMessage::Finished(wait_group) => {
-                            self.active_task_count -= 1;
-                            self.spawn_verify_batch_tasks(&wait_group);
-
-                            if let Some(metrics) = self.metrics.as_ref() {
-                                metrics.set_attestation_verifier_active_task_count(self.active_task_count);
-                            }
+                            self.active_aggregates_task_count -= 1;
+                            self.spawn_verify_aggregate_batch_task(&wait_group);
+                            self.track_active_task_count();
+                        }
+                    }
+                }
+                message = self.attestations_task_to_verifier_rx.select_next_some() => {
+                    match message {
+                        TaskMessage::Finished(wait_group) => {
+                            self.active_attestations_task_count -= 1;
+                            self.spawn_verify_attestation_batch_task(&wait_group);
+                            self.track_active_task_count();
+                        }
+                    }
+                }
+                message = self.batch_attestations_task_to_verifier_rx.select_next_some() => {
+                    match message {
+                        TaskMessage::Finished(wait_group) => {
+                            self.active_batch_attestations_task_count -= 1;
+                            self.spawn_verify_batch_attestation_task(&wait_group);
+                            self.track_active_task_count();
                         }
                     }
                 }
@@ -101,14 +146,27 @@ impl<P: Preset, W: Wait> AttestationVerifier<P, W> {
                                 origin,
                             });
 
-                            self.spawn_verify_batch_tasks(&wait_group);
+                            self.spawn_verify_aggregate_batch_task(&wait_group);
                         }
                         AttestationVerifierMessage::Attestation {
                             wait_group,
                             attestation,
                         } => {
                             self.attestations.push(attestation);
-                            self.spawn_verify_batch_tasks(&wait_group);
+                            self.spawn_verify_attestation_batch_task(&wait_group);
+                        }
+                        AttestationVerifierMessage::AttestationBatch {
+                            wait_group,
+                            mut attestations,
+                        } => {
+                            debug_with_peers!(
+                                "received attestation batch with {} attestations, existing batch attestations: {}",
+                                attestations.len(),
+                                self.batch_attestations.len()
+                            );
+
+                            self.batch_attestations.append(&mut attestations);
+                            self.spawn_verify_batch_attestation_task(&wait_group);
                         }
                         AttestationVerifierMessage::Stop => break Ok(()),
                     }
@@ -117,21 +175,15 @@ impl<P: Preset, W: Wait> AttestationVerifier<P, W> {
         }
     }
 
-    fn spawn_verify_batch_tasks(&mut self, wait_group: &W) {
-        self.spawn_verify_attestation_batch_task(wait_group);
-        self.spawn_verify_aggregate_batch_task(wait_group);
-    }
-
     fn spawn_verify_aggregate_batch_task(&mut self, wait_group: &W) {
-        if self.aggregates.is_empty() || self.active_task_count >= self.max_active_tasks {
+        if self.active_aggregates_task_count >= self.max_aggregates_active_tasks
+            || self.aggregates.is_empty()
+        {
             return;
         }
 
-        self.active_task_count += 1;
-
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.set_attestation_verifier_active_task_count(self.active_task_count);
-        }
+        self.active_aggregates_task_count += 1;
+        self.track_active_task_count();
 
         let split_at = self.aggregates.len().saturating_sub(MAX_BATCH_SIZE);
         let aggregates = self.aggregates.split_off(split_at);
@@ -142,20 +194,24 @@ impl<P: Preset, W: Wait> AttestationVerifier<P, W> {
             self.controller.clone_arc(),
             &self.dedicated_executor,
             self.metrics.clone(),
-            self.task_to_verifier_tx.clone(),
+            self.aggregates_task_to_verifier_tx.clone(),
         );
     }
 
     fn spawn_verify_attestation_batch_task(&mut self, wait_group: &W) {
-        if self.attestations.is_empty() || self.active_task_count >= self.max_active_tasks {
+        if self.active_attestations_task_count >= self.max_attestations_active_tasks
+            || self.attestations.is_empty()
+        {
             return;
         }
 
-        self.active_task_count += 1;
+        self.active_attestations_task_count += 1;
+        self.track_active_task_count();
 
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.set_attestation_verifier_active_task_count(self.active_task_count);
-        }
+        debug_with_peers!(
+            "spawn verify attestation batch task: attestation_len: {}",
+            self.attestations.len(),
+        );
 
         let split_at = self.attestations.len().saturating_sub(MAX_BATCH_SIZE);
         let attestations = self.attestations.split_off(split_at);
@@ -166,8 +222,46 @@ impl<P: Preset, W: Wait> AttestationVerifier<P, W> {
             self.controller.clone_arc(),
             &self.dedicated_executor,
             self.metrics.clone(),
-            self.task_to_verifier_tx.clone(),
+            self.attestations_task_to_verifier_tx.clone(),
         );
+    }
+
+    fn spawn_verify_batch_attestation_task(&mut self, wait_group: &W) {
+        if self.active_batch_attestations_task_count >= self.max_batch_attestations_active_tasks
+            || self.batch_attestations.is_empty()
+        {
+            return;
+        }
+
+        self.active_batch_attestations_task_count += 1;
+        self.track_active_task_count();
+
+        debug_with_peers!(
+            "spawn verify batch attestation task: batch_attestation_len: {}",
+            self.batch_attestations.len()
+        );
+
+        let mut attestations = vec![];
+        core::mem::swap(&mut self.batch_attestations, &mut attestations);
+
+        VerifyAttestationBatchTask::spawn(
+            wait_group.clone(),
+            attestations,
+            self.controller.clone_arc(),
+            &self.dedicated_executor,
+            self.metrics.clone(),
+            self.batch_attestations_task_to_verifier_tx.clone(),
+        );
+    }
+
+    fn track_active_task_count(&self) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.set_attestation_verifier_active_task_count(
+                self.active_aggregates_task_count
+                    + self.active_attestations_task_count
+                    + self.active_batch_attestations_task_count,
+            );
+        }
     }
 }
 
@@ -191,6 +285,27 @@ impl<P: Preset, W: Wait> VerifyAggregateBatchTask<P, W> {
                 TaskMessage::Finished(wait_group).send(&task_to_verifier_tx);
             })
             .detach();
+    }
+
+    fn current_state(&self, snapshot: &Snapshot<P>) -> Arc<BeaconState<P>> {
+        if !self.controller.is_forward_synced() {
+            return snapshot.head_state();
+        }
+
+        match self
+            .controller
+            .preprocessed_state_at_current_slot_blocking()
+        {
+            Ok(state) => state,
+            Err(error) => {
+                debug_with_peers!(
+                    "failed to get state at current slot for aggregate and proof batch signature verification: {error}. \
+                     Using head state instead",
+                );
+
+                snapshot.head_state()
+            }
+        }
     }
 
     fn process_aggregate_batch(
@@ -221,12 +336,16 @@ impl<P: Preset, W: Wait> VerifyAggregateBatchTask<P, W> {
 
         self.send_results_to_fork_choice(other);
 
-        match self.verify_aggregate_batch_signatures(&accepted, &snapshot.head_state(), metrics) {
+        match self.verify_aggregate_batch_signatures(
+            &accepted,
+            &self.current_state(&snapshot),
+            metrics,
+        ) {
             Ok(()) => {
                 self.send_results_to_fork_choice(accepted);
             }
             Err(error) => {
-                warn!(
+                exception!(
                     "signature verification for gossip aggregate and proof batch failed: {error}",
                 );
 
@@ -293,12 +412,15 @@ impl<P: Preset, W: Wait> VerifyAggregateBatchTask<P, W> {
                 let aggregator_index = message.aggregator_index();
                 let selection_proof = message.selection_proof();
 
-                let public_key = accessors::public_key(state, aggregator_index)?;
+                let public_key = self
+                    .controller
+                    .pubkey_cache()
+                    .get_or_insert(*accessors::public_key(state, aggregator_index)?)?;
 
                 verifier.verify_singular(
                     message.slot().signing_root(config, state),
                     selection_proof,
-                    public_key,
+                    public_key.clone_arc(),
                     SignatureKind::SelectionProof,
                 )?;
 
@@ -313,7 +435,12 @@ impl<P: Preset, W: Wait> VerifyAggregateBatchTask<P, W> {
             }
         }
 
-        let attestation_triples = attestation_batch_triples(config, messages.iter(), state)?;
+        let attestation_triples = attestation_batch_triples(
+            config,
+            self.controller.pubkey_cache(),
+            messages.iter(),
+            state,
+        )?;
 
         verifier.extend(attestation_triples, SignatureKind::Attestation)?;
 
@@ -355,6 +482,27 @@ impl<P: Preset, W: Wait> VerifyAttestationBatchTask<P, W> {
             .detach();
     }
 
+    fn current_state(&self, snapshot: &Snapshot<P>) -> Arc<BeaconState<P>> {
+        if !self.controller.is_forward_synced() {
+            return snapshot.head_state();
+        }
+
+        match self
+            .controller
+            .preprocessed_state_at_current_slot_blocking()
+        {
+            Ok(state) => state,
+            Err(error) => {
+                debug_with_peers!(
+                    "failed to get state at current slot for attestation batch signature verification: {error}. \
+                     Using head state instead",
+                );
+
+                snapshot.head_state()
+            }
+        }
+    }
+
     fn process_attestation_batch(&self, attestations: Vec<AttestationItem<P, GossipId>>) {
         let snapshot = self.controller.snapshot();
 
@@ -376,7 +524,7 @@ impl<P: Preset, W: Wait> VerifyAttestationBatchTask<P, W> {
         //     metrics.set_attestation_verifier_attestation_batch_signature_len(accepted_attestations_wo.len());
         // }
 
-        match self.verify_attestation_batch_signatures(&accepted, &snapshot.head_state()) {
+        match self.verify_attestation_batch_signatures(&accepted, &self.current_state(&snapshot)) {
             Ok(()) => {
                 let accepted = accepted
                     .into_iter()
@@ -386,7 +534,7 @@ impl<P: Preset, W: Wait> VerifyAttestationBatchTask<P, W> {
                 self.send_results_to_fork_choice(accepted);
             }
             Err(error) => {
-                warn!("signature verification for gossip attestation batch failed: {error}");
+                exception!("signature verification for gossip attestation batch failed: {error}");
 
                 for accepted_attestation in accepted.into_iter().flatten() {
                     if let AttestationAction::Accept { attestation, .. } = accepted_attestation {
@@ -416,6 +564,7 @@ impl<P: Preset, W: Wait> VerifyAttestationBatchTask<P, W> {
 
         let triples = attestation_batch_triples(
             self.controller.chain_config(),
+            self.controller.pubkey_cache(),
             results.iter().filter_map(|result| {
                 if let Ok(AttestationAction::Accept {
                     ref attestation, ..
@@ -437,6 +586,7 @@ impl<P: Preset, W: Wait> VerifyAttestationBatchTask<P, W> {
 
 fn attestation_batch_triples<'a, P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     attestations: impl IntoIterator<IntoIter = impl Iterator<Item = &'a Attestation<P>> + Send>,
     state: &BeaconState<P>,
 ) -> Result<Vec<Triple>> {
@@ -452,6 +602,7 @@ fn attestation_batch_triples<'a, P: Preset>(
 
                     predicates::validate_constructed_indexed_attestation(
                         config,
+                        pubkey_cache,
                         state,
                         &indexed_attestation,
                         &mut triple,
@@ -466,6 +617,7 @@ fn attestation_batch_triples<'a, P: Preset>(
 
                     predicates::validate_constructed_indexed_attestation(
                         config,
+                        pubkey_cache,
                         state,
                         &indexed_attestation,
                         &mut triple,
@@ -481,6 +633,7 @@ fn attestation_batch_triples<'a, P: Preset>(
 
                     predicates::validate_constructed_indexed_attestation(
                         config,
+                        pubkey_cache,
                         state,
                         &indexed_attestation,
                         &mut triple,
@@ -506,7 +659,7 @@ enum TaskMessage<W> {
 impl<W> TaskMessage<W> {
     fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!(
+            debug_with_peers!(
                 "send from verification task to attestation verifier failed because the receiver was dropped"
             );
         }

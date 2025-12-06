@@ -10,19 +10,27 @@ use execution_engine::{ExecutionEngine, NullExecutionEngine};
 use features::Feature;
 use fork_choice_store::{
     AggregateAndProofOrigin, AttestationItem, AttestationOrigin, AttesterSlashingOrigin,
-    BlobSidecarOrigin, BlockAction, BlockOrigin, StateCacheProcessor, Store,
+    BlobSidecarOrigin, BlockAction, BlockOrigin, DataColumnSidecarAction, DataColumnSidecarOrigin,
+    StateCacheProcessor, Store,
 };
 use futures::channel::mpsc::Sender as MultiSender;
 use helper_functions::{
     accessors, misc,
     verifier::{MultiVerifier, NullVerifier},
 };
-use log::{debug, warn};
+use logging::{debug_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
 use ssz::SszHash as _;
+use tracing::{instrument, Span};
 use types::{
-    combined::{AttesterSlashing, SignedAggregateAndProof, SignedBeaconBlock},
+    combined::{
+        AttesterSlashing, BeaconState as CombinedBeaconState, SignedAggregateAndProof,
+        SignedBeaconBlock,
+    },
+    config::Config,
     deneb::containers::{BlobIdentifier, BlobSidecar},
+    fulu::containers::{DataColumnIdentifier, DataColumnSidecar},
     nonstandard::{RelativeEpoch, ValidationOutcome},
     phase0::{
         containers::Checkpoint,
@@ -33,7 +41,10 @@ use types::{
 };
 
 use crate::{
-    block_processor::BlockProcessor, messages::MutatorMessage, misc::VerifyAggregateAndProofResult,
+    block_processor::BlockProcessor,
+    messages::MutatorMessage,
+    misc::{ProcessingTimings, VerifyAggregateAndProofResult},
+    state_at_slot_cache::StateAtSlotCache,
     storage::Storage,
 };
 
@@ -54,18 +65,28 @@ pub trait Run {
 //                      the tasks to contain `*Pending` structs instead of duplicating their fields.
 
 pub struct BlockTask<P: Preset, E, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub block_processor: Arc<BlockProcessor<P>>,
     pub execution_engine: E,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
     pub block: Arc<SignedBeaconBlock<P>>,
     pub origin: BlockOrigin,
-    pub submission_time: Instant,
+    pub processing_timings: ProcessingTimings,
     pub metrics: Option<Arc<Metrics>>,
+    pub tracing_span: Span,
 }
 
 impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for BlockTask<P, E, W> {
+    #[instrument(
+        skip_all,
+        name = "BlockTask::run",
+        parent = &self.tracing_span,
+        fields(
+            origin = ?&self.origin,
+            slot = self.block.message().slot()
+        ),
+    )]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -75,8 +96,9 @@ impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for BlockTask<P, E, W> {
             wait_group,
             block,
             origin,
-            submission_time,
+            processing_timings,
             metrics,
+            tracing_span,
         } = self;
 
         let _timer = metrics.as_ref().map(|metrics| {
@@ -126,21 +148,23 @@ impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for BlockTask<P, E, W> {
             ),
         };
 
-        let rejected_block_root = result.is_err().then(|| block.message().hash_tree_root());
+        // TODO: reduce number of block root computations across the app
+        let block_root = block.message().hash_tree_root();
 
         MutatorMessage::Block {
             wait_group,
-            result,
+            result: result.into(),
             origin,
-            submission_time,
-            rejected_block_root,
+            processing_timings,
+            block_root,
+            tracing_span,
         }
         .send(&mutator_tx);
     }
 }
 
 pub struct BlockVerifyForGossipTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub block_processor: Arc<BlockProcessor<P>>,
     pub wait_group: W,
     pub block: Arc<SignedBeaconBlock<P>>,
@@ -148,6 +172,14 @@ pub struct BlockVerifyForGossipTask<P: Preset, W> {
 }
 
 impl<P: Preset, W> Run for BlockVerifyForGossipTask<P, W> {
+    #[instrument(
+        skip_all,
+        name = "BlockVerifyForGossipTask::run",
+        level = "debug",
+        fields(
+            slot = self.block.message().slot()
+        ),
+    )]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -166,7 +198,9 @@ impl<P: Preset, W> Run for BlockVerifyForGossipTask<P, W> {
             });
 
         if let Err(reply) = sender.try_send(validation_outcome) {
-            debug!("reply to HTTP API failed because the receiver was dropped: {reply:?}");
+            debug_with_peers!(
+                "reply to HTTP API failed because the receiver was dropped: {reply:?}"
+            );
         }
 
         drop(wait_group);
@@ -174,7 +208,7 @@ impl<P: Preset, W> Run for BlockVerifyForGossipTask<P, W> {
 }
 
 pub struct AggregateAndProofTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
     pub aggregate_and_proof: Arc<SignedAggregateAndProof<P>>,
@@ -183,6 +217,7 @@ pub struct AggregateAndProofTask<P: Preset, W> {
 }
 
 impl<P: Preset, W> Run for AggregateAndProofTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "AggregateAndProofTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -210,7 +245,7 @@ impl<P: Preset, W> Run for AggregateAndProofTask<P, W> {
 }
 
 pub struct AttestationTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
     pub attestation: AttestationItem<P, GossipId>,
@@ -218,6 +253,7 @@ pub struct AttestationTask<P: Preset, W> {
 }
 
 impl<P: Preset, W> Run for AttestationTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "AttestationTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -242,19 +278,22 @@ impl<P: Preset, W> Run for AttestationTask<P, W> {
 
 // TODO(Grandine Team): Merge this with `BlockTask` and benchmark.
 pub struct BlockAttestationsTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
+    pub block_root: H256,
     pub block: Arc<SignedBeaconBlock<P>>,
     pub metrics: Option<Arc<Metrics>>,
 }
 
 impl<P: Preset, W> Run for BlockAttestationsTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "BlockAttestationTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
             mutator_tx,
             wait_group,
+            block_root,
             block,
             metrics,
         } = self;
@@ -270,7 +309,10 @@ impl<P: Preset, W> Run for BlockAttestationsTask<P, W> {
             .combined_attestations()
             .map(|attestation| {
                 store_snapshot.validate_attestation(
-                    AttestationItem::verified(Arc::new(attestation), AttestationOrigin::Block),
+                    AttestationItem::verified(
+                        Arc::new(attestation),
+                        AttestationOrigin::Block(block_root),
+                    ),
                     true,
                 )
             })
@@ -285,7 +327,7 @@ impl<P: Preset, W> Run for BlockAttestationsTask<P, W> {
 }
 
 pub struct AttesterSlashingTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
     pub attester_slashing: Box<AttesterSlashing<P>>,
@@ -294,6 +336,7 @@ pub struct AttesterSlashingTask<P: Preset, W> {
 }
 
 impl<P: Preset, W> Run for AttesterSlashingTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "AttesterSlashingTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -320,10 +363,11 @@ impl<P: Preset, W> Run for AttesterSlashingTask<P, W> {
 }
 
 pub struct BlobSidecarTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
     pub blob_sidecar: Arc<BlobSidecar<P>>,
+    pub state: Option<Arc<CombinedBeaconState<P>>>,
     pub block_seen: bool,
     pub origin: BlobSidecarOrigin,
     pub submission_time: Instant,
@@ -331,12 +375,14 @@ pub struct BlobSidecarTask<P: Preset, W> {
 }
 
 impl<P: Preset, W> Run for BlobSidecarTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "BlobSidecarTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
             mutator_tx,
             wait_group,
             blob_sidecar,
+            state,
             block_seen,
             origin,
             submission_time,
@@ -351,7 +397,7 @@ impl<P: Preset, W> Run for BlobSidecarTask<P, W> {
         let index = blob_sidecar.index;
         let blob_identifier = BlobIdentifier { block_root, index };
 
-        let result = store_snapshot.validate_blob_sidecar(blob_sidecar, block_seen, &origin);
+        let result = store_snapshot.validate_blob_sidecar(blob_sidecar, state, block_seen, &origin);
 
         MutatorMessage::BlobSidecar {
             wait_group,
@@ -365,8 +411,95 @@ impl<P: Preset, W> Run for BlobSidecarTask<P, W> {
     }
 }
 
+pub struct DataColumnSidecarTask<P: Preset, W> {
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
+    pub mutator_tx: Sender<MutatorMessage<P, W>>,
+    pub wait_group: W,
+    pub data_column_sidecar: Arc<DataColumnSidecar<P>>,
+    pub state: Option<Arc<CombinedBeaconState<P>>>,
+    pub block_seen: bool,
+    pub origin: DataColumnSidecarOrigin,
+    pub submission_time: Instant,
+    pub metrics: Option<Arc<Metrics>>,
+}
+
+impl<P: Preset, W> Run for DataColumnSidecarTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "DataColumnSidecarTask::run")]
+    fn run(self) {
+        let Self {
+            store_snapshot,
+            mutator_tx,
+            wait_group,
+            data_column_sidecar,
+            state,
+            block_seen,
+            origin,
+            submission_time,
+            metrics,
+        } = self;
+
+        let block_root = data_column_sidecar
+            .signed_block_header
+            .message
+            .hash_tree_root();
+
+        let _data_column_sidecar_verification_timer = metrics
+            .as_ref()
+            .map(|metrics| metrics.data_column_sidecar_verification_times.start_timer());
+
+        let _timer = metrics
+            .as_ref()
+            .map(|metrics| metrics.fc_data_column_sidecar_task_times.start_timer());
+
+        let index = data_column_sidecar.index;
+        let data_column_identifier = DataColumnIdentifier { block_root, index };
+
+        let result = store_snapshot.validate_data_column_sidecar(
+            data_column_sidecar,
+            state,
+            block_seen,
+            &origin,
+            metrics.as_ref(),
+        );
+
+        if result.is_err() {
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.data_column_sidecars_submitted_for_processing.inc();
+            }
+        }
+
+        if let Ok(DataColumnSidecarAction::Accept(_)) = result {
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.data_column_sidecars_submitted_for_processing.inc();
+                metrics.verified_gossip_data_column_sidecar.inc();
+            }
+        }
+
+        MutatorMessage::DataColumnSidecar {
+            wait_group,
+            result,
+            origin,
+            data_column_identifier,
+            block_seen,
+            submission_time,
+        }
+        .send(&mutator_tx);
+    }
+}
+
+pub struct RetryDataColumnSidecarTask<P: Preset, W> {
+    pub task: DataColumnSidecarTask<P, W>,
+}
+
+impl<P: Preset, W> Run for RetryDataColumnSidecarTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "RetryDataColumnSidecarTask::run")]
+    fn run(self) {
+        self.task.run()
+    }
+}
+
 pub struct PersistBlobSidecarsTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub storage: Arc<Storage<P>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
@@ -374,6 +507,7 @@ pub struct PersistBlobSidecarsTask<P: Preset, W> {
 }
 
 impl<P: Preset, W> Run for PersistBlobSidecarsTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "PersistBlobSidecarTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -398,22 +532,69 @@ impl<P: Preset, W> Run for PersistBlobSidecarsTask<P, W> {
                 .send(&mutator_tx);
             }
             Err(error) => {
-                warn!("failed to persist blob sidecars to storage: {error:?}");
+                warn_with_peers!("failed to persist blob sidecars to storage: {error:?}");
+            }
+        }
+    }
+}
+
+pub struct PersistDataColumnSidecarsTask<P: Preset, W> {
+    pub slot: Slot,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
+    pub storage: Arc<Storage<P>>,
+    pub mutator_tx: Sender<MutatorMessage<P, W>>,
+    pub wait_group: W,
+    pub metrics: Option<Arc<Metrics>>,
+}
+
+impl<P: Preset, W> Run for PersistDataColumnSidecarsTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "PersistDataColumnSidecarTask::run")]
+    fn run(self) {
+        let Self {
+            slot,
+            storage,
+            store_snapshot,
+            mutator_tx,
+            wait_group,
+            metrics,
+        } = self;
+
+        let _timer = metrics.as_ref().map(|metrics| {
+            metrics
+                .fc_data_column_sidecar_persist_task_times
+                .start_timer()
+        });
+
+        let data_column_sidecars = store_snapshot.unpersisted_data_column_sidecars();
+
+        match storage.append_data_column_sidecars(data_column_sidecars) {
+            Ok(persisted_data_column_ids) => {
+                MutatorMessage::FinishedPersistingDataColumnSidecars {
+                    wait_group,
+                    persisted_data_column_ids,
+                    slot,
+                }
+                .send(&mutator_tx);
+            }
+            Err(error) => {
+                warn_with_peers!("failed to persist data column sidecars to storage: {error:?}");
             }
         }
     }
 }
 
 pub struct CheckpointStateTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub state_cache: Arc<StateCacheProcessor<P>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub wait_group: W,
     pub checkpoint: Checkpoint,
+    pub pubkey_cache: Arc<PubkeyCache>,
     pub metrics: Option<Arc<Metrics>>,
 }
 
 impl<P: Preset, W> Run for CheckpointStateTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "CheckpointStateTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -421,6 +602,7 @@ impl<P: Preset, W> Run for CheckpointStateTask<P, W> {
             mutator_tx,
             wait_group,
             checkpoint,
+            pubkey_cache,
             metrics,
         } = self;
 
@@ -431,10 +613,16 @@ impl<P: Preset, W> Run for CheckpointStateTask<P, W> {
         let Checkpoint { epoch, root } = checkpoint;
         let slot = misc::compute_start_slot_at_epoch::<P>(epoch);
 
-        let checkpoint_state = match state_cache.try_state_at_slot(&store_snapshot, root, slot) {
+        let checkpoint_state = match state_cache.try_state_at_slot(
+            &pubkey_cache,
+            &store_snapshot,
+            root,
+            slot,
+            store_snapshot.is_forward_synced(),
+        ) {
             Ok(state) => state,
             Err(error) => {
-                warn!("failed to compute checkpoint state: {error:?}");
+                warn_with_peers!("failed to compute checkpoint state: {error:?}");
                 return;
             }
         };
@@ -449,15 +637,17 @@ impl<P: Preset, W> Run for CheckpointStateTask<P, W> {
 }
 
 pub struct PreprocessStateTask<P: Preset, W> {
-    pub store_snapshot: Arc<Store<P>>,
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub state_cache: Arc<StateCacheProcessor<P>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub head_block_root: H256,
     pub next_slot: Slot,
+    pub pubkey_cache: Arc<PubkeyCache>,
     pub metrics: Option<Arc<Metrics>>,
 }
 
 impl<P: Preset, W> Run for PreprocessStateTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "PreprocessStateTask::run")]
     fn run(self) {
         let Self {
             store_snapshot,
@@ -465,6 +655,7 @@ impl<P: Preset, W> Run for PreprocessStateTask<P, W> {
             mutator_tx,
             head_block_root,
             next_slot,
+            pubkey_cache,
             metrics,
         } = self;
 
@@ -472,27 +663,85 @@ impl<P: Preset, W> Run for PreprocessStateTask<P, W> {
             .as_ref()
             .map(|metrics| metrics.fc_preprocess_state_task_times.start_timer());
 
-        match state_cache.state_at_slot_quiet(&store_snapshot, head_block_root, next_slot) {
+        match state_cache.state_at_slot_quiet(
+            &pubkey_cache,
+            &store_snapshot,
+            head_block_root,
+            next_slot,
+        ) {
             Ok(state) => {
-                if let Err(error) = initialize_preprocessed_state_cache(&state) {
-                    warn!("failed to initialize preprocessed state's cache values: {error:?}");
+                if let Err(error) =
+                    initialize_preprocessed_state_cache(store_snapshot.chain_config(), &state)
+                {
+                    warn_with_peers!(
+                        "failed to initialize preprocessed state's cache values: {error:?}"
+                    );
                 }
 
                 MutatorMessage::PreprocessedBeaconState { state }.send(&mutator_tx);
             }
             Err(error) => {
-                warn!("failed to preprocess beacon state for the next slot: {error:?}");
+                warn_with_peers!("failed to preprocess beacon state for the next slot: {error:?}");
             }
         }
     }
 }
 
-fn initialize_preprocessed_state_cache<P: Preset>(state: &impl BeaconState<P>) -> Result<()> {
-    accessors::get_or_try_init_beacon_proposer_index(state, false)?;
+pub struct PersistPubkeyCacheTask<P: Preset, W> {
+    pub pubkey_cache: Arc<PubkeyCache>,
+    pub state: Arc<CombinedBeaconState<P>>,
+    pub wait_group: W,
+    pub metrics: Option<Arc<Metrics>>,
+}
+
+impl<P: Preset, W> Run for PersistPubkeyCacheTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "PersistPubkeyCacheTask::run")]
+    fn run(self) {
+        let Self {
+            pubkey_cache,
+            state,
+            wait_group,
+            metrics,
+        } = self;
+
+        let _timer = metrics
+            .as_ref()
+            .map(|metrics| metrics.fc_persist_pubkey_cache_task_times.start_timer());
+
+        if let Err(error) = pubkey_cache.persist(&state) {
+            warn_with_peers!("failed to persist pubkey cache to disk: {error:?}");
+        }
+
+        drop(wait_group);
+    }
+}
+
+fn initialize_preprocessed_state_cache<P: Preset>(
+    config: &Config,
+    state: &impl BeaconState<P>,
+) -> Result<()> {
+    accessors::get_or_try_init_beacon_proposer_index(config, state, false)?;
     accessors::get_or_init_active_validator_indices_shuffled(state, RelativeEpoch::Current, false);
     accessors::get_or_init_active_validator_indices_shuffled(state, RelativeEpoch::Next, false);
     accessors::get_or_init_total_active_balance(state, false);
     accessors::get_or_init_validator_indices(state, false);
 
     Ok(())
+}
+
+pub struct StateAtSlotCacheFlushTask<P: Preset> {
+    pub state_at_slot_cache: Arc<StateAtSlotCache<P>>,
+}
+
+impl<P: Preset> Run for StateAtSlotCacheFlushTask<P> {
+    #[instrument(skip_all, level = "debug", name = "StateAtSlotCacheFlushTask::run")]
+    fn run(self) {
+        let Self {
+            state_at_slot_cache,
+        } = self;
+
+        if let Err(error) = state_at_slot_cache.flush() {
+            warn_with_peers!("failed to flush state at slot cache: {error:?}");
+        }
+    }
 }

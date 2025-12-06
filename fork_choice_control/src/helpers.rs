@@ -6,16 +6,21 @@ use clock::Tick;
 use crossbeam_utils::sync::WaitGroup;
 use eth2_libp2p::GossipId;
 use execution_engine::{
+    BlockOrDataColumnSidecar, EngineGetBlobsParams, EngineGetBlobsV1Params, EngineGetBlobsV2Params,
     ExecutionServiceMessage, MockExecutionEngine, PayloadStatusV1, PayloadValidationStatus,
 };
 use fork_choice_store::{AttestationItem, AttestationOrigin};
 use futures::channel::mpsc::UnboundedReceiver;
 use helper_functions::misc;
+use pubkey_cache::PubkeyCache;
+use ssz::SszHash as _;
 use std_ext::ArcExt as _;
+use typenum::Unsigned as _;
 use types::{
     combined::{Attestation, AttesterSlashing, BeaconState, SignedBeaconBlock},
     config::Config,
     deneb::containers::{BlobIdentifier, BlobSidecar},
+    fulu::containers::DataColumnSidecar,
     nonstandard::{PayloadStatus, Phase, TimedPowBlock},
     phase0::{
         containers::Checkpoint,
@@ -34,6 +39,7 @@ use crate::{
 };
 
 pub struct Context<P: Preset> {
+    pubkey_cache: Arc<PubkeyCache>,
     controller: Option<Arc<TestController<P>>>,
     #[expect(
         dead_code,
@@ -60,14 +66,23 @@ impl<P: Preset> Drop for Context<P> {
 impl<P: Preset> Context<P> {
     fn with_config(config: Config) -> Result<Self> {
         let config = Arc::new(config);
-        let (genesis_state, _) = factory::min_genesis_state(&config)?;
+        let pubkey_cache = Arc::new(PubkeyCache::default());
+        let (genesis_state, _) = factory::min_genesis_state(&config, &pubkey_cache)?;
         let genesis_block = Arc::new(genesis::beacon_block(&genesis_state));
-        Ok(Self::new(config, genesis_block, genesis_state, true))
+
+        Ok(Self::new(
+            config,
+            pubkey_cache,
+            genesis_block,
+            genesis_state,
+            true,
+        ))
     }
 
     #[must_use]
     pub fn new(
         config: Arc<Config>,
+        pubkey_cache: Arc<PubkeyCache>,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
         optimistic_merge_block_validation: bool,
@@ -82,15 +97,23 @@ impl<P: Preset> Context<P> {
 
         let (p2p_tx, p2p_rx) = futures::channel::mpsc::unbounded();
 
+        let phase = anchor_block.phase();
+
         let (controller, mutator_handle) = TestController::with_p2p_tx(
             config,
+            pubkey_cache.clone_arc(),
             anchor_block,
             anchor_state,
             execution_engine.clone_arc(),
             p2p_tx,
         );
 
+        if phase.is_peerdas_activated() {
+            controller.on_store_sampling_columns((0..P::NumberOfColumns::U64).collect());
+        }
+
         Self {
+            pubkey_cache,
             controller: Some(controller),
             mutator_handle,
             p2p_rx,
@@ -152,8 +175,14 @@ impl<P: Preset> Context<P> {
         slot: Slot,
         graffiti: H256,
     ) -> (Arc<SignedBeaconBlock<P>>, Arc<BeaconState<P>>) {
-        factory::empty_block(self.config(), pre_state.clone_arc(), slot, graffiti)
-            .expect("block should be constructed successfully")
+        factory::empty_block(
+            self.config(),
+            &self.pubkey_cache,
+            pre_state.clone_arc(),
+            slot,
+            graffiti,
+        )
+        .expect("block should be constructed successfully")
     }
 
     #[must_use]
@@ -170,6 +199,7 @@ impl<P: Preset> Context<P> {
 
         factory::block_with_payload(
             self.config(),
+            &self.pubkey_cache,
             pre_state.clone_arc(),
             slot,
             graffiti,
@@ -187,8 +217,14 @@ impl<P: Preset> Context<P> {
     ) -> (Arc<SignedBeaconBlock<P>>, Arc<BeaconState<P>>) {
         let pre_state = pre_state.clone_arc();
 
-        factory::block_justifying_previous_epoch(self.config(), pre_state, epoch, graffiti)
-            .expect("block should be constructed successfully")
+        factory::block_justifying_previous_epoch(
+            self.config(),
+            &self.pubkey_cache,
+            pre_state,
+            epoch,
+            graffiti,
+        )
+        .expect("block should be constructed successfully")
     }
 
     #[must_use]
@@ -200,8 +236,15 @@ impl<P: Preset> Context<P> {
     ) -> (Arc<SignedBeaconBlock<P>>, Arc<BeaconState<P>>) {
         let pre_state = pre_state.clone_arc();
 
-        factory::block_justifying_current_epoch(self.config(), pre_state, epoch, graffiti, None)
-            .expect("block should be constructed successfully")
+        factory::block_justifying_current_epoch(
+            self.config(),
+            &self.pubkey_cache,
+            pre_state,
+            epoch,
+            graffiti,
+            None,
+        )
+        .expect("block should be constructed successfully")
     }
 
     #[must_use]
@@ -224,6 +267,7 @@ impl<P: Preset> Context<P> {
 
         factory::block_justifying_current_epoch(
             self.config(),
+            &self.pubkey_cache,
             pre_state,
             epoch,
             graffiti,
@@ -238,6 +282,11 @@ impl<P: Preset> Context<P> {
 
         self.controller().on_tick(tick);
         self.controller().wait_for_tasks();
+
+        // Some artifacts, like blob sidecars, require current slot state for validation.
+        let _unused = self
+            .controller()
+            .preprocessed_state_at_current_slot_blocking();
 
         if old_slot < new_slot {
             assert!(matches!(
@@ -266,6 +315,24 @@ impl<P: Preset> Context<P> {
 
         self.controller().on_gossip_blob_sidecar(
             Arc::new(blob_sidecar),
+            subnet_id,
+            GossipId::default(),
+            true,
+        );
+
+        self.controller().wait_for_tasks();
+        self.next_p2p_message()
+    }
+
+    pub fn on_data_column_sidecar(
+        &mut self,
+        data_column_sidecar: DataColumnSidecar<P>,
+    ) -> Option<P2pMessage<P>> {
+        let subnet_id =
+            misc::compute_subnet_for_data_column_sidecar(self.config(), data_column_sidecar.index);
+
+        self.controller().on_gossip_data_column_sidecar(
+            Arc::new(data_column_sidecar),
             subnet_id,
             GossipId::default(),
             true,
@@ -307,23 +374,67 @@ impl<P: Preset> Context<P> {
         self.on_valid_block(block);
 
         let block_root = block.message().hash_tree_root();
-        let identifiers = (0..blob_count)
-            .map(|index| BlobIdentifier {
-                block_root,
-                index: index.try_into().expect("usize should fit to u64"),
-            })
-            .collect::<Vec<_>>();
 
         match self.next_execution_service_message() {
-            Some(ExecutionServiceMessage::GetBlobs {
-                block: block_with_missing_blobs,
-                blob_identifiers,
-                peer_id: _,
-            }) => {
-                assert_eq!(blob_identifiers, identifiers);
-                assert_eq!(block_with_missing_blobs, *block);
-            }
+            Some(ExecutionServiceMessage::GetBlobs(params)) => match params {
+                EngineGetBlobsParams::V1(EngineGetBlobsV1Params {
+                    block: block_with_missing_blobs,
+                    blob_identifiers,
+                    peer_id: _,
+                }) => {
+                    let expected_identifiers = (0..blob_count)
+                        .map(|index| BlobIdentifier {
+                            block_root,
+                            index: index.try_into().expect("usize should fit to u64"),
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(blob_identifiers, expected_identifiers);
+                    assert_eq!(block_with_missing_blobs, *block);
+                }
+                EngineGetBlobsParams::V2(EngineGetBlobsV2Params {
+                    block_or_sidecar,
+                    data_column_identifiers,
+                }) => {
+                    assert!(data_column_identifiers
+                        .iter()
+                        .all(|id| id.block_root == block_root));
+                    assert!(!data_column_identifiers.is_empty());
+
+                    match block_or_sidecar {
+                        BlockOrDataColumnSidecar::Block(block_with_missing_blobs) => {
+                            assert_eq!(block_with_missing_blobs, *block)
+                        }
+                        BlockOrDataColumnSidecar::Sidecar(data_column_sidecar) => {
+                            assert_eq!(data_column_sidecar.signed_block_header, block.to_header())
+                        }
+                    }
+                }
+            },
             _ => panic!("ExecutionServiceMessage::GetBlobs expected"),
+        }
+    }
+
+    pub fn on_block_with_reconstructing_data_columns(&mut self, block: &Arc<SignedBeaconBlock<P>>) {
+        // If an optimistic beacon block is not accepted by the fork choice,
+        // then it will not be propagated in gossipsub before it is fully validated (e.g. block arrives before blob).
+        self.on_valid_block(block);
+
+        let block_root = block.message().hash_tree_root();
+
+        loop {
+            match self.next_p2p_message() {
+                Some(P2pMessage::PublishDataColumnSidecar(data_column_sidecar)) => {
+                    assert_eq!(
+                        data_column_sidecar
+                            .signed_block_header
+                            .message
+                            .hash_tree_root(),
+                        block_root
+                    );
+                }
+                Some(P2pMessage::Accept(_)) | None => break,
+                Some(other) => panic!("Unexpected P2P message: {other:?}"),
+            }
         }
     }
 
@@ -360,11 +471,12 @@ impl<P: Preset> Context<P> {
 
     pub fn on_notified_new_payload(
         &self,
+        beacon_block_root: H256,
         block_hash: ExecutionBlockHash,
         payload_status: PayloadStatusV1,
     ) {
         self.controller()
-            .on_notified_new_payload(block_hash, payload_status);
+            .on_notified_new_payload(beacon_block_root, block_hash, payload_status);
         self.controller().wait_for_tasks();
     }
 
@@ -385,6 +497,7 @@ impl<P: Preset> Context<P> {
         let execution_block_hash = Self::execution_block_hash(block);
 
         self.on_notified_new_payload(
+            block.message().hash_tree_root(),
             execution_block_hash,
             PayloadStatusV1 {
                 status: PayloadValidationStatus::Valid,
@@ -404,6 +517,7 @@ impl<P: Preset> Context<P> {
         latest_valid_block: Option<&SignedBeaconBlock<P>>,
     ) {
         self.on_notified_new_payload(
+            block.message().hash_tree_root(),
             Self::execution_block_hash(block),
             PayloadStatusV1 {
                 status: PayloadValidationStatus::Invalid,
@@ -531,7 +645,7 @@ impl<P: Preset> Context<P> {
     pub fn assert_head_notification_sent(&mut self) {
         assert!(matches!(
             self.next_p2p_message_verbose(),
-            Some(P2pMessage::HeadState(_)),
+            Some(P2pMessage::HeadChanged(_)),
         ));
     }
 
@@ -559,9 +673,14 @@ impl<P: Preset> Context<P> {
         epoch: Epoch,
         validator_index: ValidatorIndex,
     ) -> Option<P2pMessage<P>> {
-        let (attestation, subnet_id) =
-            factory::singular_attestation(self.config(), state.clone_arc(), epoch, validator_index)
-                .expect("attestation should be constructed successfully");
+        let (attestation, subnet_id) = factory::singular_attestation(
+            self.config(),
+            &self.pubkey_cache,
+            state.clone_arc(),
+            epoch,
+            validator_index,
+        )
+        .expect("attestation should be constructed successfully");
 
         self.controller()
             .on_singular_attestation(AttestationItem::unverified(
@@ -583,7 +702,7 @@ impl<P: Preset> Context<P> {
             let option = self.next_p2p_message_verbose();
 
             if let Some(
-                P2pMessage::FinalizedCheckpoint(_) | P2pMessage::HeadState(_) | P2pMessage::Stop,
+                P2pMessage::FinalizedCheckpoint(_) | P2pMessage::HeadChanged(_) | P2pMessage::Stop,
             ) = option
             {
                 continue;

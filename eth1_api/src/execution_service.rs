@@ -12,7 +12,7 @@ use futures::{
     channel::mpsc::{UnboundedReceiver, UnboundedSender},
     StreamExt as _,
 };
-use log::warn;
+use logging::warn_with_peers;
 use std_ext::ArcExt as _;
 use types::{
     combined::{ExecutionPayload, ExecutionPayloadParams},
@@ -23,7 +23,7 @@ use types::{
 
 use crate::{
     eth1_api::Eth1Api, messages::Eth1ApiToBlobFetcher, misc::ApiController,
-    spawn_exchange_capabilities_task,
+    spawn_exchange_capabilities_and_versions_task,
 };
 
 #[derive(Constructor)]
@@ -40,16 +40,12 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
         while let Some(message) = self.rx.next().await {
             match message {
                 ExecutionServiceMessage::ExchangeCapabilities => {
-                    spawn_exchange_capabilities_task(
+                    spawn_exchange_capabilities_and_versions_task(
                         self.api.clone_arc(),
                         &self.dedicated_executor,
                     );
                 }
-                ExecutionServiceMessage::GetBlobs {
-                    block,
-                    blob_identifiers,
-                    peer_id,
-                } => {
+                ExecutionServiceMessage::GetBlobs(params) => {
                     // Fetch blobs from the EL in a separate task concurrently.
                     // Blob fetching from the EL should not delay the 'engine_forkchoiceUpdated'
                     // call, if all required blobs are received via gossip in the meantime.
@@ -57,12 +53,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
                     // The message to trigger blob fetching should not be sent directly from
                     // `Mutator` to `ExecutionBlobFetcher`, as fetching must occur only after
                     // the execution payload is validated with the `engine_newPayload` call.
-                    Eth1ApiToBlobFetcher::GetBlobs {
-                        block,
-                        blob_identifiers,
-                        peer_id,
-                    }
-                    .send(&self.blob_fetcher_tx);
+                    Eth1ApiToBlobFetcher::GetBlobs(params).send(&self.blob_fetcher_tx);
                 }
                 ExecutionServiceMessage::NotifyForkchoiceUpdated {
                     head_eth1_block_hash,
@@ -93,7 +84,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
 
                     if let Some(sender) = sender {
                         if let Err(message) = sender.send(payload_id) {
-                            warn!(
+                            warn_with_peers!(
                                 "sending engine_forkchoiceUpdated result \
                                  failed because the receiver was dropped: {message:?}"
                             );
@@ -113,12 +104,13 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
                     match &response {
                         Ok(payload_status) => {
                             self.controller.on_notified_new_payload(
+                                beacon_block_root,
                                 payload.block_hash(),
                                 payload_status.clone(),
                             );
                         }
                         Err(error) => {
-                            warn!("engine_newPayload call failed: {error}");
+                            warn_with_peers!("engine_newPayload call failed: {error}");
 
                             features::log!(
                                 DebugEth1,
@@ -131,7 +123,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
 
                     if let Some(sender) = sender {
                         if let Err(message) = sender.send(response) {
-                            warn!(
+                            warn_with_peers!(
                                 "sending engine_newPayload result \
                                 failed because the receiver was dropped: {message:?}"
                             );
@@ -171,11 +163,11 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
         match response {
             Ok(response) => {
                 if response.payload_id.is_none() && payload_id_expected {
-                    warn!("payload_id expected but was none: {response:?}");
+                    warn_with_peers!("payload_id expected but was none: {response:?}");
                 }
 
                 if response.payload_status.status.is_invalid() {
-                    warn!(
+                    warn_with_peers!(
                         "engine_forkchoiceUpdated returned INVALID status \
                          (head_eth1_block_hash: {head_eth1_block_hash:?}, \
                           safe_eth1_block_hash: {safe_eth1_block_hash:?}, \
@@ -185,7 +177,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
                 }
 
                 if response.payload_status.status.is_syncing() {
-                    warn!(
+                    warn_with_peers!(
                         "engine_forkchoiceUpdated returned SYNCING status \
                          (head_eth1_block_hash: {head_eth1_block_hash:?}, \
                           safe_eth1_block_hash: {safe_eth1_block_hash:?}, \
@@ -197,7 +189,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
                 Some(response)
             }
             Err(error) => {
-                warn!("engine_forkchoiceUpdated call failed: {error}");
+                warn_with_peers!("engine_forkchoiceUpdated call failed: {error}");
                 None
             }
         }
@@ -214,7 +206,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
         let response = self.api.new_payload(payload, params).await?;
 
         if response.status.is_invalid() {
-            warn!(
+            warn_with_peers!(
                 "engine_newPayload returned INVALID status \
                  (beacon_block_root: {beacon_block_root:?}, \
                   block_number: {block_number}, \
@@ -224,7 +216,7 @@ impl<P: Preset, W: Wait> ExecutionService<P, W> {
         }
 
         if response.status.is_syncing() {
-            warn!(
+            warn_with_peers!(
                 "engine_newPayload returned SYNCING status \
                  (beacon_block_root: {beacon_block_root:?}, \
                   block_number: {block_number}, \

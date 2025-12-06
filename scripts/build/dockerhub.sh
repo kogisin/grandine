@@ -4,7 +4,11 @@ cross build \
     --bin grandine \
     --target x86_64-unknown-linux-gnu \
     --features default-networks \
-    --profile compact
+    --features tracing          \
+    --profile compact           \
+    --workspace                 \
+    --exclude zkvm_host         \
+    --exclude zkvm_guest_risc0
 
 docker buildx build \
     --file Dockerfile.cross \
@@ -17,7 +21,11 @@ cross build \
     --bin grandine \
     --target aarch64-unknown-linux-gnu \
     --features default-networks \
-    --profile compact
+    --features tracing          \
+    --profile compact           \
+    --workspace                 \
+    --exclude zkvm_host         \
+    --exclude zkvm_guest_risc0
 
 docker buildx build \
     --file Dockerfile.cross \

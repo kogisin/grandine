@@ -1,10 +1,16 @@
-use core::time::Duration;
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
+#[cfg(not(target_os = "zkvm"))]
 use im::{HashMap, OrdMap};
-use log::{info, warn};
+use logging::{info_with_peers, warn_with_peers};
 use parking_lot::{Mutex, MutexGuard};
+#[cfg(target_os = "zkvm")]
+use std::collections::{BTreeMap as OrdMap, HashMap};
 use std_ext::ArcExt as _;
 use tap::Pipe as _;
 use thiserror::Error;
@@ -32,6 +38,7 @@ enum CacheLockError {
 pub struct StateCache<P: Preset> {
     cache: Mutex<HashMap<H256, StateMapLock<P>>>,
     try_lock_timeout: Duration,
+    log_lock_timeouts: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -46,6 +53,7 @@ impl<P: Preset> StateCache<P> {
         Self {
             cache: Mutex::new(HashMap::new()),
             try_lock_timeout,
+            log_lock_timeouts: AtomicBool::new(false),
         }
     }
 
@@ -105,7 +113,7 @@ impl<P: Preset> StateCache<P> {
                     return Ok((state.clone_arc(), *rewards));
                 }
 
-                info!(
+                info_with_peers!(
                     "recomputing state cache entry for block {block_root:?} at slot {slot} \
                      because block rewards are missing",
                 );
@@ -160,7 +168,7 @@ impl<P: Preset> StateCache<P> {
                     return Ok(Some((state.clone_arc(), *rewards)));
                 }
 
-                info!(
+                info_with_peers!(
                     "recomputing state cache entry for block {block_root:?} at slot {slot} \
                      because block rewards are missing",
                 );
@@ -208,11 +216,27 @@ impl<P: Preset> StateCache<P> {
         lengths.into_iter().sum::<usize>().pipe(Ok)
     }
 
-    pub fn prune(&self, last_pruned_slot: Slot, preserved_states: &HashSet<H256>) -> Result<()> {
+    pub fn prune(
+        &self,
+        last_pruned_slot: Slot,
+        preserved_older_states: &HashSet<H256>,
+        pruned_newer_states: &HashSet<H256>,
+    ) -> Result<()> {
         for (block_root, state_map_lock) in self.all_state_map_locks()? {
-            let mut state_map = self.try_lock_map(&state_map_lock, block_root)?;
+            let mut state_map = match self.try_lock_map(&state_map_lock, block_root) {
+                Ok(state_map) => state_map,
+                Err(error) => {
+                    warn_with_peers!("failed to prune beacon state cache: {error:?}");
+                    continue;
+                }
+            };
 
-            if preserved_states.contains(&block_root) {
+            if preserved_older_states.contains(&block_root) {
+                continue;
+            }
+
+            if pruned_newer_states.contains(&block_root) {
+                state_map.clear();
                 continue;
             }
 
@@ -227,6 +251,11 @@ impl<P: Preset> StateCache<P> {
         });
 
         Ok(())
+    }
+
+    pub fn set_log_lock_timeouts(&self, log_lock_timeouts: bool) {
+        self.log_lock_timeouts
+            .store(log_lock_timeouts, Ordering::SeqCst);
     }
 
     fn all_state_map_locks(&self) -> Result<Vec<(H256, StateMapLock<P>)>> {
@@ -249,13 +278,15 @@ impl<P: Preset> StateCache<P> {
         self.try_lock_cache()?.get(&block_root).cloned().pipe(Ok)
     }
 
-    fn try_lock_cache(&self) -> Result<MutexGuard<HashMap<H256, StateMapLock<P>>>> {
+    fn try_lock_cache(&self) -> Result<MutexGuard<'_, HashMap<H256, StateMapLock<P>>>> {
         let timeout = self.try_lock_timeout;
 
         self.cache.try_lock_for(timeout).ok_or_else(|| {
             let error = CacheLockError::CacheLockTimeout { timeout };
 
-            warn!("{error:?}");
+            if self.log_lock_timeouts.load(Ordering::SeqCst) {
+                warn_with_peers!("{error:?}");
+            }
 
             anyhow!(error)
         })
@@ -274,7 +305,9 @@ impl<P: Preset> StateCache<P> {
                 timeout,
             };
 
-            warn!("{error:?}");
+            if self.log_lock_timeouts.load(Ordering::SeqCst) {
+                warn_with_peers!("{error:?}");
+            }
 
             anyhow!(error)
         })
@@ -366,7 +399,7 @@ mod tests {
     fn test_state_cache_prune() -> Result<()> {
         let cache = new_test_cache()?;
 
-        cache.prune(2, &[].into())?;
+        cache.prune(2, &[].into(), &[].into())?;
 
         assert_eq!(cache.before_or_at_slot(ROOT_1, 1)?, None);
         assert_eq!(cache.before_or_at_slot(ROOT_2, 2)?, None);
@@ -385,7 +418,7 @@ mod tests {
         cache.insert(ROOT_1, (state_at_slot(2), None))?;
         cache.insert(ROOT_2, (state_at_slot(2), None))?;
 
-        cache.prune(2, &[ROOT_1].into())?;
+        cache.prune(2, &[ROOT_1].into(), &[].into())?;
 
         assert_eq!(
             cache.before_or_at_slot(ROOT_1, 1)?,

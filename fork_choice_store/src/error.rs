@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use anyhow::Error as AnyhowError;
 use static_assertions::assert_eq_size;
 use thiserror::Error;
 use types::{
     bellatrix::containers::PowBlock,
     combined::{Attestation, SignedAggregateAndProof, SignedBeaconBlock},
     deneb::containers::BlobSidecar,
+    fulu::containers::DataColumnSidecar,
     phase0::primitives::{Slot, SubnetId, ValidatorIndex},
     preset::{Mainnet, Preset},
 };
@@ -38,7 +40,7 @@ pub enum Error<P: Preset> {
     },
     #[error("attestation votes for a checkpoint in the wrong epoch: {attestation:?}")]
     AttestationTargetsWrongEpoch { attestation: Arc<Attestation<P>> },
-    #[error("The current finalized_checkpoint is not an ancestor of the sidecar's block: {blob_sidecar:?}")]
+    #[error("the current finalized_checkpoint is not an ancestor of the sidecar's block: {blob_sidecar:?}")]
     BlobSidecarBlockNotADescendantOfFinalized { blob_sidecar: Arc<BlobSidecar<P>> },
     // TODO(feature/deneb): This is vague.
     //                      The validation that fails with this error actually checks commitments.
@@ -75,10 +77,60 @@ pub enum Error<P: Preset> {
         blob_sidecar: Arc<BlobSidecar<P>>,
         computed: ValidatorIndex,
     },
+    #[error("the current finalized_checkpoint is not an ancestor of the sidecar's block: {data_column_sidecar:?}")]
+    DataColumnSidecarBlockNotADescendantOfFinalized {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+    },
+    #[error("data column sidecar is invalid: {data_column_sidecar:?}")]
+    DataColumnSidecarInvalid {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+    },
+    // TODO(feature/deneb): This is vague.
+    //                      The validation that fails with this error actually checks commitments.
+    #[error("data column sidecar's kzg proofs is invalid: {data_column_sidecar:?} error: {error}")]
+    DataColumnSidecarInvalidKzgProofs {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        error: AnyhowError,
+    },
+    #[error("data column sidecar's block's parent is invalid: {data_column_sidecar:?}")]
+    DataColumnSidecarInvalidParentOfBlock {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+    },
+    #[error("data column sidecar contains invalid inclusion proof: {data_column_sidecar:?}")]
+    DataColumnSidecarInvalidInclusionProof {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+    },
+    #[error(
+        "data column sidecar is not newer than block parent \
+         (data_column_sidecar: {data_column_sidecar:?}, parent_slot: {parent_slot})"
+    )]
+    DataColumnSidecarNotNewerThanBlockParent {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        parent_slot: Slot,
+    },
+    #[error(
+        "data column sidecar published on incorrect subnet \
+         (data_column_sidecar: {data_column_sidecar:?}, expected: {expected}, actual: {actual})"
+    )]
+    DataColumnSidecarOnIncorrectSubnet {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        expected: SubnetId,
+        actual: SubnetId,
+    },
+    #[error(
+        "data column sidecar has incorrect proposer index \
+         (data_column_sidecar: {data_column_sidecar:?}, computed: {computed})"
+    )]
+    DataColumnSidecarProposerIndexMismatch {
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        computed: ValidatorIndex,
+    },
     #[error("aggregate and proof has invalid signature: {aggregate_and_proof:?}")]
     InvalidAggregateAndProofSignature {
         aggregate_and_proof: Arc<SignedAggregateAndProof<P>>,
     },
+    #[error("block has invalid execution payload")]
+    InvalidExecutionPayload,
     #[error("aggregate has invalid selection proof: {aggregate_and_proof:?}")]
     InvalidSelectionProof {
         aggregate_and_proof: Arc<SignedAggregateAndProof<P>>,

@@ -11,15 +11,19 @@ use allocator as _;
 use anyhow::Result;
 use clock::Tick;
 use criterion::{BatchSize, Criterion, Throughput};
+use dashmap::DashMap;
+use database::Database;
 use easy_ext::ext;
 use eth2_cache_utils::holesky::{self, CAPELLA_BEACON_STATE};
 use execution_engine::NullExecutionEngine;
+use fork_choice_control::{Storage, StorageMode, DEFAULT_ARCHIVAL_EPOCH_INTERVAL};
 use fork_choice_store::{
     ApplyBlockChanges, ApplyTickChanges, AttestationAction, AttestationItem, AttestationOrigin,
     BlockAction, DataAvailabilityPolicy, Store, StoreConfig, ValidAttestation,
 };
 use helper_functions::{misc, verifier::NullVerifier};
 use itertools::Itertools as _;
+use pubkey_cache::PubkeyCache;
 use std_ext::ArcExt as _;
 use transition_functions::{combined, unphased::StateRootPolicy};
 use types::{
@@ -56,6 +60,7 @@ impl Criterion {
         let store_before_next_ordinary_slot = LazyCell::new(|| {
             let run = || -> Result<_> {
                 let config = Arc::new(Config::holesky());
+                let pubkey_cache = Arc::new(PubkeyCache::default());
                 let anchor_state = CAPELLA_BEACON_STATE.force().clone_arc();
                 let anchor_slot = anchor_state.slot();
 
@@ -63,13 +68,25 @@ impl Criterion {
                     .into_iter()
                     .exactly_one()?;
 
+                let storage = Arc::new(Storage::new(
+                    config.clone_arc(),
+                    pubkey_cache.clone_arc(),
+                    Database::in_memory(),
+                    DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
+                    StorageMode::Standard,
+                ));
+
                 let mut store = Store::new(
                     config.clone_arc(),
+                    pubkey_cache.clone_arc(),
                     StoreConfig::default(),
                     anchor_block,
                     anchor_state,
+                    storage,
                     false,
                     false,
+                    [].into(),
+                    Arc::new(DashMap::new()),
                 );
 
                 for slot in (anchor_slot + 1)..=last_attestation_slot {
@@ -79,7 +96,7 @@ impl Criterion {
                         .into_iter()
                         .at_most_one()?
                     {
-                        process_block(&mut store, &block)?
+                        process_block(&pubkey_cache, &mut store, &block)?
                     }
 
                     for attestation in holesky::aggregate_attestations_by_slot(slot) {
@@ -138,7 +155,7 @@ impl Criterion {
     }
 }
 
-fn process_slot(store: &mut Store<impl Preset>, slot: Slot) -> Result<()> {
+fn process_slot<P: Preset>(store: &mut Store<P, Storage<P>>, slot: Slot) -> Result<()> {
     let Some(changes) = store.apply_tick(Tick::start_of_slot(slot))? else {
         panic!("tick at slot {slot} should be later than the current one")
     };
@@ -150,7 +167,11 @@ fn process_slot(store: &mut Store<impl Preset>, slot: Slot) -> Result<()> {
     Ok(())
 }
 
-fn process_block<P: Preset>(store: &mut Store<P>, block: &Arc<SignedBeaconBlock<P>>) -> Result<()> {
+fn process_block<P: Preset>(
+    pubkey_cache: &PubkeyCache,
+    store: &mut Store<P, Storage<P>>,
+    block: &Arc<SignedBeaconBlock<P>>,
+) -> Result<()> {
     let slot = block.message().slot();
 
     let block_action = store.validate_block(
@@ -167,7 +188,7 @@ fn process_block<P: Preset>(store: &mut Store<P>, block: &Arc<SignedBeaconBlock<
 
     if let ApplyBlockChanges::Reorganized { .. } = store.apply_block(chain_link)? {
         panic!("block at slot {slot} should not cause a reorganization")
-    };
+    }
 
     let checkpoint = store.unrealized_justified_checkpoint();
 
@@ -181,6 +202,7 @@ fn process_block<P: Preset>(store: &mut Store<P>, block: &Arc<SignedBeaconBlock<
         if checkpoint_state.slot() < checkpoint_slot {
             combined::process_slots(
                 store.chain_config(),
+                pubkey_cache,
                 checkpoint_state.make_mut(),
                 checkpoint_slot,
             )?;
@@ -193,7 +215,7 @@ fn process_block<P: Preset>(store: &mut Store<P>, block: &Arc<SignedBeaconBlock<
 }
 
 fn process_attestation<P: Preset>(
-    store: &mut Store<P>,
+    store: &mut Store<P, Storage<P>>,
     attestation: Arc<Attestation<P>>,
 ) -> Result<()> {
     let slot = attestation.data().slot;

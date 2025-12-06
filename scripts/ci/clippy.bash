@@ -24,7 +24,9 @@ options=(
     --package bls
     --package builder_api
     --package clock
+    --package data_dumper
     --package database
+    --package debug_info
     --package deposit_tree
     --package directories
     --package doppelganger_protection
@@ -56,6 +58,7 @@ options=(
     --package panics
     --package predefined_chains
     --package prometheus_metrics
+    --package pubkey_cache
     --package runtime
     --package serde_utils
     --package shuffling
@@ -73,6 +76,7 @@ options=(
     --package types
     --package validator
     --package validator_key_cache
+    --package validator_statistics
 
     # The `--` lets callers pass `--deny warnings` to the script.
     # Lint settings must be specified after a `--`.
@@ -86,6 +90,9 @@ options=(
     # until that was fixed in <https://github.com/rust-lang/rust-clippy/pull/12730>,
     # which somehow did make into Rust 1.80.0 despite being merged in the same release cycle.
     --allow clippy::lint_groups_priority
+
+    # TODO: find and fix these warnings
+    --allow clippy::large-stack-arrays
 )
 
 exec cargo clippy "${options[@]}" "$@"

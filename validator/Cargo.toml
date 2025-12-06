@@ -15,10 +15,12 @@ bls = { workspace = true }
 builder_api = { workspace = true }
 clock = { workspace = true }
 constant_time_eq = { workspace = true }
+debug_info = { workspace = true }
 derivative = { workspace = true }
 derive_more = { workspace = true }
 directories = { workspace = true }
 doppelganger_protection = { workspace = true }
+eip_7594 = { workspace = true }
 eth1_api = { workspace = true }
 eth2_libp2p = { workspace = true }
 features = { workspace = true }
@@ -32,13 +34,14 @@ http_api_utils = { workspace = true }
 itertools = { workspace = true }
 keymanager = { workspace = true }
 liveness_tracker = { workspace = true }
-log = { workspace = true }
+logging = { workspace = true }
 once_cell = { workspace = true }
 operation_pools = { workspace = true }
 p2p = { workspace = true }
 prometheus_metrics = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_utils = { workspace = true }
 signer = { workspace = true }
@@ -51,16 +54,24 @@ tap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
+tracing = { workspace = true }
 try_from_iterator = { workspace = true }
 tynm = { workspace = true }
 typenum = { workspace = true }
 types = { workspace = true }
+validator_statistics = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+eth2_cache_utils = { workspace = true }
 factory = { workspace = true }
+hex-literal = { workspace = true }
 interop = { workspace = true }
+pubkey_cache = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+
+[features]
+eth2-cache = []

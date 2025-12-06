@@ -1,9 +1,5 @@
-#![allow(
-    clippy::allow_attributes,
-    reason = "allow_attributes lint trigger from some derive macros. \
-              See <https://github.com/rust-lang/rust-clippy/issues/13349>."
-)]
 use std::{
+    collections::HashSet,
     sync::{mpsc::Sender, Arc},
     time::Instant,
 };
@@ -15,22 +11,30 @@ use execution_engine::PayloadStatusV1;
 use fork_choice_store::{
     AggregateAndProofOrigin, AttestationAction, AttestationItem, AttestationValidationError,
     AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockOrigin,
-    ChainLink,
+    ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin,
 };
-use log::debug;
+use logging::debug_with_peers;
 use serde::Serialize;
+use tracing::Span;
 use types::{
     combined::{Attestation, BeaconState, SignedAggregateAndProof, SignedBeaconBlock},
     deneb::containers::{BlobIdentifier, BlobSidecar},
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar},
+        primitives::ColumnIndex,
+    },
     phase0::{
         containers::Checkpoint,
-        primitives::{DepositIndex, ExecutionBlockHash, Slot, ValidatorIndex, H256},
+        primitives::{ExecutionBlockHash, Slot, ValidatorIndex, H256},
     },
     preset::Preset,
 };
 
 use crate::{
-    misc::{MutatorRejectionReason, VerifyAggregateAndProofResult, VerifyAttestationResult},
+    misc::{
+        MutatorRejectionReason, ProcessingTimings, VerifyAggregateAndProofResult,
+        VerifyAttestationResult,
+    },
     unbounded_sink::UnboundedSink,
 };
 
@@ -50,13 +54,19 @@ pub enum AttestationVerifierMessage<P: Preset, W> {
         wait_group: W,
         attestation: AttestationItem<P, GossipId>,
     },
+    AttestationBatch {
+        wait_group: W,
+        attestations: Vec<AttestationItem<P, GossipId>>,
+    },
     Stop,
 }
 
 impl<P: Preset, W> AttestationVerifierMessage<P, W> {
     pub fn send(self, tx: &impl UnboundedSink<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to attestation verifier failed because the receiver was dropped");
+            debug_with_peers!(
+                "send to attestation verifier failed because the receiver was dropped"
+            );
         }
     }
 }
@@ -74,10 +84,11 @@ pub enum MutatorMessage<P: Preset, W> {
     },
     Block {
         wait_group: W,
-        result: Result<BlockAction<P>>,
+        result: Box<Result<BlockAction<P>>>,
         origin: BlockOrigin,
-        submission_time: Instant,
-        rejected_block_root: Option<H256>,
+        processing_timings: ProcessingTimings,
+        block_root: H256,
+        tracing_span: Span,
     },
     AggregateAndProof {
         wait_group: W,
@@ -121,9 +132,22 @@ pub enum MutatorMessage<P: Preset, W> {
         checkpoint: Checkpoint,
         checkpoint_state: Option<Arc<BeaconState<P>>>,
     },
+    DataColumnSidecar {
+        wait_group: W,
+        result: Result<DataColumnSidecarAction<P>>,
+        origin: DataColumnSidecarOrigin,
+        data_column_identifier: DataColumnIdentifier,
+        block_seen: bool,
+        submission_time: Instant,
+    },
     FinishedPersistingBlobSidecars {
         wait_group: W,
         persisted_blob_ids: Vec<BlobIdentifier>,
+    },
+    FinishedPersistingDataColumnSidecars {
+        wait_group: W,
+        persisted_data_column_ids: Vec<DataColumnIdentifier>,
+        slot: Slot,
     },
     PreprocessedBeaconState {
         state: Arc<BeaconState<P>>,
@@ -134,6 +158,7 @@ pub enum MutatorMessage<P: Preset, W> {
     },
     NotifiedNewPayload {
         wait_group: W,
+        beacon_block_root: H256,
         execution_block_hash: ExecutionBlockHash,
         payload_status: PayloadStatusV1,
     },
@@ -150,6 +175,15 @@ pub enum MutatorMessage<P: Preset, W> {
     Stop {
         save_to_storage: bool,
     },
+    StoreSamplingColumns {
+        sampling_columns: HashSet<ColumnIndex>,
+    },
+    ReconstructedMissingColumns {
+        wait_group: W,
+        block_root: H256,
+        block: Arc<SignedBeaconBlock<P>>,
+        data_column_sidecars: Vec<Arc<DataColumnSidecar<P>>>,
+    },
 }
 
 impl<P: Preset, W> MutatorMessage<P, W> {
@@ -158,24 +192,25 @@ impl<P: Preset, W> MutatorMessage<P, W> {
         if tx.send(self).is_err() {
             // This can happen if the mutator thread exits early due to failure or if a task
             // is completed after the `Controller` is dropped and stops the mutator thread.
-            debug!("send to mutator failed because the receiver was dropped");
+            debug_with_peers!("send to mutator failed because the receiver was dropped");
         }
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(bound = "")]
 #[cfg_attr(test, derive(Derivative))]
-#[cfg_attr(test, derivative(Debug(bound = "")))]
 pub enum P2pMessage<P: Preset> {
     Slot(Slot),
     Accept(GossipId),
     Ignore(GossipId),
     PublishBlobSidecar(Arc<BlobSidecar<P>>),
+    PublishDataColumnSidecar(Arc<DataColumnSidecar<P>>),
+    PenalizePeer(PeerId, MutatorRejectionReason),
     Reject(Option<GossipId>, MutatorRejectionReason),
     BlockNeeded(H256, Option<PeerId>),
     FinalizedCheckpoint(Checkpoint),
-    HeadState(#[cfg_attr(test, derivative(Debug = "ignore"))] Arc<BeaconState<P>>),
+    HeadChanged(H256),
     Stop,
 }
 
@@ -183,28 +218,33 @@ impl<P: Preset> P2pMessage<P> {
     pub(crate) fn send(self, tx: &impl UnboundedSink<Self>) {
         // Don't log the value because it can contain entire `BeaconState`s.
         if tx.unbounded_send(self).is_err() {
-            debug!("send to p2p failed because the receiver was dropped");
+            debug_with_peers!("send to p2p failed because the receiver was dropped");
         }
     }
 }
 
-pub enum PoolMessage {
+pub enum PoolMessage<P: Preset, W> {
     Slot(Slot),
     Tick(Tick),
     Stop,
+    ReconstructDataColumns {
+        wait_group: W,
+        block_root: H256,
+        block: Arc<SignedBeaconBlock<P>>,
+        slot: Slot,
+    },
 }
 
-impl PoolMessage {
+impl<P: Preset, W> PoolMessage<P, W> {
     pub(crate) fn send(self, tx: &impl UnboundedSink<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to operation pools failed because the receiver was dropped");
+            debug_with_peers!("send to operation pools failed because the receiver was dropped");
         }
     }
 }
 
 pub enum ValidatorMessage<P: Preset, W> {
     Tick(W, Tick),
-    FinalizedEth1Data(DepositIndex, Option<DepositIndex>),
     Head(W, ChainLink<P>),
     ValidAttestation(W, Arc<Attestation<P>>),
     PrepareExecutionPayload(Slot, ExecutionBlockHash, ExecutionBlockHash),
@@ -215,7 +255,7 @@ impl<P: Preset, W> ValidatorMessage<P, W> {
     pub(crate) fn send(self, tx: &impl UnboundedSink<Self>) {
         // Don't log the value because it can contain entire `BeaconState`s.
         if tx.unbounded_send(self).is_err() {
-            debug!("send to validator failed because the receiver was dropped");
+            debug_with_peers!("send to validator failed because the receiver was dropped");
         }
     }
 }
@@ -228,7 +268,7 @@ pub enum SubnetMessage<W> {
 impl<W> SubnetMessage<W> {
     pub(crate) fn send(self, tx: &impl UnboundedSink<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to subnet service failed because the receiver was dropped");
+            debug_with_peers!("send to subnet service failed because the receiver was dropped");
         }
     }
 }
@@ -242,7 +282,7 @@ pub enum SyncMessage<P: Preset> {
 impl<P: Preset> SyncMessage<P> {
     pub(crate) fn send(self, tx: &impl UnboundedSink<Self>) {
         if let Err(message) = tx.unbounded_send(self) {
-            debug!(
+            debug_with_peers!(
                 "send to block sync service failed because the receiver was dropped: {message:?}"
             );
         }

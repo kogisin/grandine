@@ -11,22 +11,27 @@ anyhow = { workspace = true }
 arithmetic = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
+binary_utils ={ workspace = true }
 block_producer = { workspace = true }
 bls = { workspace = true }
 builder_api = { workspace = true }
 byteorder = { workspace = true }
+derive_more = { workspace = true }
 enum-iterator = { workspace = true }
+eip_7594 = { workspace = true }
 eth1_api = { workspace = true }
 eth2_libp2p = { workspace = true }
 features = { workspace = true }
 fork_choice_control = { workspace = true }
+fork_choice_store = { workspace = true }
 futures = { workspace = true }
 genesis = { workspace = true }
 helper_functions = { workspace = true }
 http_api_utils = { workspace = true }
 itertools = { workspace = true }
+kzg_utils = { workspace = true }
 liveness_tracker = { workspace = true }
-log = { workspace = true }
+logging ={ workspace = true }
 mediatype = { workspace = true }
 mime = { workspace = true }
 operation_pools = { workspace = true }
@@ -47,17 +52,20 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tower-http = { workspace = true }
+tracing = { workspace = true }
 transition_functions = { workspace = true }
 try_from_iterator = { workspace = true }
 typenum = { workspace = true }
 types = { workspace = true }
 unwrap_none = { workspace = true }
 validator = { workspace = true }
+validator_statistics = { workspace = true }
 
 [dev-dependencies]
 attestation_verifier = { workspace = true }
 clock = { workspace = true }
 crossbeam-utils = { workspace = true }
+dashmap = { workspace = true }
 database = { workspace = true }
 dedicated_executor = { workspace = true }
 deposit_tree = { workspace = true }
@@ -72,6 +80,7 @@ keymanager = { workspace = true }
 num_cpus = { workspace = true }
 once_cell = { workspace = true }
 predefined_chains = { workspace = true }
+pubkey_cache = { workspace = true }
 reqwest = { workspace = true }
 signer = { workspace = true }
 slashing_protection = { workspace = true }

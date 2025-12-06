@@ -1,13 +1,18 @@
 use core::ops::{AddAssign as _, Bound, SubAssign as _};
 use std::{
     backtrace::Backtrace,
-    collections::binary_heap::{BinaryHeap, PeekMut},
+    collections::{
+        binary_heap::{BinaryHeap, PeekMut},
+        HashSet as StdHashSet,
+    },
     sync::{Arc, OnceLock},
 };
 
 use anyhow::{anyhow, bail, ensure, Result};
 use arithmetic::NonZeroExt as _;
 use clock::Tick;
+use dashmap::DashMap;
+use eip_7594::{verify_data_column_sidecar, verify_kzg_proofs, verify_sidecar_inclusion_proof};
 use execution_engine::ExecutionEngine;
 use features::Feature;
 use hash_hasher::HashedMap;
@@ -21,11 +26,13 @@ use helper_functions::{
 };
 use im::{hashmap, hashmap::HashMap, ordmap, vector, HashSet, OrdMap, Vector};
 use itertools::{izip, Either, EitherOrBoth, Itertools as _};
-use log::{error, warn};
+use logging::{error_with_peers, info_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
-use ssz::SszHash as _;
+use pubkey_cache::PubkeyCache;
+use ssz::{ContiguousList, SszHash as _};
 use std_ext::ArcExt as _;
 use tap::Pipe as _;
+use tracing::instrument;
 use transition_functions::{
     combined,
     unphased::{self, ProcessSlots, StateRootPolicy},
@@ -42,10 +49,14 @@ use types::{
         primitives::{BlobIndex, KzgCommitment},
     },
     electra::containers::IndexedAttestation as ElectraIndexedAttestation,
-    nonstandard::{BlobSidecarWithId, PayloadStatus, Phase, WithStatus},
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar},
+        primitives::ColumnIndex,
+    },
+    nonstandard::{BlobSidecarWithId, DataColumnSidecarWithId, PayloadStatus, Phase, WithStatus},
     phase0::{
         consts::{ATTESTATION_PROPAGATION_SLOT_RANGE, GENESIS_EPOCH, GENESIS_SLOT},
-        containers::{AttestationData, Checkpoint},
+        containers::{AttestationData, BeaconBlockHeader, Checkpoint},
         primitives::{Epoch, ExecutionBlockHash, Gwei, Slot, ValidatorIndex, H256},
     },
     preset::Preset,
@@ -55,29 +66,33 @@ use unwrap_none::UnwrapNone as _;
 
 use crate::{
     blob_cache::BlobCache,
+    data_column_cache::DataColumnCache,
     error::Error,
     misc::{
         AggregateAndProofAction, AggregateAndProofOrigin, ApplyBlockChanges, ApplyTickChanges,
         AttestationAction, AttestationItem, AttestationValidationError, AttesterSlashingOrigin,
         BlobSidecarAction, BlobSidecarOrigin, BlockAction, BranchPoint, ChainLink,
-        DataAvailabilityPolicy, Difference, DifferenceAtLocation, DissolvedDifference,
-        LatestMessage, Location, PartialAttestationAction, PartialBlockAction, PayloadAction,
-        Score, SegmentId, UnfinalizedBlock, ValidAttestation,
+        DataAvailabilityPolicy, DataColumnSidecarAction, DataColumnSidecarOrigin, Difference,
+        DifferenceAtLocation, DissolvedDifference, LatestMessage, Location,
+        PartialAttestationAction, PartialBlockAction, PayloadAction, Score, SegmentId, Storage,
+        UnfinalizedBlock, ValidAttestation,
     },
     segment::{Position, Segment},
     state_cache_processor::StateCacheProcessor,
     store_config::StoreConfig,
     supersets::MultiPhaseAggregateAndProofSets as AggregateAndProofSupersets,
     validations::validate_merge_block,
-    StateCacheError,
+    AttestationOrigin,
 };
 
 /// [`Store`] from the Fork Choice specification.
 ///
 /// [`Store`]: https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/phase0/fork-choice.md#store
+#[expect(clippy::type_complexity)]
 #[derive(Clone)]
-pub struct Store<P: Preset> {
+pub struct Store<P: Preset, S: Storage<P>> {
     chain_config: Arc<ChainConfig>,
+    pubkey_cache: Arc<PubkeyCache>,
     store_config: StoreConfig,
     // The fork choice rule does not need a precise timestamp.
     tick: Tick,
@@ -205,23 +220,39 @@ pub struct Store<P: Preset> {
     aggregate_and_proof_supersets: Arc<AggregateAndProofSupersets<P>>,
     accepted_blob_sidecars:
         HashMap<(Slot, ValidatorIndex, BlobIndex), HashMap<H256, KzgCommitment>>,
+    accepted_data_column_sidecars: HashMap<
+        (Slot, ValidatorIndex, ColumnIndex),
+        HashMap<H256, ContiguousList<KzgCommitment, P::MaxBlobCommitmentsPerBlock>>,
+    >,
     blob_cache: BlobCache<P>,
     state_cache: Arc<StateCacheProcessor<P>>,
+    storage: Arc<S>,
+    data_column_cache: DataColumnCache<P>,
     rejected_block_roots: HashSet<H256>,
     finished_initial_forward_sync: bool,
     finished_back_sync: bool,
+    blacklisted_blocks: StdHashSet<H256>,
+    sampling_columns: StdHashSet<ColumnIndex>,
+    sidecars_construction_started: Arc<DashMap<H256, Slot>>,
+    delayed_block_at_slot: HashMap<Slot, H256>,
+    requested_blobs_from_el: HashMap<H256, Slot>,
 }
 
-impl<P: Preset> Store<P> {
+impl<P: Preset, S: Storage<P>> Store<P, S> {
     /// [`get_forkchoice_store`](https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/phase0/fork-choice.md#get_forkchoice_store)
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
         store_config: StoreConfig,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
+        storage: Arc<S>,
         finished_initial_forward_sync: bool,
         finished_back_sync: bool,
+        mut blacklisted_blocks: StdHashSet<H256>,
+        sidecars_construction_started: Arc<DashMap<H256, Slot>>,
     ) -> Self {
         let block_root = anchor_block.message().hash_tree_root();
         let state_root = anchor_state.hash_tree_root();
@@ -254,8 +285,11 @@ impl<P: Preset> Store<P> {
         let validator_count = anchor_state.validators().len_usize();
         let latest_messages = core::iter::repeat_n(None, validator_count).collect();
 
+        blacklisted_blocks.extend(chain_config.blacklisted_blocks.iter());
+
         Self {
             chain_config,
+            pubkey_cache,
             store_config,
             tick: Tick::start_of_slot(anchor_state.slot()),
             justified_checkpoint: checkpoint,
@@ -277,13 +311,21 @@ impl<P: Preset> Store<P> {
             execution_payload_locations: hashmap! {},
             aggregate_and_proof_supersets: Arc::new(AggregateAndProofSupersets::new()),
             accepted_blob_sidecars: HashMap::default(),
+            accepted_data_column_sidecars: HashMap::default(),
             blob_cache: BlobCache::default(),
             state_cache: Arc::new(StateCacheProcessor::new(
                 store_config.state_cache_lock_timeout,
             )),
+            storage,
+            data_column_cache: DataColumnCache::default(),
             rejected_block_roots: HashSet::default(),
             finished_initial_forward_sync,
             finished_back_sync,
+            blacklisted_blocks,
+            sampling_columns: StdHashSet::default(),
+            sidecars_construction_started,
+            delayed_block_at_slot: HashMap::default(),
+            requested_blobs_from_el: HashMap::default(),
         }
     }
 
@@ -334,6 +376,14 @@ impl<P: Preset> Store<P> {
         blob_id: BlobIdentifier,
     ) -> Option<Arc<BlobSidecar<P>>> {
         self.blob_cache.get(blob_id)
+    }
+
+    #[must_use]
+    pub fn cached_data_column_sidecar_by_id(
+        &self,
+        data_column_id: DataColumnIdentifier,
+    ) -> Option<Arc<DataColumnSidecar<P>>> {
+        self.data_column_cache.get(data_column_id)
     }
 
     #[must_use]
@@ -436,18 +486,27 @@ impl<P: Preset> Store<P> {
     }
 
     #[must_use]
-    pub fn exibits_equivocation_on_blobs(
+    pub fn exhibits_equivocation_on_blobs(
         &self,
         slot: Slot,
         proposer_index: ValidatorIndex,
         block_root: H256,
     ) -> bool {
-        self.blob_cache
-            .exibits_equivocation(slot, proposer_index, block_root)
+        if self
+            .chain_config()
+            .phase_at_slot::<P>(slot)
+            .is_peerdas_activated()
+        {
+            self.data_column_cache
+                .exhibits_equivocation(slot, proposer_index, block_root)
+        } else {
+            self.blob_cache
+                .exhibits_equivocation(slot, proposer_index, block_root)
+        }
     }
 
     #[must_use]
-    pub fn exibits_equivocation_on_blocks(
+    pub fn exhibits_equivocation_on_blocks(
         &self,
         slot: Slot,
         proposer_index: ValidatorIndex,
@@ -958,7 +1017,7 @@ impl<P: Preset> Store<P> {
                     {
                         // `Backtrace::force_capture` can be costly and a warning may be excessive,
                         // but this is controlled by a `Feature` that should be disabled by default.
-                        warn!(
+                        warn_with_peers!(
                             "processing slots for beacon state not found in state cache before state transition \
                             (block root: {block_root:?}, parent block root: {:?}, from slot {} to {})\n{}",
                             parent.block_root,
@@ -983,7 +1042,7 @@ impl<P: Preset> Store<P> {
                 if let Some(body) = block
                     .message()
                     .body()
-                    .post_bellatrix()
+                    .with_execution_payload()
                     .filter(|body| predicates::is_merge_transition_block(&state, *body))
                 {
                     match validate_merge_block(&self.chain_config, block, body, &execution_engine)?
@@ -997,6 +1056,7 @@ impl<P: Preset> Store<P> {
             // > Check the block is valid and compute the post-state
             combined::custom_state_transition(
                 &self.chain_config,
+                &self.pubkey_cache,
                 state.make_mut(),
                 block,
                 ProcessSlots::IfNeeded,
@@ -1010,6 +1070,7 @@ impl<P: Preset> Store<P> {
         })
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn validate_gossip_rules(
         &self,
         block: &Arc<SignedBeaconBlock<P>>,
@@ -1057,6 +1118,11 @@ impl<P: Preset> Store<P> {
         state_transition_for_gossip: impl FnOnce(&ChainLink<P>) -> Result<Option<BlockAction<P>>>,
     ) -> Result<Option<BlockAction<P>>> {
         let block_root = block.message().hash_tree_root();
+
+        if self.blacklisted_blocks.contains(&block_root) {
+            bail!("blacklisted beacon block: (block root: {block_root:?})");
+        }
+
         let block_action = self.validate_gossip_rules(block, block_root);
 
         if let Some(action) = block_action {
@@ -1072,6 +1138,7 @@ impl<P: Preset> Store<P> {
         state_transition_for_gossip(parent)
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub fn validate_block_with_custom_state_transition(
         &self,
         block: &Arc<SignedBeaconBlock<P>>,
@@ -1082,6 +1149,11 @@ impl<P: Preset> Store<P> {
         ) -> Result<(Arc<BeaconState<P>>, Option<BlockAction<P>>)>,
     ) -> Result<BlockAction<P>> {
         let block_root = block.message().hash_tree_root();
+
+        if self.blacklisted_blocks.contains(&block_root) {
+            bail!("blacklisted beacon block: (block root: {block_root:?})");
+        }
+
         let block_action = self.validate_gossip_rules(block, block_root);
 
         if let Some(action) = block_action {
@@ -1102,9 +1174,14 @@ impl<P: Preset> Store<P> {
 
         if self.should_check_data_availability_at_slot(block.message().slot())
             && data_availability_policy.check()
-            && !self.indices_of_missing_blobs(block).is_empty()
         {
-            return Ok(BlockAction::DelayUntilBlobs(block.clone_arc()));
+            if state.phase().is_peerdas_activated() {
+                if !self.indices_of_missing_data_columns(block).is_empty() {
+                    return Ok(BlockAction::DelayUntilBlobs(block.clone_arc(), state));
+                }
+            } else if !self.indices_of_missing_blobs(block).is_empty() {
+                return Ok(BlockAction::DelayUntilBlobs(block.clone_arc(), state));
+            }
         }
 
         let attester_slashing_results = block
@@ -1180,6 +1257,7 @@ impl<P: Preset> Store<P> {
         Ok(BlockAction::Accept(chain_link, attester_slashing_results))
     }
 
+    #[expect(clippy::too_many_lines)]
     pub fn validate_aggregate_and_proof<I>(
         &self,
         aggregate_and_proof: Arc<SignedAggregateAndProof<P>>,
@@ -1301,20 +1379,24 @@ impl<P: Preset> Store<P> {
 
         if !signature_validated && origin.verify_signatures() {
             let chain_config = &self.chain_config;
+            let pubkey = self.pubkey_cache.get_or_insert(*public_key)?;
 
             // > The `aggregate_and_proof.selection_proof` is a valid signature of the
             // > `aggregate.data.slot` by the validator with index
             // > `aggregate_and_proof.aggregator_index`.
-            if let Err(error) =
-                slot.verify(chain_config, &target_state, selection_proof, public_key)
-            {
+            if let Err(error) = slot.verify(
+                chain_config,
+                &target_state,
+                selection_proof,
+                pubkey.clone_arc(),
+            ) {
                 bail!(error.context(Error::InvalidSelectionProof {
                     aggregate_and_proof,
                 }));
             }
 
             // > The aggregator signature, `signed_aggregate_and_proof.signature`, is valid.
-            if let Err(error) = message.verify(chain_config, &target_state, signature, public_key) {
+            if let Err(error) = message.verify(chain_config, &target_state, signature, pubkey) {
                 bail!(error.context(Error::InvalidAggregateAndProofSignature {
                     aggregate_and_proof,
                 }));
@@ -1337,6 +1419,7 @@ impl<P: Preset> Store<P> {
         })
     }
 
+    #[expect(clippy::too_many_lines)]
     pub fn validate_attestation<I>(
         &self,
         attestation: AttestationItem<P, I>,
@@ -1357,11 +1440,11 @@ impl<P: Preset> Store<P> {
             }
             Err(source) => {
                 return Err(AttestationValidationError::Other {
-                    attestation,
+                    attestation: Box::new(attestation),
                     source,
                 })
             }
-        };
+        }
 
         let index = misc::committee_index(&attestation.item);
 
@@ -1391,7 +1474,7 @@ impl<P: Preset> Store<P> {
             if attestation.item.count_aggregation_bits() != 1 {
                 return Err(
                     AttestationValidationError::SingularAttestationHasMultipleAggregationBitsSet {
-                        attestation,
+                        attestation: Box::new(attestation),
                     },
                 );
             }
@@ -1411,10 +1494,26 @@ impl<P: Preset> Store<P> {
 
             state.clone_arc()
         } else {
-            let Some(state) = self.state_before_or_at_slot(
-                target.root,
-                misc::compute_start_slot_at_epoch::<P>(target.epoch),
-            ) else {
+            let mut target_state = self
+                .state_cache
+                .before_or_at_slot_in_cache_only(target.root, slot);
+
+            if let AttestationOrigin::Block(block_root) = attestation.origin {
+                if target_state.is_none() {
+                    // During state transition, all block attestations are validated against block state.
+                    // Same logic applies here.
+                    target_state = self
+                        .chain_link(block_root)
+                        .map(|chain_link| chain_link.state(self));
+                }
+            }
+
+            let Some(state) = target_state.or_else(|| {
+                self.state_before_or_at_slot(
+                    target.root,
+                    misc::compute_start_slot_at_epoch::<P>(target.epoch),
+                )
+            }) else {
                 return Ok(AttestationAction::DelayUntilBlock(attestation, target.root));
             };
 
@@ -1434,7 +1533,7 @@ impl<P: Preset> Store<P> {
                     Ok(subnet) => subnet,
                     Err(source) => {
                         return Err(AttestationValidationError::Other {
-                            attestation,
+                            attestation: Box::new(attestation),
                             source,
                         })
                     }
@@ -1444,7 +1543,7 @@ impl<P: Preset> Store<P> {
             if actual != expected {
                 return Err(
                     AttestationValidationError::SingularAttestationOnIncorrectSubnet {
-                        attestation,
+                        attestation: Box::new(attestation),
                         expected,
                         actual,
                     },
@@ -1461,7 +1560,7 @@ impl<P: Preset> Store<P> {
             Err(source) => {
                 return Err(AttestationValidationError::Other {
                     source,
-                    attestation,
+                    attestation: Box::new(attestation),
                 })
             }
         };
@@ -1569,7 +1668,7 @@ impl<P: Preset> Store<P> {
             }
 
             return Ok(PartialAttestationAction::DelayUntilBlock(target.root));
-        };
+        }
 
         // > Attestations must be for a known block.
         // > If block is unknown, delay consideration until the block is found
@@ -1625,6 +1724,7 @@ impl<P: Preset> Store<P> {
                 if validate_indexed {
                     predicates::validate_constructed_indexed_attestation(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         target_state,
                         &indexed_attestation,
                         SingleVerifier,
@@ -1642,6 +1742,7 @@ impl<P: Preset> Store<P> {
                 if validate_indexed {
                     predicates::validate_constructed_indexed_attestation(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         target_state,
                         &indexed_attestation,
                         SingleVerifier,
@@ -1659,6 +1760,7 @@ impl<P: Preset> Store<P> {
                 if validate_indexed {
                     predicates::validate_constructed_indexed_attestation(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         target_state,
                         &indexed_attestation,
                         SingleVerifier,
@@ -1682,12 +1784,14 @@ impl<P: Preset> Store<P> {
                 if origin.verify_signatures() {
                     unphased::validate_attester_slashing(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         self.justified_state(),
                         attester_slashing,
                     )
                 } else {
                     unphased::validate_attester_slashing_with_verifier(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         self.justified_state(),
                         attester_slashing,
                         NullVerifier,
@@ -1698,12 +1802,14 @@ impl<P: Preset> Store<P> {
                 if origin.verify_signatures() {
                     unphased::validate_attester_slashing(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         self.justified_state(),
                         attester_slashing,
                     )
                 } else {
                     unphased::validate_attester_slashing_with_verifier(
                         &self.chain_config,
+                        &self.pubkey_cache,
                         self.justified_state(),
                         attester_slashing,
                         NullVerifier,
@@ -1721,7 +1827,7 @@ impl<P: Preset> Store<P> {
         block_seen: bool,
         origin: &BlobSidecarOrigin,
         parent_info: impl FnOnce() -> Option<(Arc<SignedBeaconBlock<P>>, PayloadStatus)>,
-        state_fn: impl FnOnce() -> Result<Arc<BeaconState<P>>>,
+        state_fn: impl FnOnce() -> Option<Arc<BeaconState<P>>>,
     ) -> Result<BlobSidecarAction<P>> {
         let block_header = blob_sidecar.signed_block_header.message;
         let block_root = block_header.hash_tree_root();
@@ -1735,8 +1841,7 @@ impl<P: Preset> Store<P> {
         // [REJECT] The sidecar's index is consistent with MAX_BLOBS_PER_BLOCK -- i.e. blob_sidecar.index < MAX_BLOBS_PER_BLOCK.
         let max_blobs_per_block = self
             .chain_config()
-            .phase_at_slot::<P>(block_header.slot)
-            .max_blobs_per_block(&self.chain_config);
+            .max_blobs_per_block(Self::epoch_at_slot(block_header.slot));
 
         ensure!(
             blob_sidecar.index < max_blobs_per_block,
@@ -1779,15 +1884,11 @@ impl<P: Preset> Store<P> {
             return Ok(BlobSidecarAction::Ignore(true));
         }
 
-        let state = match state_fn() {
-            Ok(state) => state,
-            Err(error) => {
-                if let Some(StateCacheError::StateFarBehind { .. }) = error.downcast_ref() {
-                    return Ok(BlobSidecarAction::DelayUntilSlot(blob_sidecar));
-                }
-
-                bail!(error);
-            }
+        let Some(state) = state_fn() else {
+            // Delay blob validations until the state is available.
+            // Alternatively, we could allow slot processing to obtain states for blob sidecar validations,
+            // however, that introduces opportunity for DoS attacks with fake blob sidecars.
+            return Ok(BlobSidecarAction::DelayUntilState(blob_sidecar, block_root));
         };
 
         // [REJECT] The proposer signature of blob_sidecar.signed_block_header, is valid with respect to the block_header.proposer_index pubkey.
@@ -1797,7 +1898,8 @@ impl<P: Preset> Store<P> {
                 .message
                 .signing_root(&self.chain_config, &state),
             blob_sidecar.signed_block_header.signature,
-            accessors::public_key(&state, block_header.proposer_index)?,
+            self.pubkey_cache
+                .get_or_insert(*accessors::public_key(&state, block_header.proposer_index)?)?,
             SignatureKind::BlockInBlobSidecar,
         )?;
 
@@ -1876,7 +1978,7 @@ impl<P: Preset> Store<P> {
             // If the proposer_index cannot immediately be verified against the expected shuffling,
             // the sidecar MAY be queued for later processing while proposers for the block's branch are calculated --
             // in such a case do not REJECT, instead IGNORE this message.
-            let computed = accessors::get_beacon_proposer_index(&state)?;
+            let computed = accessors::get_beacon_proposer_index(&self.chain_config, &state)?;
 
             ensure!(
                 block_header.proposer_index == computed,
@@ -1893,32 +1995,304 @@ impl<P: Preset> Store<P> {
     pub fn validate_blob_sidecar(
         &self,
         blob_sidecar: Arc<BlobSidecar<P>>,
+        state: Option<Arc<BeaconState<P>>>,
         block_seen: bool,
         origin: &BlobSidecarOrigin,
     ) -> Result<BlobSidecarAction<P>> {
         let block_header = blob_sidecar.signed_block_header.message;
 
-        self.validate_blob_sidecar_with_state(
-            blob_sidecar,
-            block_seen,
-            origin,
-            || {
-                self.chain_link(block_header.parent_root)
-                    .map(|chain_link| (chain_link.block.clone_arc(), chain_link.payload_status))
+        let parent_info = || {
+            self.chain_link(block_header.parent_root)
+                .map(|chain_link| (chain_link.block.clone_arc(), chain_link.payload_status))
+        };
+
+        if let Some(state) = state {
+            self.validate_blob_sidecar_with_state(
+                blob_sidecar,
+                block_seen,
+                origin,
+                parent_info,
+                || Some(state),
+            )
+        } else {
+            self.validate_blob_sidecar_with_state(
+                blob_sidecar,
+                block_seen,
+                origin,
+                parent_info,
+                || {
+                    self.state_cache.existing_state_at_slot(
+                        self,
+                        block_header.parent_root,
+                        block_header.slot,
+                    )
+                },
+            )
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_lines)]
+    #[instrument(level = "debug", skip_all)]
+    pub fn validate_data_column_sidecar_with_state(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        block_seen: bool,
+        origin: &DataColumnSidecarOrigin,
+        validate_block_presence: bool,
+        parent_info: impl FnOnce() -> Option<(Arc<SignedBeaconBlock<P>>, PayloadStatus)>,
+        state_fn: impl FnOnce() -> Option<Arc<BeaconState<P>>>,
+        metrics: Option<&Arc<Metrics>>,
+    ) -> Result<DataColumnSidecarAction<P>> {
+        let block_header = data_column_sidecar.signed_block_header.message;
+        let block_root = block_header.hash_tree_root();
+
+        // No need to validate and import data column sidecars for blocks that are already in fork choice,
+        // i.e. already have all the data columns validated
+        // The exception to this is data column sidecars from custody group column backfill,
+        // where additional columns are being downloaded for blocks already in fork choice.
+        if validate_block_presence && self.contains_block(block_root) {
+            return Ok(DataColumnSidecarAction::Ignore(false));
+        }
+
+        // Validate data column sidecars submitted via beacon API even
+        // if they are not part of the sampling group.
+        // This ensures that correct data columns are published to the network.
+        let mut is_non_sampled_with_full_validation = false;
+
+        // Ignore non-sampling data column sidecars unless they are submitted to beacon API
+        // for publishing after proposal
+        if !self.sampling_columns.contains(&data_column_sidecar.index) {
+            if origin.is_from_api() {
+                is_non_sampled_with_full_validation = true;
+            } else {
+                return Ok(DataColumnSidecarAction::Ignore(false));
+            }
+        }
+
+        // [REJECT] The sidecar is valid as verified by verify_data_column_sidecar(sidecar)
+        ensure!(
+            verify_data_column_sidecar(&self.chain_config, &data_column_sidecar),
+            Error::DataColumnSidecarInvalid {
+                data_column_sidecar
             },
-            || {
-                self.state_cache
-                    .try_state_at_slot(self, block_header.parent_root, block_header.slot)
-                    .transpose()
-                    .unwrap_or_else(|| {
-                        self.state_cache.state_at_slot(
-                            self,
-                            self.head().block_root,
-                            block_header.slot,
-                        )
-                    })
+        );
+
+        // [REJECT] The sidecar is for the correct subnet -- i.e. compute_subnet_for_data_column_sidecar(sidecar.index) == subnet_id.
+        if let Some(actual) = origin.subnet_id() {
+            let expected = misc::compute_subnet_for_data_column_sidecar(
+                &self.chain_config,
+                data_column_sidecar.index,
+            );
+            ensure!(
+                actual == expected,
+                Error::DataColumnSidecarOnIncorrectSubnet {
+                    data_column_sidecar,
+                    expected,
+                    actual,
+                },
+            );
+        }
+
+        // [IGNORE] The sidecar is not from a future slot (with a MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance) -- i.e. validate that block_header.slot <= current_slot
+        // (a client MAY queue future sidecars for processing at the appropriate slot).
+        if self.slot() < block_header.slot {
+            return Ok(DataColumnSidecarAction::DelayUntilSlot(data_column_sidecar));
+        }
+
+        // [IGNORE] The sidecar is from a slot greater than the latest finalized slot -- i.e. validate that block_header.slot > compute_start_slot_at_epoch(state.finalized_checkpoint.epoch)
+        if !origin.is_from_back_sync() && block_header.slot <= self.finalized_slot() {
+            return Ok(DataColumnSidecarAction::Ignore(false));
+        }
+
+        // [IGNORE] The sidecar is the first sidecar for the tuple (block_header.slot, block_header.proposer_index, sidecar.index) with valid header signature, sidecar inclusion proof, and kzg proof.
+        // Adjustment: Ignore data column sidecars for unseen blocks only
+        if self
+            .accepted_data_column_sidecars
+            .get(&(
+                block_header.slot,
+                block_header.proposer_index,
+                data_column_sidecar.index,
+            ))
+            .is_some_and(|commitments| commitments.contains_key(&block_root))
+            && !block_seen
+        {
+            return Ok(DataColumnSidecarAction::Ignore(true));
+        }
+
+        let Some(state) = state_fn() else {
+            // Delay data column validations until the state is available.
+            // Alternatively, we could allow slot processing to obtain states for data column sidecar validations,
+            // however, that introduces opportunity for DoS attacks with fake data column sidecars.
+            return Ok(DataColumnSidecarAction::DelayUntilState(
+                data_column_sidecar,
+                block_root,
+            ));
+        };
+
+        // [REJECT] The proposer signature of sidecar.signed_block_header, is valid with respect to the block_header.proposer_index pubkey.
+        SingleVerifier.verify_singular(
+            data_column_sidecar
+                .signed_block_header
+                .message
+                .signing_root(&self.chain_config, &state),
+            data_column_sidecar.signed_block_header.signature,
+            self.pubkey_cache
+                .get_or_insert(*accessors::public_key(&state, block_header.proposer_index)?)?,
+            SignatureKind::BlockInBlobSidecar,
+        )?;
+
+        // [REJECT] The sidecar's block's parent (defined by block_header.parent_root) passes validation.
+        // Part 1/2:
+        // Since our fork choice store's implementation doesn't preserve invalid blocks,
+        // it needs to check this before sidecar's block's parent's presence check
+        ensure!(
+            !self
+                .rejected_block_roots
+                .contains(&block_header.parent_root),
+            Error::DataColumnSidecarInvalidParentOfBlock {
+                data_column_sidecar
             },
-        )
+        );
+
+        // [IGNORE] The sidecar's block's parent (defined by block_header.parent_root) has been seen (via both gossip and non-gossip sources)
+        // (a client MAY queue sidecars for processing once the parent block is retrieved).
+        let Some((parent, parent_payload_status)) = parent_info() else {
+            return Ok(DataColumnSidecarAction::DelayUntilParent(
+                data_column_sidecar,
+            ));
+        };
+
+        // [REJECT] The sidecar's block's parent (defined by block_header.parent_root) passes validation.
+        // Part 2/2:
+        ensure!(
+            !parent_payload_status.is_invalid(),
+            Error::DataColumnSidecarInvalidParentOfBlock {
+                data_column_sidecar
+            }
+        );
+
+        // [REJECT] The sidecar is from a higher slot than the sidecar's block's parent (defined by block_header.parent_root).
+        let parent_slot = parent.message().slot();
+
+        ensure!(
+            block_header.slot > parent_slot,
+            Error::DataColumnSidecarNotNewerThanBlockParent {
+                data_column_sidecar,
+                parent_slot,
+            }
+        );
+
+        if !origin.is_from_back_sync() {
+            // [REJECT] The current finalized_checkpoint is an ancestor of the sidecar's block
+            // -- i.e. get_checkpoint_block(store, block_header.parent_root, store.finalized_checkpoint.epoch) == store.finalized_checkpoint.root.
+            let ancestor_at_finalized_slot = self
+                .ancestor(block_header.parent_root, self.finalized_slot())
+                .expect(
+                    "every block in the store should have an ancestor at the last finalized slot",
+                );
+
+            ensure!(
+                ancestor_at_finalized_slot == self.finalized_checkpoint.root,
+                Error::DataColumnSidecarBlockNotADescendantOfFinalized {
+                    data_column_sidecar
+                },
+            );
+        }
+
+        if !origin.is_from_el() {
+            // [REJECT] The sidecar's kzg_commitments field inclusion proof is valid as verified by verify_data_column_sidecar_inclusion_proof(sidecar).
+            ensure!(
+                verify_sidecar_inclusion_proof(&data_column_sidecar, metrics),
+                Error::DataColumnSidecarInvalidInclusionProof {
+                    data_column_sidecar
+                }
+            );
+
+            // [REJECT] The sidecar's column data is valid as verified by verify_data_column_sidecar_kzg_proofs(sidecar).
+            let verify_result =
+                verify_kzg_proofs(&data_column_sidecar, self.store_config.kzg_backend, metrics)
+                    .map_err(|error| Error::DataColumnSidecarInvalidKzgProofs {
+                        data_column_sidecar: data_column_sidecar.clone_arc(),
+                        error,
+                    })?;
+
+            ensure!(
+                verify_result,
+                Error::DataColumnSidecarInvalidKzgProofs {
+                    data_column_sidecar: data_column_sidecar.clone_arc(),
+                    error: anyhow!("invalid KZG proofs verification result"),
+                }
+            );
+        }
+
+        if !origin.is_from_back_sync() {
+            // [REJECT] The sidecar is proposed by the expected proposer_index for the block's slot in the context of the current shuffling
+            // (defined by block_header.parent_root/block_header.slot).
+            // If the proposer_index cannot immediately be verified against the expected shuffling,
+            // the sidecar MAY be queued for later processing while proposers for the block's branch are calculated --
+            // in such a case do not REJECT, instead IGNORE this message.
+            let computed = accessors::get_beacon_proposer_index(&self.chain_config, &state)?;
+
+            ensure!(
+                block_header.proposer_index == computed,
+                Error::DataColumnSidecarProposerIndexMismatch {
+                    data_column_sidecar,
+                    computed,
+                }
+            );
+        }
+
+        if is_non_sampled_with_full_validation {
+            return Ok(DataColumnSidecarAction::Ignore(true));
+        }
+
+        Ok(DataColumnSidecarAction::Accept(data_column_sidecar))
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn validate_data_column_sidecar(
+        &self,
+        data_column_sidecar: Arc<DataColumnSidecar<P>>,
+        state: Option<Arc<BeaconState<P>>>,
+        block_seen: bool,
+        origin: &DataColumnSidecarOrigin,
+        metrics: Option<&Arc<Metrics>>,
+    ) -> Result<DataColumnSidecarAction<P>> {
+        let block_header = data_column_sidecar.signed_block_header.message;
+
+        let parent_info = || {
+            self.chain_link(block_header.parent_root)
+                .map(|chain_link| (chain_link.block.clone_arc(), chain_link.payload_status))
+        };
+
+        if let Some(state) = state {
+            self.validate_data_column_sidecar_with_state(
+                data_column_sidecar,
+                block_seen,
+                origin,
+                true,
+                parent_info,
+                || Some(state),
+                metrics,
+            )
+        } else {
+            self.validate_data_column_sidecar_with_state(
+                data_column_sidecar,
+                block_seen,
+                origin,
+                true,
+                parent_info,
+                || {
+                    self.state_cache.existing_state_at_slot(
+                        self,
+                        block_header.parent_root,
+                        block_header.slot,
+                    )
+                },
+                metrics,
+            )
+        }
     }
 
     /// [`on_tick`](https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/phase0/fork-choice.md#on_tick)
@@ -1947,7 +2321,9 @@ impl<P: Preset> Store<P> {
         let mut finalized_checkpoint_updated = false;
 
         // > If a new epoch, pull-up justification and finalization from previous epoch
-        if new_tick.epoch::<P>() > old_tick.epoch::<P>() {
+        let is_new_epoch = new_tick.epoch::<P>() > old_tick.epoch::<P>();
+
+        if is_new_epoch {
             let old_justified_checkpoint = self.justified_checkpoint;
             let old_finalized_checkpoint = self.finalized_checkpoint;
 
@@ -1967,7 +2343,6 @@ impl<P: Preset> Store<P> {
 
             if finalized_checkpoint_updated {
                 self.extend_latest_messages_after_finalization();
-                self.prune_after_finalization();
             }
         }
 
@@ -1977,13 +2352,20 @@ impl<P: Preset> Store<P> {
         self.apply_balance_differences(differences)?;
         self.update_head_segment_id();
 
+        // Pruning the state cache requires the head slot, which depends on head_segment_id
+        // pointing to the correct head. Therefore, prune state cache after the head_segment_id
+        // is updated.
+        if is_new_epoch && finalized_checkpoint_updated {
+            self.prune_after_finalization();
+        }
+
         self.blob_cache.on_slot(new_tick.slot);
         self.prune_state_cache(true);
 
         let changes = if self.reorganized(old_head_segment_id) {
             ApplyTickChanges::Reorganized {
                 finalized_checkpoint_updated,
-                old_head,
+                old_head: Box::new(old_head),
             }
         } else {
             ApplyTickChanges::SlotUpdated {
@@ -2055,11 +2437,16 @@ impl<P: Preset> Store<P> {
         let finalized_checkpoint_updated = old_finalized_checkpoint != self.finalized_checkpoint;
 
         let log_imported_block_info = || {
-            if let Some(post_deneb_block_body) = chain_link.block.message().body().post_deneb() {
+            if let Some(post_deneb_block_body) = chain_link
+                .block
+                .message()
+                .body()
+                .with_blob_kzg_commitments()
+            {
                 if self.should_check_data_availability_at_slot(chain_link.slot()) {
                     let blob_count = post_deneb_block_body.blob_kzg_commitments().len();
 
-                    log::info!(
+                    info_with_peers!(
                         "imported beacon block with {blob_count} blobs (slot: {}, {block_root:?}",
                         chain_link.slot(),
                     );
@@ -2068,7 +2455,7 @@ impl<P: Preset> Store<P> {
                 }
             }
 
-            log::info!(
+            info_with_peers!(
                 "imported beacon block (slot: {}, {block_root:?})",
                 chain_link.slot(),
             );
@@ -2080,11 +2467,6 @@ impl<P: Preset> Store<P> {
 
         if justified_checkpoint_updated {
             self.update_balances_after_justification()?;
-        }
-
-        if finalized_checkpoint_updated {
-            self.extend_latest_messages_after_finalization();
-            self.prune_after_finalization();
         }
 
         // The head segment does not need to be updated every time a block is added.
@@ -2101,14 +2483,23 @@ impl<P: Preset> Store<P> {
         // debugging when implementing proposer score boosting.
         self.update_head_segment_id();
 
+        // Pruning the state cache requires the head slot, which depends on head_segment_id
+        // pointing to the correct head. Therefore, prune state cache after the head_segment_id
+        // is updated.
+        if finalized_checkpoint_updated {
+            self.extend_latest_messages_after_finalization();
+            self.prune_after_finalization();
+        }
+
         if !self.finished_initial_forward_sync && self.head().slot() >= self.slot() {
             self.finished_initial_forward_sync = true;
+            self.state_cache.set_log_lock_timeouts(true);
         }
 
         let changes = if self.reorganized(old_head_segment_id) {
             ApplyBlockChanges::Reorganized {
                 finalized_checkpoint_updated,
-                old_head,
+                old_head: Box::new(old_head),
             }
         } else if old_head.block_root == self.head().block_root {
             ApplyBlockChanges::AlternateChainExtended {
@@ -2124,7 +2515,7 @@ impl<P: Preset> Store<P> {
     }
 
     /// [`update_checkpoints`](https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/phase0/fork-choice.md#update_checkpoints)
-    fn update_checkpoints(
+    const fn update_checkpoints(
         &mut self,
         justified_checkpoint: Checkpoint,
         finalized_checkpoint: Checkpoint,
@@ -2141,7 +2532,7 @@ impl<P: Preset> Store<P> {
     }
 
     /// [`update_unrealized_checkpoints`](https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/phase0/fork-choice.md#update_unrealized_checkpoints)
-    fn update_unrealized_checkpoints(
+    const fn update_unrealized_checkpoints(
         &mut self,
         unrealized_justified_checkpoint: Checkpoint,
         unrealized_finalized_checkpoint: Checkpoint,
@@ -2203,7 +2594,7 @@ impl<P: Preset> Store<P> {
 
             let index = usize::try_from(validator_index)?;
 
-            let Some(latest_message) = &self.latest_messages[index] else {
+            let Some(Some(latest_message)) = &self.latest_messages.get(index) else {
                 continue;
             };
 
@@ -2242,6 +2633,63 @@ impl<P: Preset> Store<P> {
         commitments.insert(block_root, blob_sidecar.kzg_commitment);
 
         self.blob_cache.insert(blob_sidecar);
+    }
+
+    pub fn apply_data_column_sidecar(&mut self, data_sidecar: Arc<DataColumnSidecar<P>>) {
+        let block_header = data_sidecar.signed_block_header.message;
+        let block_root = block_header.hash_tree_root();
+
+        let commitments = self
+            .accepted_data_column_sidecars
+            .entry((
+                block_header.slot,
+                block_header.proposer_index,
+                data_sidecar.index,
+            ))
+            .or_default();
+
+        commitments.insert(block_root, data_sidecar.kzg_commitments.clone());
+
+        self.data_column_cache.insert(data_sidecar);
+    }
+
+    pub fn accepted_data_column_sidecars_count(&self, block_header: BeaconBlockHeader) -> usize {
+        self.accepted_data_column_sidecars
+            .iter()
+            .filter(|((slot, proposer_index, _), commitments)| {
+                *slot == block_header.slot
+                    && *proposer_index == block_header.proposer_index
+                    && commitments.contains_key(&block_header.hash_tree_root())
+            })
+            .count()
+    }
+
+    pub fn accepted_data_column_sidecar(
+        &self,
+        block_header: BeaconBlockHeader,
+        index: ColumnIndex,
+    ) -> bool {
+        let block_root = block_header.hash_tree_root();
+
+        if let Some(accepted) = self.accepted_data_column_sidecars.get(&(
+            block_header.slot,
+            block_header.proposer_index,
+            index,
+        )) {
+            return accepted.contains_key(&block_root);
+        }
+
+        false
+    }
+
+    pub fn is_reconstruction_enabled_for(&self, block_root: &H256) -> bool {
+        // samples enough columns for reconstruction
+        self.sampling_columns_count() * 2 >= P::NumberOfColumns::USIZE
+            // reconstruction not started for given blocks
+            && !self.is_sidecars_construction_started(block_root)
+            // reconstruction is enabled during syncing (if syncing)
+            && (self.is_forward_synced()
+                || !self.store_config().sync_without_reconstruction)
     }
 
     fn insert_block(&mut self, chain_link: ChainLink<P>) -> Result<()> {
@@ -2454,18 +2902,33 @@ impl<P: Preset> Store<P> {
             .retain(|target, _| finalized_epoch <= target.epoch);
     }
 
-    pub fn unload_old_states(&mut self, unfinalized_states_in_memory: Slot) {
+    pub fn unload_old_states(&mut self, unfinalized_states_in_memory: Slot) -> Vec<ChainLink<P>> {
         let head_slot = self.head().slot();
 
         // `OrdMap` has no `iter_mut` or `values_mut` methods or `IntoIterator` impl for `&mut`.
         // See <https://github.com/bodil/im-rs/issues/138>.
         let segment_ids = self.unfinalized.keys().copied().collect_vec();
 
+        let mut to_persist = vec![];
+
         for segment_id in segment_ids {
+            let segment = &self.unfinalized[&segment_id];
+            let segment_last_slot = segment
+                .last_non_invalid_block()
+                .map(UnfinalizedBlock::slot)
+                .unwrap_or_else(|| segment.last_block().slot());
+            let far_ahead_non_canonical_segment =
+                segment_last_slot >= head_slot + P::SlotsPerEpoch::U64;
+
             for unfinalized_block in &mut self.unfinalized[&segment_id] {
                 let chain_link = &mut unfinalized_block.chain_link;
 
-                if head_slot.saturating_sub(chain_link.slot()) < unfinalized_states_in_memory {
+                if far_ahead_non_canonical_segment {
+                    // Keep only one epoch of states in memory for far ahead (relative to head) non-canonical chains
+                    if chain_link.slot() + P::SlotsPerEpoch::U64 > segment_last_slot {
+                        break;
+                    }
+                } else if chain_link.slot() + unfinalized_states_in_memory > head_slot {
                     break;
                 }
 
@@ -2474,13 +2937,18 @@ impl<P: Preset> Store<P> {
                 // (as long as the justified block is not orphaned, which is possible according to
                 // the Fork Choice specification). It is not sufficient because it does not prevent
                 // `ChainLink`s with unloaded states from becoming justified or finalized later.
-                if misc::is_epoch_start::<P>(chain_link.slot()) {
-                    continue;
+                if let Some(state) = chain_link.state.take() {
+                    if misc::is_epoch_start::<P>(chain_link.slot()) {
+                        to_persist.push(ChainLink {
+                            state: Some(state),
+                            ..chain_link.clone()
+                        });
+                    }
                 }
-
-                chain_link.state.take();
             }
         }
+
+        to_persist
     }
 
     fn update_balances_after_justification(&mut self) -> Result<()> {
@@ -2549,6 +3017,14 @@ impl<P: Preset> Store<P> {
 
         self.accepted_blob_sidecars
             .retain(|(slot, _, _), _| finalized_slot <= *slot);
+        self.accepted_data_column_sidecars
+            .retain(|(slot, _, _), _| finalized_slot <= *slot);
+        self.sidecars_construction_started
+            .retain(|_, slot| finalized_slot <= *slot);
+        self.delayed_block_at_slot
+            .retain(|slot, _| finalized_slot <= *slot);
+        self.requested_blobs_from_el
+            .retain(|_, slot| finalized_slot <= *slot);
         self.prune_checkpoint_states();
         self.prune_state_cache(false);
         self.aggregate_and_proof_supersets
@@ -2560,11 +3036,12 @@ impl<P: Preset> Store<P> {
             self.store_config.max_epochs_to_retain_states_in_cache * P::SlotsPerEpoch::U64;
 
         let prune_slot = self
+            .head()
             .slot()
             .saturating_sub(retain_slots)
             .max(self.finalized_slot());
 
-        let fork_tip_block_roots = if preserve_unfinalized_fork_tips {
+        let preserved_older_states = if preserve_unfinalized_fork_tips {
             self.unfinalized_fork_tips()
                 .map(|chain_link| chain_link.block_root)
                 .collect()
@@ -2572,8 +3049,40 @@ impl<P: Preset> Store<P> {
             [].into()
         };
 
-        if let Err(error) = self.state_cache.prune(prune_slot, &fork_tip_block_roots) {
-            error!("failed to prune beacon state cache: {error:?}");
+        let head_slot = self.head().slot();
+        let mut pruned_newer_states = StdHashSet::new();
+        let slots_to_retain = P::SlotsPerEpoch::U64;
+
+        let far_ahead_non_canonical_segments = self
+            .unfinalized
+            .values()
+            .map(|segment| {
+                (
+                    segment,
+                    segment
+                        .last_non_invalid_block()
+                        .map(UnfinalizedBlock::slot)
+                        .unwrap_or_else(|| segment.last_block().slot()),
+                )
+            })
+            .filter(|(_, last_slot)| *last_slot >= head_slot + slots_to_retain);
+
+        for (segment, last_slot) in far_ahead_non_canonical_segments {
+            for unfinalized_block in segment {
+                let chain_link = &unfinalized_block.chain_link;
+
+                if chain_link.slot() + slots_to_retain < last_slot {
+                    pruned_newer_states.insert(chain_link.block_root);
+                }
+            }
+        }
+
+        let prune_result =
+            self.state_cache
+                .prune(prune_slot, &preserved_older_states, &pruned_newer_states);
+
+        if let Err(error) = prune_result {
+            error_with_peers!("failed to prune beacon state cache: {error:?}");
         }
     }
 
@@ -2635,7 +3144,7 @@ impl<P: Preset> Store<P> {
                 let index = usize::try_from(validator_index)?;
                 let balance = self.justified_active_balance(index);
 
-                if let Some(old_message) = &self.latest_messages[index] {
+                if let Some(Some(old_message)) = &self.latest_messages.get(index) {
                     let LatestMessage {
                         epoch: old_epoch,
                         beacon_block_root: old_beacon_block_root,
@@ -2662,7 +3171,9 @@ impl<P: Preset> Store<P> {
 
                 // Note that we mutate `Store.latest_messages` as we go along.
                 // This prevents duplicate attestations from being counted more than once.
-                self.latest_messages[index] = Some(latest_message.clone_arc());
+                if index < self.latest_messages.len() {
+                    self.latest_messages[index] = Some(latest_message.clone_arc());
+                }
             }
         }
 
@@ -2706,7 +3217,7 @@ impl<P: Preset> Store<P> {
                     {
                         Some(balance) => balance,
                         None => {
-                            error!(
+                            error_with_peers!(
                                 "{:?}",
                                 anyhow!("attesting balance should never go below zero"),
                             );
@@ -2943,6 +3454,81 @@ impl<P: Preset> Store<P> {
         PayloadStatus::Valid
     }
 
+    pub fn load_beacon_state(
+        &self,
+        block_root: H256,
+        slot: Slot,
+        state: Option<&Arc<BeaconState<P>>>,
+    ) -> Arc<BeaconState<P>> {
+        if let Some(state) = state {
+            return state.clone_arc();
+        }
+
+        let load_result = self
+            .state_cache
+            .get_or_insert_with(block_root, slot, true, || {
+                let stored_state_opt = match self.stored_state_by_block_root(block_root) {
+                    Ok(state_opt) => state_opt,
+                    Err(error) => {
+                        error_with_peers!("failed to load persisted beacon state: {error:?}");
+                        None
+                    }
+                };
+
+                let loaded_state = stored_state_opt
+                    .unwrap_or_else(|| self.load_beacon_state_by_state_transition(block_root));
+
+                Ok((loaded_state, None))
+            });
+
+        match load_result {
+            Ok(state_with_rewards) => state_with_rewards.0,
+            Err(error) => {
+                error_with_peers!("failed to load beacon state: {error:?}");
+                self.load_beacon_state_by_state_transition(block_root)
+            }
+        }
+    }
+
+    fn load_beacon_state_by_state_transition(&self, block_root: H256) -> Arc<BeaconState<P>> {
+        let mut blocks_to_process = vec![];
+
+        let mut state = self
+            .chain_ending_with(block_root)
+            .find_map(|chain_link| {
+                let state = chain_link.state.clone().or_else(|| {
+                    match self.stored_state_by_block_root(chain_link.block_root) {
+                        Ok(state_opt) => state_opt,
+                        Err(error) => {
+                            error_with_peers!("failed to load persisted beacon state: {error:?}");
+                            None
+                        }
+                    }
+                });
+
+                if state.is_none() {
+                    blocks_to_process.push(&chain_link.block);
+                }
+
+                state
+            })
+            .expect("at least one ancestor should have a state in memory or persisted");
+
+        assert!(!blocks_to_process.is_empty());
+
+        for block in blocks_to_process.into_iter().rev() {
+            combined::trusted_state_transition(
+                self.chain_config(),
+                &self.pubkey_cache,
+                state.make_mut(),
+                block,
+            )
+            .expect("state transition should succeed because block is already in store");
+        }
+
+        state
+    }
+
     pub fn state_before_or_at_slot(
         &self,
         block_root: H256,
@@ -2951,10 +3537,16 @@ impl<P: Preset> Store<P> {
         self.state_cache.before_or_at_slot(self, block_root, slot)
     }
 
+    pub fn stored_state_by_block_root(
+        &self,
+        block_root: H256,
+    ) -> Result<Option<Arc<BeaconState<P>>>> {
+        self.storage.stored_state_by_block_root(block_root)
+    }
+
     #[must_use]
     pub fn is_forward_synced(&self) -> bool {
         self.head().slot() + self.store_config.max_empty_slots >= self.slot()
-            && self.finished_initial_forward_sync
     }
 
     #[must_use]
@@ -2962,7 +3554,7 @@ impl<P: Preset> Store<P> {
         self.finished_back_sync
     }
 
-    pub fn set_back_synced(&mut self, finished_back_sync: bool) {
+    pub const fn set_back_synced(&mut self, finished_back_sync: bool) {
         self.finished_back_sync = finished_back_sync;
     }
 
@@ -3058,18 +3650,31 @@ impl<P: Preset> Store<P> {
         vec![]
     }
 
-    pub fn invalidate_block_and_descendant_payload_statuses(
-        &mut self,
-        block_hash: ExecutionBlockHash,
-    ) -> PayloadAction {
-        if self.set_block_payload_status(block_hash, PayloadStatus::Invalid) {
-            self.set_block_descendant_payload_statuses(block_hash, PayloadStatus::Invalid);
-            self.update_head_segment_id();
+    pub fn invalidate_block_and_descendant_payloads(&mut self, block_root: H256) {
+        let invalidate_blocks_with_roots = self
+            .unfinalized
+            .values()
+            .filter_map(|segment| {
+                let chain_block_roots = self
+                    .unfinalized_chain_ending_with(segment, segment.last_position())
+                    .map(|chain_link| chain_link.block_root)
+                    .take_while_inclusive(|root| *root != block_root)
+                    .collect::<HashSet<H256>>();
 
-            return PayloadAction::Accept;
+                chain_block_roots
+                    .contains(&block_root)
+                    .then_some(chain_block_roots)
+            })
+            .flatten()
+            .collect::<HashSet<H256>>();
+
+        for root in invalidate_blocks_with_roots {
+            if let Some(chain_link) = self.unfinalized_chain_link_mut(root) {
+                chain_link.payload_status = PayloadStatus::Invalid;
+            }
         }
 
-        PayloadAction::DelayUntilBlock(block_hash)
+        self.update_head_segment_id();
     }
 
     pub fn update_chain_payload_statuses(
@@ -3117,10 +3722,10 @@ impl<P: Preset> Store<P> {
         PayloadAction::DelayUntilBlock(latest_valid_hash)
     }
 
-    pub fn indices_of_missing_blobs(&self, block: &Arc<SignedBeaconBlock<P>>) -> Vec<BlobIndex> {
+    pub fn indices_of_missing_blobs(&self, block: &SignedBeaconBlock<P>) -> Vec<BlobIndex> {
         let block = block.message();
 
-        let Some(body) = block.body().post_deneb() else {
+        let Some(body) = block.body().with_blob_kzg_commitments() else {
             return vec![];
         };
 
@@ -3141,6 +3746,37 @@ impl<P: Preset> Store<P> {
                     })
             })
             .map(|(_, index)| index)
+            .collect()
+    }
+
+    pub fn indices_of_missing_data_columns(
+        &self,
+        block: &SignedBeaconBlock<P>,
+    ) -> Vec<ColumnIndex> {
+        let block = block.message();
+
+        // `block.phase` has already been checked
+        let Some(body) = block.body().with_blob_kzg_commitments() else {
+            return vec![];
+        };
+
+        if body.blob_kzg_commitments().is_empty() {
+            return vec![];
+        }
+
+        let block_root = block.hash_tree_root();
+
+        self.sampling_columns
+            .iter()
+            .filter(|index| {
+                !self
+                    .accepted_data_column_sidecars
+                    .get(&(block.slot(), block.proposer_index(), **index))
+                    .is_some_and(|kzg_commitments| {
+                        kzg_commitments.get(&block_root) == Some(body.blob_kzg_commitments())
+                    })
+            })
+            .copied()
             .collect()
     }
 
@@ -3167,7 +3803,7 @@ impl<P: Preset> Store<P> {
             .unwrap_or(GENESIS_EPOCH)
     }
 
-    pub fn min_checked_data_availability_epoch(&self) -> Epoch {
+    pub fn min_checked_blob_availability_epoch(&self) -> Epoch {
         self.chain_config.deneb_fork_epoch.max(
             self.tick
                 .epoch::<P>()
@@ -3176,12 +3812,98 @@ impl<P: Preset> Store<P> {
         )
     }
 
+    pub fn min_checked_data_column_availability_epoch(&self) -> Epoch {
+        self.chain_config.fulu_fork_epoch.max(
+            self.tick
+                .epoch::<P>()
+                .checked_sub(
+                    self.chain_config
+                        .min_epochs_for_data_column_sidecars_requests,
+                )
+                .unwrap_or(GENESIS_EPOCH),
+        )
+    }
+
+    pub fn min_checked_data_availability_epoch(&self, slot: Slot) -> Epoch {
+        if self
+            .chain_config
+            .phase_at_slot::<P>(slot)
+            .is_peerdas_activated()
+        {
+            self.min_checked_data_column_availability_epoch()
+        } else {
+            self.min_checked_blob_availability_epoch()
+        }
+    }
+
     pub fn should_check_data_availability_at_slot(&self, slot: Slot) -> bool {
-        misc::compute_epoch_at_slot::<P>(slot) >= self.min_checked_data_availability_epoch()
+        misc::compute_epoch_at_slot::<P>(slot) >= self.min_checked_data_availability_epoch(slot)
     }
 
     pub fn state_cache(&self) -> Arc<StateCacheProcessor<P>> {
         self.state_cache.clone_arc()
+    }
+
+    pub fn mark_persisted_data_columns(
+        &mut self,
+        persisted_data_column_ids: Vec<DataColumnIdentifier>,
+    ) {
+        self.data_column_cache
+            .mark_persisted_data_columns(persisted_data_column_ids);
+    }
+
+    pub fn prune_data_columns(&mut self, slot: Slot) {
+        self.data_column_cache.prune(slot);
+    }
+
+    pub fn prune_persisted_data_columns(&mut self, slot: Slot) {
+        self.data_column_cache.prune_persisted(slot);
+    }
+
+    pub fn unpersisted_data_column_sidecars(
+        &self,
+    ) -> impl Iterator<Item = DataColumnSidecarWithId<P>> + '_ {
+        self.data_column_cache.unpersisted_data_column_sidecars()
+    }
+
+    pub fn store_sampling_columns(&mut self, sampling_columns: StdHashSet<ColumnIndex>) {
+        self.sampling_columns = sampling_columns;
+    }
+
+    pub fn sampling_columns_count(&self) -> usize {
+        self.sampling_columns.len()
+    }
+
+    pub const fn sampling_columns(&self) -> &StdHashSet<ColumnIndex> {
+        &self.sampling_columns
+    }
+
+    pub fn is_sidecars_construction_started(&self, block_root: &H256) -> bool {
+        self.sidecars_construction_started.contains_key(block_root)
+    }
+
+    pub fn mark_sidecar_construction_started(&self, block_root: H256, slot: Slot) {
+        self.sidecars_construction_started.insert(block_root, slot);
+    }
+
+    pub fn mark_sidecar_construction_failed(&self, block_root: &H256) {
+        self.sidecars_construction_started.remove(block_root);
+    }
+
+    pub fn delay_block_at_slot(&mut self, slot: Slot, block_root: H256) {
+        self.delayed_block_at_slot.insert(slot, block_root);
+    }
+
+    pub fn get_delayed_block_at_slot(&self, slot: Slot) -> Option<&H256> {
+        self.delayed_block_at_slot.get(&slot)
+    }
+
+    pub fn has_requested_blobs_from_el(&self, block_root: &H256) -> bool {
+        self.requested_blobs_from_el.contains_key(block_root)
+    }
+
+    pub fn mark_requested_blobs_from_el(&mut self, block_root: H256, slot: Slot) {
+        self.requested_blobs_from_el.insert(block_root, slot);
     }
 
     pub fn track_collection_metrics(&self, metrics: &Arc<Metrics>) {
@@ -3193,7 +3915,12 @@ impl<P: Preset> Store<P> {
             "blob_store",
             self.blob_cache.size(),
         );
-
+        metrics.set_collection_length(
+            module_path!(),
+            &type_name,
+            "data_column_store",
+            self.data_column_cache.size(),
+        );
         metrics.set_collection_length(
             module_path!(),
             &type_name,
@@ -3251,6 +3978,13 @@ impl<P: Preset> Store<P> {
             &type_name,
             "checkpoint_states",
             self.checkpoint_states.len(),
+        );
+
+        metrics.set_collection_length(
+            module_path!(),
+            &type_name,
+            "unpersisted_data_columns",
+            self.unpersisted_data_column_sidecars().count(),
         );
 
         metrics.set_collection_length(

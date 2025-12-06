@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-arithmetic = { workspace = true }
 enum-iterator = { workspace = true }
 futures = { workspace = true }
 helper_functions = { workspace = true }

@@ -2,7 +2,7 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::warn;
+use logging::warn_with_peers;
 use once_cell::sync::OnceCell;
 use prometheus::{
     histogram_opts, opts, Gauge, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec,
@@ -20,6 +20,7 @@ pub static METRICS: OnceCell<Arc<Metrics>> = OnceCell::new();
 #[derive(Debug)]
 pub struct Metrics {
     // Overview
+    beacon_clock_slot: IntGauge,
     live: IntGauge,
     pub metrics_requests_since_last_update: IntCounter,
 
@@ -58,6 +59,22 @@ pub struct Metrics {
     pub received_sync_contribution_subsets: IntCounter,
     pub received_aggregated_attestation_subsets: IntCounter,
 
+    // Custody Subnets / PeerDAS
+    column_subnet_peers: IntGaugeVec,
+    pub data_column_sidecars_submitted_for_processing: IntCounter,
+    pub verified_gossip_data_column_sidecar: IntCounter,
+    pub data_column_sidecar_verification_times: Histogram,
+    pub reconstructed_columns: IntCounter,
+    pub columns_reconstruction_time: Histogram,
+    pub data_column_sidecar_computation: Histogram,
+    pub data_column_sidecar_inclusion_proof_verification: Histogram,
+    pub data_column_sidecar_kzg_verification_batch: Histogram,
+    beacon_custody_groups: IntGauge,
+    beacon_custody_groups_backfilled: IntGauge,
+    pub engine_get_blobs_v2_requests_count: IntCounter,
+    pub engine_get_blobs_v2_responses_count: IntCounter,
+    pub engine_get_blobs_v2_request_time: Histogram,
+
     // Extra Network stats
     gossip_block_slot_start_delay_time: Histogram,
 
@@ -65,6 +82,7 @@ pub struct Metrics {
     mutator_attestations: IntCounterVec,
     mutator_aggregate_and_proofs: IntCounterVec,
 
+    pub block_insertion_times: Histogram,
     pub block_processing_times: Histogram,
     pub block_post_processing_times: Histogram,
 
@@ -107,8 +125,9 @@ pub struct Metrics {
     pub prepare_voluntary_exits_times: Histogram,
 
     // Pools
-    att_pool_pack_iterations: Gauge,
+    pub att_pool_pack_iterations: IntCounter,
     pub att_pool_insert_attestation_task_times: Histogram,
+    pub att_pool_attestation_tracking_times: Histogram,
 
     pub sync_pool_add_own_contribution_times: Histogram,
     pub sync_pool_aggregate_own_messages_times: Histogram,
@@ -125,11 +144,14 @@ pub struct Metrics {
     pub fc_attestation_task_times: HistogramVec,
 
     pub fc_blob_sidecar_task_times: Histogram,
+    pub fc_data_column_sidecar_task_times: Histogram,
     pub fc_blob_sidecar_persist_task_times: Histogram,
+    pub fc_data_column_sidecar_persist_task_times: Histogram,
     pub fc_block_attestation_task_times: Histogram,
     pub fc_attester_slashing_task_times: Histogram,
     pub fc_preprocess_state_task_times: Histogram,
     pub fc_checkpoint_state_task_times: Histogram,
+    pub fc_persist_pubkey_cache_task_times: Histogram,
 
     // Cache metrics
     pub active_validator_indices_ordered_init_count: IntCounter,
@@ -190,6 +212,7 @@ impl Metrics {
     pub fn new() -> Result<Self> {
         Ok(Self {
             // Overview
+            beacon_clock_slot: IntGauge::new("beacon_clock_slot", "Beacon clock slot")?,
             live: IntGauge::new("IS_LIVE", "Grandine status")?,
 
             metrics_requests_since_last_update: IntCounter::new(
@@ -292,6 +315,77 @@ impl Metrics {
                  already known aggregates"
             )?,
 
+            // Custody Subnets / PeerDAS
+            column_subnet_peers: IntGaugeVec::new(
+                opts!("PEERS_PER_COLUMN_SUBNET", "Number of connected peers per column subnet"),
+                &["subnet_id"],
+            )?,
+
+            data_column_sidecars_submitted_for_processing: IntCounter::new(
+                "beacon_data_column_sidecar_processing_requests_total",
+                "Number of data column sidecars submitted for processing"
+            )?,
+
+            verified_gossip_data_column_sidecar: IntCounter::new(
+                "beacon_data_column_sidecar_processing_successes_total",
+                "Number of data column sidecars verified for gossip"
+            )?,
+
+            data_column_sidecar_verification_times: Histogram::with_opts(histogram_opts!(
+                "beacon_data_column_sidecar_gossip_verification_seconds",
+                "Full runtime of data column sidecars gossip verification"
+            ))?,
+
+            reconstructed_columns: IntCounter::new(
+                "beacon_data_availability_reconstructed_columns_total",
+                "Total count of reconstructed columns"
+            )?,
+
+            columns_reconstruction_time: Histogram::with_opts(histogram_opts!(
+                "beacon_data_availability_reconstruction_time_seconds",
+                "Time taken to reconstruct columns"
+            ))?,
+
+            data_column_sidecar_computation: Histogram::with_opts(histogram_opts!(
+                "beacon_data_column_sidecar_computation_seconds",
+                "Time taken to compute data column sidecar, including cells, proofs and inclusion proof"
+            ))?,
+
+            data_column_sidecar_inclusion_proof_verification: Histogram::with_opts(histogram_opts!(
+                "beacon_data_column_sidecar_inclusion_proof_verification_seconds",
+                "Time taken to verify data column sidecar inclusion proof"
+            ))?,
+
+            data_column_sidecar_kzg_verification_batch: Histogram::with_opts(histogram_opts!(
+                "beacon_kzg_verification_data_column_batch_seconds",
+                "Runtime of batched data column kzg verification"
+            ))?,
+
+            beacon_custody_groups: IntGauge::new(
+                "beacon_custody_groups",
+                "Total number of custody groups within a node"
+            )?,
+
+            beacon_custody_groups_backfilled: IntGauge::new(
+                "beacon_custody_groups_backfilled",
+                "Total number of custody groups backfilled by a node"
+            )?,
+
+            engine_get_blobs_v2_requests_count: IntCounter::new(
+                "beacon_engine_getBlobsV2_requests_total",
+                "Total number of engine_getBlobsV2 requests sent"
+            )?,
+
+            engine_get_blobs_v2_responses_count: IntCounter::new(
+                "beacon_engine_getBlobsV2_responses_total",
+                "Total number of engine_getBlobsV2 successful responses received"
+            )?,
+
+            engine_get_blobs_v2_request_time: Histogram::with_opts(histogram_opts!(
+                "beacon_engine_getBlobsV2_request_duration_seconds",
+                "Duration of engine_getBlobsV2 requests"
+            ))?,
+
             // Extra Network stats
             gossip_block_slot_start_delay_time: Histogram::with_opts(histogram_opts!(
                 "beacon_block_gossip_slot_start_delay_time",
@@ -315,6 +409,11 @@ impl Metrics {
                 ),
                 &["type"],
             )?,
+
+            block_insertion_times: Histogram::with_opts(histogram_opts!(
+                "MUTATOR_BLOCK_INSERTION_TIMES",
+                "Mutator Block insertion times (from submission)",
+            ))?,
 
             block_processing_times: Histogram::with_opts(histogram_opts!(
                 "MUTATOR_BLOCK_PROCESSING_TIMES",
@@ -461,7 +560,7 @@ impl Metrics {
             ))?,
 
             // Pools
-            att_pool_pack_iterations: Gauge::new(
+            att_pool_pack_iterations: IntCounter::new(
                 "ATT_POOL_PACK_ITERATIONS",
                 "Attestation packer iteration count per slog",
             )?,
@@ -469,6 +568,11 @@ impl Metrics {
             att_pool_insert_attestation_task_times: Histogram::with_opts(histogram_opts!(
                 "ATT_POOL_INSERT_ATTESTATION_TASK_TIMES",
                 "Attestation agg pool insert attestation task times",
+            ))?,
+
+            att_pool_attestation_tracking_times: Histogram::with_opts(histogram_opts!(
+                "ATT_POOL_ATTESTATION_TRACKING_TIMES",
+                "Attestation agg pool track attestation times",
             ))?,
 
             sync_pool_add_own_contribution_times: Histogram::with_opts(histogram_opts!(
@@ -541,6 +645,16 @@ impl Metrics {
                 "Forkchoice BlobSidecar persist task times",
             ))?,
 
+            fc_data_column_sidecar_task_times: Histogram::with_opts(histogram_opts!(
+                "FC_DATA_COLUMN_SIDECAR_TASK_TIMES",
+                "Forkchoice DataColumnSidecar times",
+            ))?,
+
+            fc_data_column_sidecar_persist_task_times: Histogram::with_opts(histogram_opts!(
+                "FC_DATA_COLUMN_SIDECAR_PERSIST_TASK_TIMES",
+                "Forkchoice DataColumnSidecar persist task times",
+            ))?,
+
             fc_block_attestation_task_times: Histogram::with_opts(histogram_opts!(
                 "FC_BLOCK_ATTESTATION_TASK_TIMES",
                 "Forkchoice BlockAttesttionTask times",
@@ -554,6 +668,11 @@ impl Metrics {
             fc_preprocess_state_task_times: Histogram::with_opts(histogram_opts!(
                 "FC_PREPROCESS_STATE_TASK_TIMES",
                 "Forkchoice PreprocessStateTask times",
+            ))?,
+
+            fc_persist_pubkey_cache_task_times: Histogram::with_opts(histogram_opts!(
+                "FC_PERSIST_PUBKEY_CACHE_TASK_TIMES",
+                "Forkchoice PersistPubkeyCacheTask times",
             ))?,
 
             fc_checkpoint_state_task_times: Histogram::with_opts(histogram_opts!(
@@ -749,6 +868,7 @@ impl Metrics {
     pub fn register_with_default_metrics(&self) -> Result<()> {
         let default_registry = prometheus::default_registry();
 
+        default_registry.register(Box::new(self.beacon_clock_slot.clone()))?;
         default_registry.register(Box::new(self.live.clone()))?;
         default_registry.register(Box::new(self.cores.clone()))?;
         default_registry.register(Box::new(self.disk_usage.clone()))?;
@@ -772,9 +892,33 @@ impl Metrics {
         default_registry.register(Box::new(
             self.received_aggregated_attestation_subsets.clone(),
         ))?;
+        default_registry.register(Box::new(self.column_subnet_peers.clone()))?;
+        default_registry.register(Box::new(
+            self.data_column_sidecars_submitted_for_processing.clone(),
+        ))?;
+        default_registry.register(Box::new(self.verified_gossip_data_column_sidecar.clone()))?;
+        default_registry.register(Box::new(
+            self.data_column_sidecar_verification_times.clone(),
+        ))?;
+        default_registry.register(Box::new(self.reconstructed_columns.clone()))?;
+        default_registry.register(Box::new(self.columns_reconstruction_time.clone()))?;
+        default_registry.register(Box::new(self.data_column_sidecar_computation.clone()))?;
+        default_registry.register(Box::new(
+            self.data_column_sidecar_inclusion_proof_verification
+                .clone(),
+        ))?;
+        default_registry.register(Box::new(
+            self.data_column_sidecar_kzg_verification_batch.clone(),
+        ))?;
+        default_registry.register(Box::new(self.beacon_custody_groups.clone()))?;
+        default_registry.register(Box::new(self.beacon_custody_groups_backfilled.clone()))?;
+        default_registry.register(Box::new(self.engine_get_blobs_v2_requests_count.clone()))?;
+        default_registry.register(Box::new(self.engine_get_blobs_v2_responses_count.clone()))?;
+        default_registry.register(Box::new(self.engine_get_blobs_v2_request_time.clone()))?;
         default_registry.register(Box::new(self.gossip_block_slot_start_delay_time.clone()))?;
         default_registry.register(Box::new(self.mutator_attestations.clone()))?;
         default_registry.register(Box::new(self.mutator_aggregate_and_proofs.clone()))?;
+        default_registry.register(Box::new(self.block_insertion_times.clone()))?;
         default_registry.register(Box::new(self.block_processing_times.clone()))?;
         default_registry.register(Box::new(self.block_post_processing_times.clone()))?;
         default_registry.register(Box::new(
@@ -824,6 +968,7 @@ impl Metrics {
         default_registry.register(Box::new(
             self.att_pool_insert_attestation_task_times.clone(),
         ))?;
+        default_registry.register(Box::new(self.att_pool_attestation_tracking_times.clone()))?;
         default_registry.register(Box::new(self.sync_pool_add_own_contribution_times.clone()))?;
         default_registry.register(Box::new(
             self.sync_pool_aggregate_own_messages_times.clone(),
@@ -842,10 +987,15 @@ impl Metrics {
         default_registry.register(Box::new(self.fc_attestation_task_times.clone()))?;
         default_registry.register(Box::new(self.fc_blob_sidecar_task_times.clone()))?;
         default_registry.register(Box::new(self.fc_blob_sidecar_persist_task_times.clone()))?;
+        default_registry.register(Box::new(self.fc_data_column_sidecar_task_times.clone()))?;
+        default_registry.register(Box::new(
+            self.fc_data_column_sidecar_persist_task_times.clone(),
+        ))?;
         default_registry.register(Box::new(self.fc_block_attestation_task_times.clone()))?;
         default_registry.register(Box::new(self.fc_attester_slashing_task_times.clone()))?;
         default_registry.register(Box::new(self.fc_preprocess_state_task_times.clone()))?;
         default_registry.register(Box::new(self.fc_checkpoint_state_task_times.clone()))?;
+        default_registry.register(Box::new(self.fc_persist_pubkey_cache_task_times.clone()))?;
         default_registry.register(Box::new(
             self.active_validator_indices_ordered_init_count.clone(),
         ))?;
@@ -910,6 +1060,10 @@ impl Metrics {
     }
 
     // Overview
+    pub fn set_beacon_clock_slot(&self, slot: Slot) {
+        self.beacon_clock_slot.set(slot as i64);
+    }
+
     pub fn set_live(&self) {
         self.live.set(1)
     }
@@ -983,7 +1137,9 @@ impl Metrics {
             .get_metric_with_label_values(labels)
         {
             Ok(metrics) => metrics.observe(response_duration.as_secs_f64()),
-            Err(error) => warn!("unable to track HTTP API response time for {labels:?}: {error:?}"),
+            Err(error) => {
+                warn_with_peers!("unable to track HTTP API response time for {labels:?}: {error:?}")
+            }
         }
     }
 
@@ -995,7 +1151,9 @@ impl Metrics {
         {
             Ok(metrics) => metrics.observe(response_duration.as_secs_f64()),
             Err(error) => {
-                warn!("unable to track metrics server response time for {labels:?}: {error:?}")
+                warn_with_peers!(
+                    "unable to track metrics server response time for {labels:?}: {error:?}"
+                )
             }
         }
     }
@@ -1008,7 +1166,9 @@ impl Metrics {
         {
             Ok(metrics) => metrics.observe(response_duration.as_secs_f64()),
             Err(error) => {
-                warn!("unable to track Validator API response time for {labels:?}: {error:?}")
+                warn_with_peers!(
+                    "unable to track Validator API response time for {labels:?}: {error:?}"
+                )
             }
         }
     }
@@ -1028,9 +1188,35 @@ impl Metrics {
         match self.gossip_objects.get_metric_with_label_values(labels) {
             Ok(counter) => counter.inc(),
             Err(error) => {
-                warn!("unable to register received object over gossip for {labels:?}: {error:?}")
+                warn_with_peers!(
+                    "unable to register received object over gossip for {labels:?}: {error:?}"
+                )
             }
         }
+    }
+
+    // Custody Subnets / PeerDAS
+    pub fn set_column_subnet_peers(&self, subnet_id: &str, num_peers: usize) {
+        match self
+            .column_subnet_peers
+            .get_metric_with_label_values(&[subnet_id])
+        {
+            Ok(metric) => metric.set(num_peers as i64),
+            Err(error) => {
+                warn_with_peers!(
+                    "the number of label values should match the number \
+                 of labels that column_subnet_peers was created: {error:?}"
+                );
+            }
+        }
+    }
+
+    pub fn set_beacon_custody_groups(&self, group_count: u64) {
+        self.beacon_custody_groups.set(group_count as i64);
+    }
+
+    pub fn set_beacon_custody_groups_backfilled(&self, backfilled: u64) {
+        self.beacon_custody_groups_backfilled.set(backfilled as i64);
     }
 
     // Extra Network stats
@@ -1039,7 +1225,7 @@ impl Metrics {
             Ok(duration) => self
                 .gossip_block_slot_start_delay_time
                 .observe(duration.as_secs_f64()),
-            Err(error) => warn!("unable to observe block duration to slot: {error:?}"),
+            Err(error) => warn_with_peers!("unable to observe block duration to slot: {error:?}"),
         }
     }
 
@@ -1051,7 +1237,7 @@ impl Metrics {
         {
             Ok(counter) => counter.inc(),
             Err(error) => {
-                warn!("unable to register mutator attestation for {labels:?}: {error:?}")
+                warn_with_peers!("unable to register mutator attestation for {labels:?}: {error:?}")
             }
         }
     }
@@ -1063,7 +1249,9 @@ impl Metrics {
         {
             Ok(counter) => counter.inc(),
             Err(error) => {
-                warn!("unable to register mutator aggregate_and_proof for {labels:?}: {error:?}")
+                warn_with_peers!(
+                    "unable to register mutator aggregate_and_proof for {labels:?}: {error:?}"
+                )
             }
         }
     }
@@ -1149,10 +1337,5 @@ impl Metrics {
                  of labels that tick_delay_times was created with",
             )
             .set(delay.as_secs_f64())
-    }
-
-    // Pool
-    pub fn set_attestation_packer_iteration_count(&self, iterations: u32) {
-        self.att_pool_pack_iterations.set(iterations as f64)
     }
 }

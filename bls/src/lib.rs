@@ -3,8 +3,7 @@ pub use bls_core::*;
 macro_rules! implement_backend {
     ($backend:path) => {
         pub use $backend::{
-            cached_public_key::CachedPublicKey, public_key::PublicKey,
-            public_key_bytes::PublicKeyBytes, secret_key::SecretKey,
+            public_key::PublicKey, public_key_bytes::PublicKeyBytes, secret_key::SecretKey,
             secret_key_bytes::SecretKeyBytes, signature::Signature,
             signature_bytes::SignatureBytes,
         };
@@ -21,3 +20,6 @@ implement_backend!(bls_blst);
 
 #[cfg(feature = "zkcrypto")]
 implement_backend!(bls_zkcrypto);
+
+#[cfg(all(feature = "zkcrypto", target_os = "zkvm"))]
+pub use bls_zkcrypto::signature::set_rand_seed;

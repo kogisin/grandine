@@ -1,29 +1,30 @@
-use anyhow::{Error as AnyhowError, Result};
+use std::sync::Arc;
+
+use anyhow::{bail, Error as AnyhowError, Result};
 use eth1_api::{ApiController, RealController};
 use fork_choice_control::Wait;
 use helper_functions::{accessors, misc};
-use ssz::ReadError;
-use thiserror::Error;
+use logging::debug_with_peers;
+use typenum::Unsigned as _;
 use types::{
-    combined::Attestation,
-    electra::containers::{Attestation as ElectraAttestation, SingleAttestation},
-    phase0::containers::{Attestation as Phase0Attestation, AttestationData},
+    combined::{Attestation, BeaconState},
+    electra::{
+        containers::{Attestation as ElectraAttestation, SingleAttestation},
+        error::AttestationConversionError,
+    },
+    phase0::containers::{Attestation as Phase0Attestation, AttestationData, Checkpoint},
     preset::Preset,
 };
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("invalid committee index for conversion")]
-    InvalidCommitteeIndex,
-    #[error("invalid aggregation bits for conversion")]
-    InvalidAggregationBits(#[source] ReadError),
-}
-
 pub fn convert_attestation_for_pool<P: Preset, W: Wait>(
     controller: &ApiController<P, W>,
-    attestation: Attestation<P>,
+    attestation: Arc<Attestation<P>>,
 ) -> Result<Phase0Attestation<P>> {
-    let attestation = match attestation {
+    if attestation.data().slot + P::SlotsPerEpoch::U64 < controller.slot() {
+        bail!(AttestationConversionError::Irrelevant);
+    }
+
+    let attestation = match Arc::unwrap_or_clone(attestation) {
         Attestation::Phase0(attestation) => attestation,
         Attestation::Electra(attestation) => {
             let ElectraAttestation {
@@ -37,22 +38,19 @@ pub fn convert_attestation_for_pool<P: Preset, W: Wait>(
 
             let index = misc::get_committee_indices::<P>(committee_bits)
                 .next()
-                .ok_or(Error::InvalidCommitteeIndex)?;
+                .ok_or(AttestationConversionError::InvalidCommitteeIndex)?;
 
             Phase0Attestation {
                 aggregation_bits: aggregation_bits
                     .try_into()
-                    .map_err(Error::InvalidAggregationBits)?,
+                    .map_err(AttestationConversionError::InvalidAggregationBits)?,
                 data: AttestationData { index, ..data },
                 signature,
             }
         }
         Attestation::Single(attestation) => {
             let slot = attestation.data.slot;
-            let state = controller
-                .state_at_slot(slot)?
-                .ok_or_else(|| AnyhowError::msg(format!("state not available at slot: {slot:?}")))?
-                .value;
+            let state = current_state(controller, attestation.data.target);
             let committee = accessors::beacon_committee(&state, slot, attestation.committee_index)?;
 
             attestation.try_into_phase0_attestation(committee)?
@@ -71,7 +69,7 @@ pub fn convert_to_electra_attestation<P: Preset>(
 // TODO(feature/electra): properly refactor attestations
 pub fn try_convert_to_single_attestation<P: Preset>(
     controller: &RealController<P>,
-    attestation: &ElectraAttestation<P>,
+    attestation: ElectraAttestation<P>,
 ) -> Result<SingleAttestation> {
     let ElectraAttestation {
         aggregation_bits,
@@ -80,15 +78,11 @@ pub fn try_convert_to_single_attestation<P: Preset>(
         committee_bits,
     } = attestation;
 
-    let committee_index = misc::get_committee_indices::<P>(*committee_bits)
+    let committee_index = misc::get_committee_indices::<P>(committee_bits)
         .next()
         .unwrap_or_default();
 
-    let state = controller
-        .state_at_slot(data.slot)?
-        .ok_or_else(|| AnyhowError::msg(format!("state not available at slot: {:?}", data.slot)))?
-        .value;
-
+    let state = current_state(controller, data.target);
     let committee = accessors::beacon_committee(&state, data.slot, committee_index)?;
 
     let attester_index = aggregation_bits
@@ -100,7 +94,37 @@ pub fn try_convert_to_single_attestation<P: Preset>(
     Ok(SingleAttestation {
         committee_index,
         attester_index,
-        data: *data,
-        signature: *signature,
+        data,
+        signature,
     })
+}
+
+fn current_state<P: Preset, W: Wait>(
+    controller: &ApiController<P, W>,
+    target: Checkpoint,
+) -> Arc<BeaconState<P>> {
+    if !controller.is_forward_synced() {
+        return controller.head_state().value;
+    }
+
+    if let Some(state) = controller.state_before_or_at_slot(
+        target.root,
+        misc::compute_start_slot_at_epoch::<P>(target.epoch),
+    ) {
+        if accessors::get_current_epoch(&state) == target.epoch {
+            return state;
+        }
+    }
+
+    match controller.preprocessed_state_at_current_slot_blocking() {
+        Ok(state) => state,
+        Err(error) => {
+            debug_with_peers!(
+                "failed to get state at current slot for attestation conversion: {error}. \
+                 Using head state instead",
+            );
+
+            controller.head_state().value
+        }
+    }
 }

@@ -1,14 +1,9 @@
 // TODO(32-bit support): Review all uses of `typenum::Unsigned::USIZE`.
 
-#![expect(
-    clippy::allow_attributes,
-    reason = "clippy::allow_attributes lint triggers from some derive macros. \
-              See <https://github.com/rust-lang/rust-clippy/issues/13349>."
-)]
 use core::{fmt::Debug, hash::Hash, marker::PhantomData};
 
 use derivative::Derivative;
-use derive_more::{AsRef, Deref, DerefMut};
+use derive_more::{Deref, DerefMut};
 use ethereum_types::H256;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use try_from_iterator::TryFromIterator;
@@ -109,8 +104,7 @@ impl<T: SszSize, N> SszSize for ContiguousList<T, N> {
 
 impl<C, T: SszRead<C>, N: Unsigned> SszRead<C> for ContiguousList<T, N> {
     fn from_ssz_unchecked(context: &C, bytes: &[u8]) -> Result<Self, ReadError> {
-        let results = shared::read_list(context, bytes)?;
-        itertools::process_results(results, |elements| Self::try_from_iter(elements))?
+        shared::read_list(N::USIZE, context, bytes)
     }
 }
 
@@ -149,7 +143,7 @@ impl<T, N> ContiguousList<T, N> {
         ContiguousList::new_unchecked(self.into_iter().map(function).collect())
     }
 
-    const fn validate_length(actual: usize) -> Result<(), ReadError>
+    pub(crate) const fn validate_length(actual: usize) -> Result<(), ReadError>
     where
         N: Unsigned,
     {
@@ -162,7 +156,7 @@ impl<T, N> ContiguousList<T, N> {
         Ok(())
     }
 
-    const fn new_unchecked(elements: Box<[T]>) -> Self {
+    pub(crate) const fn new_unchecked(elements: Box<[T]>) -> Self {
         Self {
             elements,
             phantom: PhantomData,

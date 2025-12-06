@@ -1,5 +1,6 @@
 use anyhow::{ensure, Result};
 use helper_functions::misc;
+use pubkey_cache::PubkeyCache;
 use ssz::Hc;
 use types::{
     config::Config, electra::beacon_state::BeaconState, phase0::primitives::Slot, preset::Preset,
@@ -8,8 +9,10 @@ use types::{
 use super::epoch_processing;
 use crate::unphased::{self, Error};
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_slots<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut Hc<BeaconState<P>>,
     slot: Slot,
 ) -> Result<()> {
@@ -26,7 +29,7 @@ pub fn process_slots<P: Preset>(
 
         // > Process epoch on the start slot of the next epoch
         if misc::is_epoch_start::<P>(state.slot + 1) {
-            epoch_processing::process_epoch(config, state)?;
+            epoch_processing::process_epoch(config, pubkey_cache, state)?;
         }
 
         state.slot += 1;

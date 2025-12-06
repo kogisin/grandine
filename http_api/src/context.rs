@@ -6,27 +6,29 @@ use attestation_verifier::AttestationVerifier;
 use block_producer::{BlockProducer, Options as BlockProducerOptions};
 use bls::{traits::SecretKey as _, PublicKeyBytes, SecretKey};
 use clock::Tick;
+use dashmap::DashMap;
 use database::Database;
 use dedicated_executor::DedicatedExecutor;
 use deposit_tree::DepositTree;
 use enum_iterator::Sequence as _;
-use eth1::{Eth1Chain, Eth1Config};
+use eth1::Eth1Config;
 use eth1_api::{Eth1Api, Eth1ExecutionEngine, ExecutionService};
 #[cfg(feature = "eth2-cache")]
 use eth2_cache_utils::mainnet;
 use features::Feature;
 use fork_choice_control::{
-    Controller, StateLoadStrategy, Storage, StorageMode, DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
+    Controller, EventChannels, StateLoadStrategy, Storage, StorageMode,
+    DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
 };
 use fork_choice_store::StoreConfig;
 use futures::{future::FutureExt as _, lock::Mutex, select_biased};
 use genesis::AnchorCheckpointProvider;
-use http_api_utils::EventChannels;
 use keymanager::KeyManager;
 use liveness_tracker::LivenessTracker;
 use once_cell::sync::OnceCell;
 use operation_pools::{AttestationAggPool, BlsToExecutionChangePool, SyncCommitteeAggPool};
 use p2p::{NetworkConfig, SubnetService, SyncToApi};
+use pubkey_cache::PubkeyCache;
 use reqwest::Client;
 use signer::{KeyOrigin, Signer, Web3SignerConfig};
 use slashing_protection::{SlashingProtector, DEFAULT_SLASHING_PROTECTION_HISTORY_LIMIT};
@@ -118,17 +120,6 @@ impl<P: Preset> Context<P> {
 
         let client = Client::new();
 
-        let eth1_chain = Eth1Chain::new(
-            chain_config.clone_arc(),
-            eth1_config.clone_arc(),
-            client.clone(),
-            Database::in_memory(),
-            None,
-            None,
-        )?;
-
-        eth1_chain.spawn_unfinalized_blocks_tracker_task()?;
-
         let eth1_api = Arc::new(Eth1Api::new(
             chain_config.clone_arc(),
             client.clone(),
@@ -144,8 +135,11 @@ impl<P: Preset> Context<P> {
             execution_service_tx,
         ));
 
+        let pubkey_cache = Arc::new(PubkeyCache::default());
+
         let storage = Arc::new(Storage::new(
             chain_config.clone_arc(),
+            pubkey_cache.clone_arc(),
             Database::in_memory(),
             DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
             StorageMode::Standard,
@@ -174,8 +168,11 @@ impl<P: Preset> Context<P> {
 
         let event_channels = Arc::new(EventChannels::default());
 
+        let sidecars_construction_started = Arc::new(DashMap::new());
+
         let (controller, mutator_handle) = Controller::new(
             chain_config,
+            pubkey_cache,
             store_config,
             anchor_block,
             anchor_state.clone_arc(),
@@ -192,6 +189,8 @@ impl<P: Preset> Context<P> {
             storage,
             core::iter::empty(),
             true,
+            [].into(),
+            sidecars_construction_started,
         )?;
 
         for block in extra_blocks {
@@ -233,7 +232,10 @@ impl<P: Preset> Context<P> {
 
         let slashing_protector = Arc::new(Mutex::new(slashing_protector));
 
-        let validator_config = Arc::new(ValidatorConfig::default());
+        let validator_config = Arc::new(ValidatorConfig {
+            disable_blockprint_graffiti: true,
+            ..Default::default()
+        });
 
         let keymanager = Arc::new(KeyManager::new_in_memory(
             signer.clone_arc(),
@@ -251,14 +253,19 @@ impl<P: Preset> Context<P> {
             fc_to_attestation_verifier_rx,
         );
 
-        let attestation_agg_pool =
-            AttestationAggPool::new(controller.clone_arc(), dedicated_executor.clone_arc(), None);
+        let attestation_agg_pool = AttestationAggPool::new(
+            controller.clone_arc(),
+            dedicated_executor.clone_arc(),
+            None,
+            None,
+        );
 
         let sync_committee_agg_pool = SyncCommitteeAggPool::new(
             dedicated_executor.clone_arc(),
             controller.clone_arc(),
             Some(pool_to_liveness_tx),
             pool_to_p2p_tx.clone(),
+            None,
             None,
         );
 
@@ -283,7 +290,6 @@ impl<P: Preset> Context<P> {
             None,
             controller.clone_arc(),
             dedicated_executor,
-            eth1_chain,
             execution_engine,
             attestation_agg_pool.clone_arc(),
             bls_to_execution_change_pool.clone_arc(),
@@ -305,6 +311,10 @@ impl<P: Preset> Context<P> {
             validator_to_slasher_tx: None,
         };
 
+        let mut network_config = NetworkConfig::default();
+        network_config.identify_agent_version = Some(IDENTIFY_AGENT_VERSION.to_owned());
+        let network_config = Arc::new(network_config);
+
         let validator = Validator::new(
             validator_config.clone_arc(),
             block_producer.clone_arc(),
@@ -318,12 +328,11 @@ impl<P: Preset> Context<P> {
             slashing_protector,
             sync_committee_agg_pool.clone_arc(),
             None,
+            None,
             validator_channels,
+            network_config.network_dir.as_deref(),
+            network_config.subscribe_all_data_column_subnets,
         );
-
-        let mut network_config = NetworkConfig::default();
-        network_config.identify_agent_version = Some(IDENTIFY_AGENT_VERSION.to_owned());
-        let network_config = Arc::new(network_config);
 
         let subnet_service = SubnetService::new(
             attestation_agg_pool.clone_arc(),
@@ -360,6 +369,7 @@ impl<P: Preset> Context<P> {
             bls_to_execution_change_pool,
             channels,
             metrics: None,
+            tracing_handle: None,
         };
 
         let test_state = TestState {
@@ -493,8 +503,9 @@ impl Context<Mainnet> {
 
 impl Context<Minimal> {
     pub fn minimal_minimal_all_keys() -> Self {
+        let pubkey_cache = PubkeyCache::default();
         let chain_config = ChainConfig::minimal();
-        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config);
+        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config, &pubkey_cache);
         let validator_keys = Self::interop_validator_keys(genesis_state.validators().len_u64());
 
         let anchor_checkpoint_provider =
@@ -518,12 +529,14 @@ impl Context<Minimal> {
 
     pub fn minimal_minimal_4_epochs() -> Self {
         let chain_config = ChainConfig::minimal();
-        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config);
+        let pubkey_cache = PubkeyCache::default();
+        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config, &pubkey_cache);
         let anchor_checkpoint_provider =
             AnchorCheckpointProvider::custom_from_genesis(genesis_state.clone_arc());
 
-        let extra_blocks = factory::full_blocks_up_to_epoch(&chain_config, genesis_state, 4)
-            .expect("blocks should be constructed successfully");
+        let extra_blocks =
+            factory::full_blocks_up_to_epoch(&chain_config, &pubkey_cache, genesis_state, 4)
+                .expect("blocks should be constructed successfully");
 
         let FinalizedCheckpoint {
             block: anchor_block,
@@ -543,7 +556,8 @@ impl Context<Minimal> {
 
     pub fn minimal_rapid_upgrade_none() -> Self {
         let chain_config = ChainConfig::minimal().rapid_upgrade();
-        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config);
+        let pubkey_cache = PubkeyCache::default();
+        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config, &pubkey_cache);
         let anchor_checkpoint_provider =
             AnchorCheckpointProvider::custom_from_genesis(genesis_state);
 
@@ -565,7 +579,8 @@ impl Context<Minimal> {
 
     pub fn minimal_rapid_upgrade_all_keys() -> Self {
         let chain_config = ChainConfig::minimal().rapid_upgrade();
-        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config);
+        let pubkey_cache = PubkeyCache::default();
+        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config, &pubkey_cache);
         let validator_keys = Self::interop_validator_keys(genesis_state.validators().len_u64());
         let anchor_checkpoint_provider =
             AnchorCheckpointProvider::custom_from_genesis(genesis_state);
@@ -588,13 +603,15 @@ impl Context<Minimal> {
 
     pub fn minimal_rapid_upgrade_all_phases_all_keys() -> Self {
         let chain_config = ChainConfig::minimal().rapid_upgrade();
-        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config);
+        let pubkey_cache = PubkeyCache::default();
+        let (genesis_state, deposit_tree) = Self::min_genesis_state(&chain_config, &pubkey_cache);
         let anchor_checkpoint_provider =
             AnchorCheckpointProvider::custom_from_genesis(genesis_state.clone_arc());
         let validator_keys = Self::interop_validator_keys(genesis_state.validators().len_u64());
 
         let extra_blocks = factory::full_blocks_up_to_epoch(
             &chain_config,
+            &pubkey_cache,
             genesis_state,
             Phase::CARDINALITY
                 .try_into()
@@ -618,8 +635,11 @@ impl Context<Minimal> {
         }
     }
 
-    fn min_genesis_state(chain_config: &ChainConfig) -> (Arc<BeaconState<Minimal>>, DepositTree) {
-        factory::min_genesis_state(chain_config)
+    fn min_genesis_state(
+        chain_config: &ChainConfig,
+        pubkey_cache: &PubkeyCache,
+    ) -> (Arc<BeaconState<Minimal>>, DepositTree) {
+        factory::min_genesis_state(chain_config, pubkey_cache)
             .expect("configurations used in this impl block should be valid")
     }
 }

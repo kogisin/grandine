@@ -1,19 +1,15 @@
-use core::{fmt::Display, future::Future, num::NonZeroU64, ops::Div as _};
+use core::{fmt::Display, future::Future, ops::Div as _};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use anyhow::{Context as _, Error as AnyhowError, Result};
-use bls::{
-    traits::{CachedPublicKey as _, Signature as _},
-    AggregateSignature, PublicKeyBytes, SignatureBytes,
-};
+use bls::{traits::Signature as _, AggregateSignature, PublicKeyBytes, SignatureBytes};
 use builder_api::{combined::SignedBuilderBid, BuilderApi};
 use cached::{Cached as _, SizedCache};
 use dedicated_executor::{DedicatedExecutor, Job};
-use eth1::Eth1Chain;
-use eth1_api::{ApiController, Eth1ExecutionEngine};
+use eth1_api::{ApiController, Eth1ExecutionEngine, WithClientVersions};
 use execution_engine::{
     ExecutionEngine as _, PayloadAttributes, PayloadAttributesV1, PayloadAttributesV2,
     PayloadAttributesV3, PayloadId,
@@ -27,17 +23,18 @@ use futures::{
 use helper_functions::{accessors, misc, predicates};
 use itertools::{Either, Itertools as _};
 use keymanager::ProposerConfigs;
-use log::{error, info, warn};
-use nonzero_ext::nonzero;
+use logging::{error_with_peers, info_with_peers, warn_with_peers};
 use operation_pools::{
     AttestationAggPool, BlsToExecutionChangePool, PoolAdditionOutcome, PoolRejectionReason,
     SyncCommitteeAggPool,
 };
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
 use ssz::{BitList, BitVector, ContiguousList, SszHash};
 use std_ext::ArcExt as _;
 use tap::Pipe as _;
 use tokio::task::JoinHandle;
+use tracing::instrument;
 use transition_functions::{capella, electra, unphased};
 use try_from_iterator::TryFromIterator as _;
 use typenum::Unsigned as _;
@@ -74,35 +71,35 @@ use types::{
         BeaconBlock as ElectraBeaconBlock, BeaconBlockBody as ElectraBeaconBlockBody,
         ExecutionRequests,
     },
+    fulu::containers::{BeaconBlock as FuluBeaconBlock, BeaconBlockBody as FuluBeaconBlockBody},
     nonstandard::{BlockRewards, Phase, WithBlobsAndMev},
     phase0::{
         consts::FAR_FUTURE_EPOCH,
         containers::{
             Attestation, AttestationData, AttesterSlashing as Phase0AttesterSlashing,
-            BeaconBlock as Phase0BeaconBlock, BeaconBlockBody as Phase0BeaconBlockBody, Deposit,
-            Eth1Data, ProposerSlashing, SignedVoluntaryExit,
+            BeaconBlock as Phase0BeaconBlock, BeaconBlockBody as Phase0BeaconBlockBody,
+            ProposerSlashing, SignedVoluntaryExit,
         },
         primitives::{
-            CommitteeIndex, DepositIndex, Epoch, ExecutionAddress, ExecutionBlockHash, Slot,
-            Uint256, ValidatorIndex, H256,
+            CommitteeIndex, Epoch, ExecutionAddress, ExecutionBlockHash, Slot, Uint256,
+            ValidatorIndex, H256,
         },
     },
     preset::{Preset, SyncSubcommitteeSize},
     traits::{BeaconState as _, PostBellatrixBeaconState},
 };
 
-use crate::{
-    eth1_storage::Eth1Storage as _,
-    misc::{PayloadIdEntry, ProposerData, ValidatorBlindedBlock},
-};
+use crate::misc::{build_graffiti, PayloadIdEntry, ProposerData, ValidatorBlindedBlock};
 
-const DEFAULT_BUILDER_BOOST_FACTOR: NonZeroU64 = nonzero!(100_u64);
 const PAYLOAD_CACHE_SIZE: usize = 20;
 const PAYLOAD_ID_CACHE_SIZE: usize = 10;
 
 pub type ExecutionPayloadHeaderJoinHandle<P> = JoinHandle<Result<Option<SignedBuilderBid<P>>>>;
 pub type LocalExecutionPayloadJoinHandle<P> =
-    JoinHandle<Option<WithBlobsAndMev<ExecutionPayload<P>, P>>>;
+    JoinHandle<Option<WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>>>;
+
+type PayloadCache<P> =
+    Mutex<SizedCache<H256, WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>>>;
 
 #[derive(Default)]
 pub struct Options {
@@ -120,7 +117,6 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
         builder_api: Option<Arc<BuilderApi>>,
         controller: ApiController<P, W>,
         dedicated_executor: Arc<DedicatedExecutor>,
-        eth1_chain: Eth1Chain,
         execution_engine: Arc<Eth1ExecutionEngine<P>>,
         attestation_agg_pool: Arc<AttestationAggPool<P, W>>,
         bls_to_execution_change_pool: Arc<BlsToExecutionChangePool>,
@@ -134,11 +130,11 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
 
         let producer_context = Arc::new(ProducerContext {
             chain_config: controller.chain_config().clone_arc(),
+            pubkey_cache: controller.pubkey_cache().clone_arc(),
             proposer_configs,
             builder_api,
             controller,
             dedicated_executor,
-            eth1_chain,
             execution_engine,
             attestation_agg_pool,
             bls_to_execution_change_pool,
@@ -284,16 +280,6 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
             })
     }
 
-    pub fn finalize_deposits(
-        &self,
-        finalized_deposit_index: DepositIndex,
-        deposit_requests_start_index: Option<DepositIndex>,
-    ) {
-        self.producer_context
-            .eth1_chain
-            .finalize_deposits(finalized_deposit_index, deposit_requests_start_index)
-    }
-
     pub async fn get_attester_slashings(&self) -> Vec<AttesterSlashing<P>> {
         self.producer_context
             .attester_slashings
@@ -360,13 +346,15 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
         let state = self
             .producer_context
             .controller
-            .preprocessed_state_at_current_slot()?;
+            .preprocessed_state_at_current_slot()
+            .await?;
 
         // TODO(feature/electra): implement trait for types::combined::AttesterSlashing
         let result = match slashing {
             AttesterSlashing::Phase0(ref attester_slashing) => {
                 unphased::validate_attester_slashing(
                     &self.producer_context.chain_config,
+                    &self.producer_context.pubkey_cache,
                     &state,
                     attester_slashing,
                 )
@@ -374,6 +362,7 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
             AttesterSlashing::Electra(ref attester_slashing) => {
                 unphased::validate_attester_slashing(
                     &self.producer_context.chain_config,
+                    &self.producer_context.pubkey_cache,
                     &state,
                     attester_slashing,
                 )
@@ -414,10 +403,12 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
         let state = self
             .producer_context
             .controller
-            .preprocessed_state_at_current_slot()?;
+            .preprocessed_state_at_current_slot()
+            .await?;
 
         let outcome = match unphased::validate_proposer_slashing(
             &self.producer_context.chain_config,
+            &self.producer_context.pubkey_cache,
             &state,
             slashing,
         ) {
@@ -426,7 +417,7 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
                 PoolAdditionOutcome::Accept
             }
             Err(error) => {
-                warn!(
+                warn_with_peers!(
                     "external proposer slashing rejected (error: {error}, slashing: {slashing:?})",
                 );
                 PoolAdditionOutcome::Reject(PoolRejectionReason::InvalidProposerSlashing, error)
@@ -454,19 +445,32 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
         let state = self
             .producer_context
             .controller
-            .preprocessed_state_at_current_slot()?;
+            .preprocessed_state_at_current_slot()
+            .await?;
 
         let result = match state.as_ref() {
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
             | BeaconState::Bellatrix(_)
             | BeaconState::Capella(_)
-            | BeaconState::Deneb(_) => {
-                unphased::validate_voluntary_exit(&self.producer_context.chain_config, &state, exit)
-            }
-            BeaconState::Electra(state) => {
-                electra::validate_voluntary_exit(&self.producer_context.chain_config, state, exit)
-            }
+            | BeaconState::Deneb(_) => unphased::validate_voluntary_exit(
+                &self.producer_context.chain_config,
+                &self.producer_context.pubkey_cache,
+                &state,
+                exit,
+            ),
+            BeaconState::Electra(state) => electra::validate_voluntary_exit(
+                &self.producer_context.chain_config,
+                &self.producer_context.pubkey_cache,
+                state,
+                exit,
+            ),
+            BeaconState::Fulu(state) => electra::validate_voluntary_exit(
+                &self.producer_context.chain_config,
+                &self.producer_context.pubkey_cache,
+                state,
+                exit,
+            ),
         };
 
         let outcome = match result {
@@ -496,14 +500,17 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
     pub async fn publish_signed_blinded_block(
         &self,
         block: &SignedBlindedBeaconBlock<P>,
-    ) -> Option<WithBlobsAndMev<ExecutionPayload<P>, P>> {
+    ) -> Option<WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>> {
         let header_root = block.execution_payload_header().hash_tree_root();
         let mut payload_cache = self.producer_context.payload_cache.lock().await;
         let local_payload = payload_cache.cache_get(&header_root);
 
         match local_payload {
             Some(payload) => Some(payload.clone()),
-            None => self.publish_signed_blinded_block_using_builder(block).await,
+            None => self
+                .publish_signed_blinded_block_using_builder(block)
+                .await
+                .map(WithClientVersions::none),
         }
     }
 
@@ -520,7 +527,7 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
             current_slot,
             controller.snapshot().nonempty_slots(head_block_root),
         ) {
-            warn!("cannot use Builder API for execution payload: {error}");
+            warn_with_peers!("cannot use Builder API for execution payload: {error}");
             return None;
         }
 
@@ -534,7 +541,21 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
         {
             Ok(execution_payload) => execution_payload,
             Err(error) => {
-                warn!("failed to post blinded block to the builder node: {error:?}");
+                if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
+                    if reqwest_error.is_timeout() {
+                        // If posting signed blinded beacon block to builder fails, don't print a warning,
+                        // because builder should publish the block anyway, just cannot respond in a timely
+                        // manner. We cannot do anything else here either, but exit early from propose, due
+                        // to the risk of slashing.
+                        log_with_feature(format_args!(
+                            "failed to post blinded block to the builder node: {error:?}",
+                        ));
+                    }
+
+                    return None;
+                }
+
+                warn_with_peers!("failed to post blinded block to the builder node: {error:?}");
                 return None;
             }
         };
@@ -571,21 +592,17 @@ impl<P: Preset, W: Wait> BlockProducer<P, W> {
                 "voluntary_exits",
                 self.producer_context.voluntary_exits.lock().await.len(),
             );
-
-            self.producer_context
-                .eth1_chain
-                .track_collection_metrics(metrics);
         }
     }
 }
 
 struct ProducerContext<P: Preset, W: Wait> {
     chain_config: Arc<ChainConfig>,
+    pubkey_cache: Arc<PubkeyCache>,
     proposer_configs: Arc<ProposerConfigs>,
     builder_api: Option<Arc<BuilderApi>>,
     controller: ApiController<P, W>,
     dedicated_executor: Arc<DedicatedExecutor>,
-    eth1_chain: Eth1Chain,
     execution_engine: Arc<Eth1ExecutionEngine<P>>,
     attestation_agg_pool: Arc<AttestationAggPool<P, W>>,
     bls_to_execution_change_pool: Arc<BlsToExecutionChangePool>,
@@ -594,7 +611,7 @@ struct ProducerContext<P: Preset, W: Wait> {
     proposer_slashings: Mutex<Vec<ProposerSlashing>>,
     attester_slashings: Mutex<Vec<AttesterSlashing<P>>>,
     voluntary_exits: Mutex<Vec<SignedVoluntaryExit>>,
-    payload_cache: Mutex<SizedCache<H256, WithBlobsAndMev<ExecutionPayload<P>, P>>>,
+    payload_cache: PayloadCache<P>,
     payload_id_cache: Mutex<SizedCache<(H256, Slot), PayloadId>>,
     metrics: Option<Arc<Metrics>>,
     fake_execution_payloads: bool,
@@ -602,9 +619,10 @@ struct ProducerContext<P: Preset, W: Wait> {
 
 #[derive(Clone, Copy, Default)]
 pub struct BlockBuildOptions {
-    pub graffiti: H256,
+    pub graffiti: Option<H256>,
+    pub disable_blockprint_graffiti: bool,
     pub skip_randao_verification: bool,
-    pub builder_boost_factor: Option<u64>,
+    pub builder_boost_factor: Uint256,
 }
 
 #[derive(Clone)]
@@ -628,8 +646,12 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             .as_ref()
             .map(|metrics| metrics.build_beacon_block_times.start_timer());
 
-        let block_without_state_root = self
-            .build_beacon_block_without_state_root(randao_reveal)
+        let block_without_state_root =
+            wait_for_result(self.spawn_job(|build_context| async move {
+                build_context
+                    .build_beacon_block_without_state_root(randao_reveal)
+                    .await
+            }))
             .await?;
 
         let produce_beacon_block_join_handle = self.spawn_job(|build_context| async move {
@@ -652,8 +674,12 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             Option<BlockRewards>,
         )>,
     > {
-        let block_without_state_root = self
-            .build_beacon_block_without_state_root(randao_reveal)
+        let block_without_state_root =
+            wait_for_result(self.spawn_job(|build_context| async move {
+                build_context
+                    .build_beacon_block_without_state_root(randao_reveal)
+                    .await
+            }))
             .await?;
 
         let block = block_without_state_root.clone();
@@ -679,18 +705,14 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 Some((blinded_block, blinded_block_rewards, builder_mev)),
             ) => {
                 if let Some(local_mev) = beacon_block.mev {
-                    let builder_boost_factor = Uint256::from_u64(
-                        self.options
-                            .builder_boost_factor
-                            .unwrap_or(DEFAULT_BUILDER_BOOST_FACTOR.get()),
-                    );
+                    let builder_boost_factor = self.options.builder_boost_factor;
 
                     let boosted_builder_mev = builder_mev
-                        .div(DEFAULT_BUILDER_BOOST_FACTOR)
+                        .div(Uint256::from_u64(100))
                         .saturating_mul(builder_boost_factor);
 
                     if local_mev >= boosted_builder_mev {
-                        info!(
+                        info_with_peers!(
                             "using more profitable local payload: \
                              local MEV: {local_mev}, builder MEV: {builder_mev}, \
                              boosted builder MEV: {boosted_builder_mev}, builder_boost_factor: {builder_boost_factor}",
@@ -703,25 +725,10 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                     }
                 }
 
-                let block = ValidatorBlindedBlock::BlindedBeaconBlock {
-                    blinded_block,
-                    execution_payload: Box::new(
-                        beacon_block
-                            .value
-                            .execution_payload()
-                            .expect("post-Bellatrix blocks should have execution payload"),
-                    ),
-                };
+                let block = ValidatorBlindedBlock::BlindedBeaconBlock(blinded_block);
 
                 Ok(Some((
-                    WithBlobsAndMev::new(
-                        block,
-                        None,
-                        beacon_block.proofs,
-                        beacon_block.blobs,
-                        Some(builder_mev),
-                        None,
-                    ),
+                    WithBlobsAndMev::new(block, None, None, None, Some(builder_mev), None),
                     blinded_block_rewards,
                 )))
             }
@@ -738,8 +745,8 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         &self,
         randao_reveal: SignatureBytes,
     ) -> Result<BeaconBlock<P>> {
-        let eth1_data = self.prepare_eth1_data()?;
-        let deposits = self.prepare_deposits(eth1_data)?;
+        let eth1_data = self.beacon_state.eth1_data();
+        let deposits = ContiguousList::default();
 
         // TODO(Grandine Team): Preparing slashings and voluntary exits independently may result
         //                      in an invalid block because a validator can only exit or be
@@ -755,7 +762,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         let slot = self.beacon_state.slot();
         let proposer_index = self.proposer_index;
         let parent_root = self.head_block_root;
-        let graffiti = self.options.graffiti;
+        let graffiti = self.options.graffiti.unwrap_or_default();
 
         // This is a placeholder that is overwritten later using `with_state_root`.
         // We define this explicitly instead of using struct update syntax to ensure
@@ -853,94 +860,111 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                     blob_kzg_commitments: ContiguousList::default(),
                 },
             }),
-            Phase::Electra => {
-                let attestations = if misc::compute_epoch_at_slot::<P>(slot)
-                    == self.producer_context.chain_config.electra_fork_epoch
-                {
-                    ContiguousList::default()
-                } else {
-                    // Store results in a vec to preserve insertion order and thus the results of the packing algorithm
-                    let mut results: Vec<(
-                        AttestationData,
-                        HashSet<CommitteeIndex>,
-                        Vec<ElectraAttestation<P>>,
-                    )> = Vec::new();
+            Phase::Electra | Phase::Fulu => {
+                // Store results in a vec to preserve insertion order and thus the results of the packing algorithm
+                let mut results: Vec<(
+                    AttestationData,
+                    HashSet<CommitteeIndex>,
+                    Vec<ElectraAttestation<P>>,
+                )> = Vec::new();
 
-                    for (electra_attestation, committee_index) in
-                        attestations.into_iter().filter_map(|attestation| {
-                            let committee_index = attestation.data.index;
+                for (electra_attestation, committee_index) in
+                    attestations.into_iter().filter_map(|attestation| {
+                        let committee_index = attestation.data.index;
 
-                            match operation_pools::convert_to_electra_attestation(attestation) {
-                                Ok(electra_attestation) => {
-                                    Some((electra_attestation, committee_index))
-                                }
-                                Err(error) => {
-                                    warn!("unable to convert to electra attestation: {error:?}");
-                                    None
-                                }
+                        match operation_pools::convert_to_electra_attestation(attestation) {
+                            Ok(electra_attestation) => Some((electra_attestation, committee_index)),
+                            Err(error) => {
+                                warn_with_peers!(
+                                    "unable to convert to electra attestation: {error:?}"
+                                );
+                                None
                             }
+                        }
+                    })
+                {
+                    if let Some((_, indices, attestations)) =
+                        results.iter_mut().find(|(data, indices, _)| {
+                            *data == electra_attestation.data && !indices.contains(&committee_index)
                         })
                     {
-                        if let Some((_, indices, attestations)) =
-                            results.iter_mut().find(|(data, indices, _)| {
-                                *data == electra_attestation.data
-                                    && !indices.contains(&committee_index)
-                            })
-                        {
-                            indices.insert(committee_index);
-                            attestations.push(electra_attestation);
-                        } else {
-                            results.push((
-                                electra_attestation.data,
-                                HashSet::from([committee_index]),
-                                vec![electra_attestation],
-                            ))
-                        }
+                        indices.insert(committee_index);
+                        attestations.push(electra_attestation);
+                    } else {
+                        results.push((
+                            electra_attestation.data,
+                            HashSet::from([committee_index]),
+                            vec![electra_attestation],
+                        ))
                     }
+                }
 
-                    let attestations = results
-                        .into_iter()
-                        .filter_map(|(_, _, attestations)| {
-                            match Self::compute_on_chain_aggregate(attestations.into_iter()) {
-                                Ok(electra_aggregate) => Some(electra_aggregate),
-                                Err(error) => {
-                                    warn!("unable to compute on chain aggregate: {error:?}");
-                                    None
-                                }
+                let attestations = results
+                    .into_iter()
+                    .filter_map(|(_, _, attestations)| {
+                        match Self::compute_on_chain_aggregate(attestations.into_iter()) {
+                            Ok(electra_aggregate) => Some(electra_aggregate),
+                            Err(error) => {
+                                warn_with_peers!("unable to compute on chain aggregate: {error:?}");
+                                None
                             }
-                        })
-                        .take(P::MaxAttestationsElectra::USIZE);
+                        }
+                    })
+                    .take(P::MaxAttestationsElectra::USIZE);
 
-                    ContiguousList::try_from_iter(attestations)?
-                };
+                let attestations = ContiguousList::try_from_iter(attestations)?;
 
-                BeaconBlock::from(ElectraBeaconBlock {
-                    slot,
-                    proposer_index,
-                    parent_root,
-                    state_root,
-                    body: ElectraBeaconBlockBody {
-                        randao_reveal,
-                        eth1_data,
-                        graffiti,
-                        proposer_slashings,
-                        attester_slashings: self.prepare_attester_slashings_electra().await,
-                        attestations,
-                        deposits,
-                        voluntary_exits,
-                        sync_aggregate,
-                        execution_payload: DenebExecutionPayload::default(),
-                        bls_to_execution_changes,
-                        blob_kzg_commitments: ContiguousList::default(),
-                        execution_requests: ExecutionRequests::default(),
-                    },
-                })
+                if self.beacon_state.phase() == Phase::Electra {
+                    BeaconBlock::from(ElectraBeaconBlock {
+                        slot,
+                        proposer_index,
+                        parent_root,
+                        state_root,
+                        body: ElectraBeaconBlockBody {
+                            randao_reveal,
+                            eth1_data,
+                            graffiti,
+                            proposer_slashings,
+                            attester_slashings: self.prepare_attester_slashings_electra().await,
+                            attestations,
+                            deposits,
+                            voluntary_exits,
+                            sync_aggregate,
+                            execution_payload: DenebExecutionPayload::default(),
+                            bls_to_execution_changes,
+                            blob_kzg_commitments: ContiguousList::default(),
+                            execution_requests: ExecutionRequests::default(),
+                        },
+                    })
+                } else {
+                    BeaconBlock::from(FuluBeaconBlock {
+                        slot,
+                        proposer_index,
+                        parent_root,
+                        state_root,
+                        body: FuluBeaconBlockBody {
+                            randao_reveal,
+                            eth1_data,
+                            graffiti,
+                            proposer_slashings,
+                            attester_slashings: self.prepare_attester_slashings_electra().await,
+                            attestations,
+                            deposits,
+                            voluntary_exits,
+                            sync_aggregate,
+                            execution_payload: DenebExecutionPayload::default(),
+                            bls_to_execution_changes,
+                            blob_kzg_commitments: ContiguousList::default(),
+                            execution_requests: ExecutionRequests::default(),
+                        },
+                    })
+                }
             }
         }
         .pipe(Ok)
     }
 
-    pub fn compute_on_chain_aggregate(
+    fn compute_on_chain_aggregate(
         attestations: impl Iterator<Item = ElectraAttestation<P>>,
     ) -> Result<ElectraAttestation<P>> {
         let aggregates = attestations
@@ -994,7 +1018,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         ) {
             Ok(block) => block,
             Err(error) => {
-                warn!("constructed invalid blinded beacon block (error: {error:?})");
+                warn_with_peers!("constructed invalid blinded beacon block (error: {error:?})");
                 return None;
             }
         };
@@ -1016,7 +1040,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         let (post_state, block_rewards) = match result {
             Ok((state, block_rewards)) => (state, block_rewards),
             Err(error) => {
-                warn!(
+                warn_with_peers!(
                     "constructed invalid blinded beacon block \
                      (error: {error:?}, without_state_root: {without_state_root:?})",
                 );
@@ -1052,7 +1076,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         let (post_state, block_rewards) = match result {
             Ok((state, block_rewards)) => (state, block_rewards),
             Err(error) => {
-                warn!(
+                warn_with_peers!(
                     "constructed invalid beacon block \
                      (error: {error:?}, without_state_root: {without_state_root:?})",
                 );
@@ -1068,26 +1092,32 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         Some((beacon_block, block_rewards))
     }
 
-    pub async fn produce_beacon_block(
+    async fn produce_beacon_block(
         &self,
         block_without_state_root: BeaconBlock<P>,
         local_execution_payload_handle: Option<LocalExecutionPayloadJoinHandle<P>>,
     ) -> Result<Option<(WithBlobsAndMev<BeaconBlock<P>, P>, Option<BlockRewards>)>> {
-        let with_blobs_and_mev = if let Some(handle) = local_execution_payload_handle {
-            handle.await?.map(|value| value.map(Some))
+        let payload_with_data = if let Some(handle) = local_execution_payload_handle {
+            handle
+                .await?
+                .map(|value| value.map(|value| value.map(Some)))
         } else {
             None
         };
 
-        let WithBlobsAndMev {
-            value: execution_payload,
-            commitments,
-            proofs,
-            blobs,
-            mev,
-            execution_requests,
-        } = match with_blobs_and_mev {
-            Some(payload_with_mev) => payload_with_mev,
+        let WithClientVersions {
+            client_versions,
+            result:
+                WithBlobsAndMev {
+                    value: execution_payload,
+                    commitments,
+                    proofs,
+                    blobs,
+                    mev,
+                    execution_requests,
+                },
+        } = match payload_with_data {
+            Some(payload_with_mev_and_versions) => payload_with_mev_and_versions,
             None => {
                 if self.beacon_state.post_capella().is_some()
                     || post_merge_state(&self.beacon_state).is_some()
@@ -1095,14 +1125,19 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                     return Err(AnyhowError::msg("no execution payload to include in block"));
                 }
 
-                WithBlobsAndMev::with_default(None)
+                WithClientVersions::none(WithBlobsAndMev::with_default(None))
             }
         };
 
-        let without_state_root_with_payload = block_without_state_root
+        let mut without_state_root_with_payload = block_without_state_root
             .with_execution_payload(execution_payload)?
             .with_blob_kzg_commitments(commitments)
             .with_execution_requests(execution_requests);
+
+        if !self.options.disable_blockprint_graffiti {
+            let graffiti = build_graffiti(self.options.graffiti, client_versions);
+            without_state_root_with_payload.set_graffiti(graffiti);
+        }
 
         self.process_beacon_block(without_state_root_with_payload)
             .map(|(beacon_block, block_rewards)| {
@@ -1123,9 +1158,9 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             .pipe(Ok)
     }
 
-    pub async fn produce_blinded_block(
+    async fn produce_blinded_block(
         &self,
-        block_without_state_root: BeaconBlock<P>,
+        mut block_without_state_root: BeaconBlock<P>,
         execution_payload_header_handle: Option<ExecutionPayloadHeaderJoinHandle<P>>,
     ) -> Result<Option<(BlindedBeaconBlock<P>, Option<BlockRewards>, Uint256)>> {
         let Some(header_handle) = execution_payload_header_handle else {
@@ -1138,6 +1173,11 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 let execution_requests = response.execution_requests().cloned();
                 let builder_mev = response.mev();
 
+                if !self.options.disable_blockprint_graffiti {
+                    let graffiti = build_graffiti(self.options.graffiti, None);
+                    block_without_state_root.set_graffiti(graffiti);
+                }
+
                 self.blinded_block_from_beacon_block(
                     block_without_state_root,
                     response.execution_payload_header(),
@@ -1149,21 +1189,10 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             }
             Ok(None) => Ok(None),
             Err(error) => {
-                warn!("failed to get execution payload header: {error}");
+                warn_with_peers!("failed to get execution payload header: {error}");
                 Ok(None)
             }
         }
-    }
-
-    fn prepare_eth1_data(&self) -> Result<Eth1Data> {
-        self.producer_context
-            .eth1_chain
-            .eth1_vote(
-                &self.producer_context.chain_config,
-                self.producer_context.metrics.as_ref(),
-                &self.beacon_state,
-            )
-            .context("failed to prepare eth1 data")
     }
 
     async fn prepare_proposer_slashings(
@@ -1180,6 +1209,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         let split_index = itertools::partition(slashings.iter_mut(), |slashing| {
             unphased::validate_proposer_slashing(
                 &self.producer_context.chain_config,
+                &self.producer_context.pubkey_cache,
                 &self.beacon_state,
                 *slashing,
             )
@@ -1217,6 +1247,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 AttesterSlashing::Phase0(attester_slashing) => {
                     unphased::validate_attester_slashing(
                         &self.producer_context.chain_config,
+                        &self.producer_context.pubkey_cache,
                         &self.beacon_state,
                         attester_slashing,
                     )
@@ -1224,6 +1255,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 AttesterSlashing::Electra(attester_slashing) => {
                     unphased::validate_attester_slashing(
                         &self.producer_context.chain_config,
+                        &self.producer_context.pubkey_cache,
                         &self.beacon_state,
                         attester_slashing,
                     )
@@ -1265,6 +1297,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 AttesterSlashing::Phase0(attester_slashing) => {
                     unphased::validate_attester_slashing(
                         &self.producer_context.chain_config,
+                        &self.producer_context.pubkey_cache,
                         &self.beacon_state,
                         attester_slashing,
                     )
@@ -1272,6 +1305,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 AttesterSlashing::Electra(attester_slashing) => {
                     unphased::validate_attester_slashing(
                         &self.producer_context.chain_config,
+                        &self.producer_context.pubkey_cache,
                         &self.beacon_state,
                         attester_slashing,
                     )
@@ -1306,20 +1340,6 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             .await
     }
 
-    fn prepare_deposits(
-        &self,
-        eth1_data: Eth1Data,
-    ) -> Result<ContiguousList<Deposit, P::MaxDeposits>> {
-        self.producer_context
-            .eth1_chain
-            .pending_deposits(
-                &self.beacon_state,
-                eth1_data,
-                self.producer_context.metrics.as_ref(),
-            )
-            .context("failed to prepare deposits")
-    }
-
     async fn prepare_voluntary_exits(
         &self,
     ) -> ContiguousList<SignedVoluntaryExit, P::MaxVoluntaryExits> {
@@ -1334,6 +1354,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         let split_index = itertools::partition(exits.iter_mut(), |voluntary_exit| {
             unphased::validate_voluntary_exit(
                 &self.producer_context.chain_config,
+                &self.producer_context.pubkey_cache,
                 &self.beacon_state,
                 *voluntary_exit,
             )
@@ -1425,13 +1446,16 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             .signed_bls_to_execution_changes()
             .await
             .map_err(|error| {
-                warn!("unable to retrieve BLS to execution changes from operation pool: {error:?}");
+                warn_with_peers!(
+                    "unable to retrieve BLS to execution changes from operation pool: {error:?}"
+                );
             })
             .unwrap_or_default()
             .into_iter()
             .filter(|bls_to_execution_change| {
                 capella::validate_bls_to_execution_change(
                     &self.producer_context.chain_config,
+                    &self.producer_context.pubkey_cache,
                     state,
                     *bls_to_execution_change,
                 )
@@ -1445,6 +1469,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             )
     }
 
+    #[instrument(skip_all, level = "debug")]
     pub async fn prepare_execution_payload_attributes(
         &self,
     ) -> Result<Option<PayloadAttributes<P>>> {
@@ -1517,11 +1542,31 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                     parent_beacon_block_root,
                 })
             }
+            BeaconState::Fulu(state) => {
+                let (withdrawals, _) = electra::get_expected_withdrawals(state)?;
+
+                let withdrawals = withdrawals
+                    .into_iter()
+                    .map_into()
+                    .pipe(ContiguousList::try_from_iter)?;
+
+                let parent_beacon_block_root =
+                    accessors::get_block_root_at_slot(state, state.slot().saturating_sub(1))?;
+
+                PayloadAttributes::Fulu(PayloadAttributesV3 {
+                    timestamp,
+                    prev_randao,
+                    suggested_fee_recipient,
+                    withdrawals,
+                    parent_beacon_block_root,
+                })
+            }
         };
 
         Ok(Some(payload_attributes))
     }
 
+    #[instrument(skip_all, level = "debug")]
     pub async fn prepare_execution_payload_for_slot(
         &self,
         slot: Slot,
@@ -1543,7 +1588,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             Ok(payload_id_option) => {
                 match payload_id_option {
                     Some(payload_id) => {
-                        info!(
+                        info_with_peers!(
                             "started work on execution payload with id {payload_id:?} \
                              for head {head_root:?} at slot {slot}",
                         );
@@ -1553,16 +1598,17 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                     // If we have no block at 4th-second mark, we preprocess new state without the block.
                     // In such case, after the state is preprocessed, we attempt to prepare the execution payload for the next slot with
                     // outdated EL head block hash, which EL client might discard as too old if it has seen newer blocks.
-                    None => warn!(
+                    None => warn_with_peers!(
                         "could not prepare execution payload: payload_id is None; \
                          ensure that multiple consensus clients are not driving the same execution client",
                     ),
                 }
             }
-            Err(error) => warn!("error while preparing execution payload: {error:?}"),
+            Err(error) => warn_with_peers!("error while preparing execution payload: {error:?}"),
         }
     }
 
+    #[instrument(skip_all, level = "debug")]
     async fn prepare_execution_payload(
         &self,
         safe_block_hash: ExecutionBlockHash,
@@ -1644,7 +1690,9 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                         .snapshot()
                         .nonempty_slots(self.head_block_root),
                 ) {
-                    warn!("cannot use Builder API for execution payload header: {error}");
+                    warn_with_peers!(
+                        "cannot use Builder API for execution payload header: {error}"
+                    );
                     return None;
                 }
 
@@ -1664,7 +1712,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
 
                 return Some(handle);
             }
-        };
+        }
 
         None
     }
@@ -1682,7 +1730,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
 
     async fn local_execution_payload_result(
         &self,
-    ) -> Result<Option<WithBlobsAndMev<ExecutionPayload<P>, P>>> {
+    ) -> Result<Option<WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>>> {
         let snapshot = self.producer_context.controller.snapshot();
 
         let mut payload_id = self
@@ -1695,7 +1743,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             .map(PayloadIdEntry::Cached);
 
         if payload_id.is_none() {
-            warn!(
+            warn_with_peers!(
                 "payload_id not found in payload_id_cache for {:?}",
                 self.head_block_root
             );
@@ -1710,10 +1758,10 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                     .await?
                     .map(PayloadIdEntry::Live)
             }
-        };
+        }
 
         let Some(payload_id) = payload_id else {
-            error!(
+            error_with_peers!(
                 "payload_id from execution layer was not received; This will lead to missed block"
             );
 
@@ -1728,33 +1776,36 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
         {
             Ok(payload) => payload,
             Err(error) => {
-                warn!("unable to retrieve payload with payload_id {payload_id:?}: {error:?}");
+                warn_with_peers!(
+                    "unable to retrieve payload with payload_id {payload_id:?}: {error:?}"
+                );
 
                 match payload_id {
                     PayloadIdEntry::Cached(_) => {
-                        let mut payload_id = None;
-
-                        if let Some(payload_attributes) =
+                        let payload_id = if let Some(payload_attributes) =
                             self.prepare_execution_payload_attributes().await?
                         {
-                            payload_id = self
-                                .prepare_execution_payload(
-                                    snapshot.safe_execution_payload_hash(),
-                                    snapshot.finalized_execution_payload_hash(),
-                                    payload_attributes,
-                                )
-                                .await?;
-                        }
+                            self.prepare_execution_payload(
+                                snapshot.safe_execution_payload_hash(),
+                                snapshot.finalized_execution_payload_hash(),
+                                payload_attributes,
+                            )
+                            .await?
+                        } else {
+                            None
+                        };
 
                         if let Some(payload_id) = payload_id {
-                            info!("successfully retrieved non-cached payload_id: {payload_id:?}");
+                            info_with_peers!(
+                                "successfully retrieved non-cached payload_id: {payload_id:?}"
+                            );
 
                             self.producer_context
                                 .execution_engine
                                 .get_execution_payload(payload_id)
                                 .await?
                         } else {
-                            error!(
+                            error_with_peers!(
                                 "payload_id from execution layer was not received; This will lead to missed block"
                             );
 
@@ -1766,7 +1817,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             }
         };
 
-        let payload_root = payload.value.hash_tree_root();
+        let payload_root = payload.result.value.hash_tree_root();
 
         self.producer_context
             .payload_cache
@@ -1782,7 +1833,7 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
     // payloads are only valid before the Merge.
     async fn local_execution_payload_option(
         &self,
-    ) -> Option<WithBlobsAndMev<ExecutionPayload<P>, P>> {
+    ) -> Option<WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>> {
         if self.producer_context.fake_execution_payloads {
             let slot = self.beacon_state.slot();
 
@@ -1800,7 +1851,11 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
                 );
 
                 match execution_payload {
-                    Ok(payload) => return Some(WithBlobsAndMev::with_default(payload)),
+                    Ok(payload) => {
+                        return Some(WithClientVersions::none(WithBlobsAndMev::with_default(
+                            payload,
+                        )))
+                    }
                     Err(error) => panic!("failed to produce fake payload: {error:?}"),
                 };
             }
@@ -1814,7 +1869,9 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
 
         self.local_execution_payload_result()
             .await
-            .map_err(|error| warn!("execution engine failed to produce payload: {error:?}"))
+            .map_err(|error| {
+                warn_with_peers!("execution engine failed to produce payload: {error:?}")
+            })
             .ok()
             .flatten()
     }
@@ -1830,9 +1887,10 @@ impl<P: Preset, W: Wait> BlockBuildContext<P, W> {
             .unwrap_or_else(|| {
                 let proposer_pubkey =
                     accessors::public_key(&self.beacon_state, self.proposer_index)?;
+
                 self.producer_context
                     .proposer_configs
-                    .fee_recipient(proposer_pubkey.to_bytes())
+                    .fee_recipient(*proposer_pubkey)
             })
     }
 

@@ -1,10 +1,5 @@
-#![expect(
-    clippy::allow_attributes,
-    reason = "allow_attributes lint trigger from some derive macros. \
-              See <https://github.com/rust-lang/rust-clippy/issues/13349>."
-)]
 use core::{
-    fmt::{Formatter, Result as FmtResult},
+    fmt::{Debug as FmtDebug, Formatter, Result as FmtResult},
     num::NonZeroUsize,
 };
 use std::sync::Arc;
@@ -21,12 +16,13 @@ use static_assertions::assert_eq_size;
 use std_ext::ArcExt as _;
 use strum::AsRefStr;
 use thiserror::Error;
-use transition_functions::{combined, unphased::StateRootPolicy};
+use transition_functions::unphased::StateRootPolicy;
 use types::{
     combined::{
         Attestation, AttestingIndices, BeaconState, SignedAggregateAndProof, SignedBeaconBlock,
     },
     deneb::containers::BlobSidecar,
+    fulu::containers::DataColumnSidecar,
     nonstandard::{PayloadStatus, Publishable, ValidationOutcome},
     phase0::{
         containers::{AttestationData, Checkpoint},
@@ -85,39 +81,15 @@ impl<P: Preset> ChainLink<P> {
     }
 
     #[must_use]
-    pub fn state(&self, store: &Store<P>) -> Arc<BeaconState<P>> {
-        if let Some(state) = &self.state {
-            return state.clone_arc();
-        }
-
-        let mut blocks_to_process = vec![];
-
-        let mut state = store
-            .chain_ending_with(self.block_root)
-            .find_map(|chain_link| {
-                if chain_link.state.is_none() {
-                    blocks_to_process.push(&chain_link.block);
-                }
-
-                chain_link.state.clone()
-            })
-            .expect("at least one ancestor should have a state in memory");
-
-        assert!(!blocks_to_process.is_empty());
-
-        for block in blocks_to_process.into_iter().rev() {
-            combined::trusted_state_transition(store.chain_config(), state.make_mut(), block)
-                .expect("state transition should succeed because block is already in store");
-        }
-
-        state
+    pub fn state<S: Storage<P>>(&self, store: &Store<P, S>) -> Arc<BeaconState<P>> {
+        store.load_beacon_state(self.block_root, self.slot(), self.state.as_ref())
     }
 
     // TODO(feature/deneb): Confirm that post-Deneb states are always post-Merge. See:
     //                      - <https://github.com/ethereum/consensus-specs/pull/3232>
     //                      - <https://github.com/ethereum/consensus-specs/pull/3350>
     // fn is_post_deneb(&self) -> bool {
-    //     self.block.message().body().post_deneb().is_some()
+    //     self.block.message().body().with_blob_kzg_commitments().is_some()
     // }
 }
 
@@ -384,7 +356,7 @@ pub enum AttestationOrigin<I> {
         SubnetId,
         #[serde(skip)] OneshotSender<Result<ValidationOutcome>>,
     ),
-    Block,
+    Block(H256),
     // Some test cases in `consensus-spec-tests` contain data that cannot occur in normal operation.
     // `fork_choice` test cases contain bare aggregate attestations.
     // Normally they can only occur inside blocks or alongside aggregate selection proofs.
@@ -397,7 +369,7 @@ impl<I> AttestationOrigin<I> {
         match self {
             Self::Gossip(_, gossip_id) => (Some(gossip_id), None),
             Self::Api(_, sender) => (None, Some(sender)),
-            Self::Own(_) | Self::Block | Self::Test => (None, None),
+            Self::Own(_) | Self::Block(_) | Self::Test => (None, None),
         }
     }
 
@@ -407,7 +379,7 @@ impl<I> AttestationOrigin<I> {
             Self::Gossip(subnet_id, _) | Self::Own(subnet_id) | Self::Api(subnet_id, _) => {
                 Some(subnet_id)
             }
-            Self::Block | Self::Test => None,
+            Self::Block(_) | Self::Test => None,
         }
     }
 
@@ -429,14 +401,14 @@ impl<I> AttestationOrigin<I> {
 
     #[must_use]
     pub const fn is_from_block(&self) -> bool {
-        matches!(self, Self::Block)
+        matches!(self, Self::Block(_))
     }
 
     #[must_use]
     pub const fn validate_as_gossip(&self) -> bool {
         match self {
             Self::Gossip(_, _) | Self::Own(_) | Self::Api(_, _) | Self::Test => true,
-            Self::Block => false,
+            Self::Block(_) => false,
         }
     }
 
@@ -444,7 +416,7 @@ impl<I> AttestationOrigin<I> {
     pub const fn must_be_singular(&self) -> bool {
         match self {
             Self::Gossip(_, _) | Self::Own(_) | Self::Api(_, _) => true,
-            Self::Block | Self::Test => false,
+            Self::Block(_) | Self::Test => false,
         }
     }
 
@@ -457,7 +429,7 @@ impl<I> AttestationOrigin<I> {
     pub fn verify_signatures(&self) -> bool {
         match self {
             Self::Gossip(_, _) | Self::Api(_, _) | Self::Test => true,
-            Self::Block => false,
+            Self::Block(_) => false,
             Self::Own(_) => !Feature::TrustOwnAttestationSignatures.is_enabled(),
         }
     }
@@ -466,7 +438,7 @@ impl<I> AttestationOrigin<I> {
     pub const fn send_to_validator(&self) -> bool {
         match self {
             Self::Gossip(_, _) | Self::Api(_, _) => true,
-            Self::Own(_) | Self::Block | Self::Test => false,
+            Self::Own(_) | Self::Block(_) | Self::Test => false,
         }
     }
 
@@ -477,7 +449,7 @@ impl<I> AttestationOrigin<I> {
             Self::Gossip(_, _) => "Gossip",
             Self::Own(_) => "Own",
             Self::Api(_, _) => "Api",
-            Self::Block => "Block",
+            Self::Block(_) => "Block",
             Self::Test => "Test",
         }
     }
@@ -570,13 +542,100 @@ impl BlobSidecarOrigin {
     }
 }
 
+#[derive(Debug)]
+pub enum DataColumnSidecarOrigin {
+    Api(Option<OneshotSender<Result<ValidationOutcome>>>),
+    BackSync,
+    ExecutionLayer,
+    Gossip(SubnetId, GossipId),
+    Requested(PeerId),
+    Own,
+}
+
+impl DataColumnSidecarOrigin {
+    #[must_use]
+    pub fn split(
+        self,
+    ) -> (
+        Option<GossipId>,
+        Option<OneshotSender<Result<ValidationOutcome>>>,
+    ) {
+        match self {
+            Self::Gossip(_, gossip_id) => (Some(gossip_id), None),
+            Self::Api(sender) => (None, sender),
+            Self::BackSync | Self::ExecutionLayer | Self::Own | Self::Requested(_) => (None, None),
+        }
+    }
+
+    #[must_use]
+    pub fn gossip_id(self) -> Option<GossipId> {
+        match self {
+            Self::Gossip(_, gossip_id) => Some(gossip_id),
+            Self::Api(_)
+            | Self::BackSync
+            | Self::ExecutionLayer
+            | Self::Own
+            | Self::Requested(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn peer_id(&self) -> Option<PeerId> {
+        match self {
+            Self::Gossip(_, gossip_id) => Some(gossip_id.source),
+            Self::Requested(peer_id) => Some(*peer_id),
+            Self::Api(_) | Self::BackSync | Self::ExecutionLayer | Self::Own => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn subnet_id(&self) -> Option<SubnetId> {
+        match self {
+            Self::Gossip(subnet_id, _) => Some(*subnet_id),
+            Self::Api(_)
+            | Self::BackSync
+            | Self::ExecutionLayer
+            | Self::Own
+            | Self::Requested(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_from_api(&self) -> bool {
+        matches!(self, Self::Api(_))
+    }
+
+    #[must_use]
+    pub const fn is_from_back_sync(&self) -> bool {
+        matches!(self, Self::BackSync)
+    }
+
+    #[must_use]
+    pub const fn is_from_el(&self) -> bool {
+        matches!(self, Self::ExecutionLayer)
+    }
+}
+
 pub enum BlockAction<P: Preset> {
     Accept(ChainLink<P>, Vec<Result<Vec<ValidatorIndex>>>),
     Ignore(Publishable),
-    DelayUntilBlobs(Arc<SignedBeaconBlock<P>>),
+    DelayUntilBlobs(Arc<SignedBeaconBlock<P>>, Arc<BeaconState<P>>),
     DelayUntilParent(Arc<SignedBeaconBlock<P>>),
     DelayUntilSlot(Arc<SignedBeaconBlock<P>>),
     WaitForJustifiedState(ChainLink<P>, Vec<Result<Vec<ValidatorIndex>>>, Checkpoint),
+}
+
+impl<P: Preset> FmtDebug for BlockAction<P> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            Self::Accept(_, _) => f.write_str("accept"),
+            Self::Ignore(_) => f.write_str("ignore"),
+            Self::DelayUntilBlobs(_, _) => f.write_str("delay_until_blobs"),
+            Self::DelayUntilParent(_) => f.write_str("delay_until_parent"),
+            Self::DelayUntilSlot(_) => f.write_str("delay_until_slot"),
+            Self::WaitForJustifiedState(_, _, _) => f.write_str("wait_for_justified_state"),
+        }
+    }
 }
 
 pub enum AggregateAndProofAction<P: Preset> {
@@ -629,6 +688,7 @@ impl<P: Preset, I> AttestationAction<P, I> {
 pub enum BlobSidecarAction<P: Preset> {
     Accept(Arc<BlobSidecar<P>>),
     Ignore(Publishable),
+    DelayUntilState(Arc<BlobSidecar<P>>, H256),
     DelayUntilParent(Arc<BlobSidecar<P>>),
     DelayUntilSlot(Arc<BlobSidecar<P>>),
 }
@@ -637,6 +697,27 @@ impl<P: Preset> BlobSidecarAction<P> {
     #[must_use]
     pub const fn accepted(&self) -> bool {
         matches!(self, Self::Accept(_))
+    }
+}
+
+#[derive(Debug)]
+pub enum DataColumnSidecarAction<P: Preset> {
+    Accept(Arc<DataColumnSidecar<P>>),
+    Ignore(Publishable),
+    DelayUntilState(Arc<DataColumnSidecar<P>>, H256),
+    DelayUntilParent(Arc<DataColumnSidecar<P>>),
+    DelayUntilSlot(Arc<DataColumnSidecar<P>>),
+}
+
+impl<P: Preset> DataColumnSidecarAction<P> {
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        matches!(self, Self::Accept(_))
+    }
+
+    #[must_use]
+    pub const fn ignored(&self) -> bool {
+        matches!(self, Self::Ignore(_))
     }
 }
 
@@ -665,7 +746,7 @@ pub enum ApplyBlockChanges<P: Preset> {
     },
     Reorganized {
         finalized_checkpoint_updated: bool,
-        old_head: ChainLink<P>,
+        old_head: Box<ChainLink<P>>,
     },
     AlternateChainExtended {
         finalized_checkpoint_updated: bool,
@@ -697,7 +778,7 @@ pub enum ApplyTickChanges<P: Preset> {
     },
     Reorganized {
         finalized_checkpoint_updated: bool,
-        old_head: ChainLink<P>,
+        old_head: Box<ChainLink<P>>,
     },
 }
 
@@ -833,16 +914,18 @@ pub enum AttestationValidationError<P: Preset, I> {
          (attestation: {attestation:?}, expected: {expected}, actual: {actual})"
     )]
     SingularAttestationOnIncorrectSubnet {
-        attestation: AttestationItem<P, I>,
+        attestation: Box<AttestationItem<P, I>>,
         expected: SubnetId,
         actual: SubnetId,
     },
     #[error("singular attestation has multiple aggregation bits set: {attestation:?}")]
-    SingularAttestationHasMultipleAggregationBitsSet { attestation: AttestationItem<P, I> },
+    SingularAttestationHasMultipleAggregationBitsSet {
+        attestation: Box<AttestationItem<P, I>>,
+    },
     #[error("singular attestation validation error: {attestation:?} {source:}")]
     Other {
         source: AnyhowError,
-        attestation: AttestationItem<P, I>,
+        attestation: Box<AttestationItem<P, I>>,
     },
 }
 
@@ -852,7 +935,7 @@ impl<P: Preset, I> AttestationValidationError<P, I> {
         match self {
             Self::SingularAttestationOnIncorrectSubnet { attestation, .. }
             | Self::SingularAttestationHasMultipleAggregationBitsSet { attestation }
-            | Self::Other { attestation, .. } => attestation,
+            | Self::Other { attestation, .. } => *attestation,
         }
     }
 }
@@ -885,4 +968,8 @@ impl DataAvailabilityPolicy {
     pub const fn check(self) -> bool {
         matches!(self, Self::Check)
     }
+}
+
+pub trait Storage<P: Preset> {
+    fn stored_state_by_block_root(&self, block_root: H256) -> Result<Option<Arc<BeaconState<P>>>>;
 }

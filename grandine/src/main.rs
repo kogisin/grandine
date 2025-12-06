@@ -1,5 +1,6 @@
 use core::{future::Future, net::SocketAddr, panic::AssertUnwindSafe, pin::pin};
 use std::{
+    collections::HashSet,
     net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::ExitCode,
@@ -7,22 +8,24 @@ use std::{
 };
 
 use allocator as _;
-use anyhow::{bail, ensure, Context as _, Result};
+use anyhow::{bail, ensure, Result};
+use binary_utils::TracingHandle;
 use builder_api::BuilderConfig;
 use clap::{Error as ClapError, Parser as _};
-use database::{Database, DatabaseMode};
+use database::{Database, DatabaseMode, RestartMessage};
 use eth1::{Eth1Chain, Eth1Config};
-use eth1_api::Auth;
+use eth1_api::{Auth, Eth1ApiToMetrics};
 use features::Feature;
 use fork_choice_control::{StateLoadStrategy, Storage};
 use fork_choice_store::StoreConfig;
+use futures::channel::mpsc::UnboundedSender;
 use genesis::AnchorCheckpointProvider;
-use grandine_version::APPLICATION_VERSION_WITH_PLATFORM;
+use grandine_version::APPLICATION_VERSION_WITH_COMMIT_AND_PLATFORM;
 use http_api::HttpApiConfig;
-use log::{error, info, warn};
-use logging::PEER_LOG_METRICS;
+use logging::{error_with_peers, info_with_peers, warn_with_peers, PEER_LOG_METRICS};
 use metrics::MetricsServerConfig;
 use p2p::{ListenAddr, NetworkConfig};
+use pubkey_cache::PubkeyCache;
 use reqwest::{Client, ClientBuilder};
 use runtime::{MetricsConfig, RuntimeConfig, StorageConfig};
 use signer::{KeyOrigin, Signer};
@@ -34,7 +37,7 @@ use thiserror::Error;
 use tokio::runtime::Builder;
 use types::{
     config::Config as ChainConfig,
-    phase0::primitives::{ExecutionBlockNumber, Slot},
+    phase0::primitives::{ExecutionBlockNumber, Slot, H256},
     preset::{Preset, PresetName},
     redacting_url::RedactingUrl,
     traits::BeaconState as _,
@@ -97,13 +100,16 @@ struct Context {
     slasher_config: Option<SlasherConfig>,
     state_slot: Option<Slot>,
     eth1_auth: Arc<Auth>,
-    http_api_config: HttpApiConfig,
+    http_api_config: Option<HttpApiConfig>,
     max_events: usize,
     metrics_config: MetricsConfig,
     track_liveness: bool,
+    tracing_handle: Option<TracingHandle>,
     detect_doppelgangers: bool,
     slashing_protection_history_limit: u64,
     validator_enabled: bool,
+    blacklisted_blocks: HashSet<H256>,
+    report_validator_performance: bool,
 }
 
 impl Context {
@@ -138,10 +144,10 @@ impl Context {
             match result {
                 Ok(Ok(())) => break Ok(()),
                 Ok(Err(error)) => {
-                    error!("application runtime failed: {error:?}");
+                    error_with_peers!("application runtime failed: {error:?}");
 
                     if error.downcast_ref::<libmdbx::Error>() == Some(&libmdbx::Error::MapFull) {
-                        info!("increasing environment map size limits");
+                        info_with_peers!("increasing environment map size limits");
                         db_size_modifier *= 2;
                     }
 
@@ -152,7 +158,7 @@ impl Context {
                         break Err(error);
                     }
                 }
-                Err(error) => error!("application runtime panicked: {error:?}"),
+                Err(error) => error_with_peers!("application runtime panicked: {error:?}"),
             }
         }
     }
@@ -184,12 +190,13 @@ impl Context {
             max_events,
             metrics_config,
             track_liveness,
+            tracing_handle,
             detect_doppelgangers,
             slashing_protection_history_limit,
             validator_enabled,
+            blacklisted_blocks,
+            report_validator_performance,
         } = self;
-
-        let StorageConfig { in_memory, .. } = storage_config;
 
         // Load keys early so we can validate `eth1_rpc_urls`.
         signer.load_keys_from_web3signer().await;
@@ -224,41 +231,39 @@ impl Context {
             .then(futures::channel::mpsc::unbounded)
             .unzip();
 
-        let eth1_database = if in_memory {
+        let (restart_tx, restart_rx) = futures::channel::mpsc::unbounded();
+
+        let pubkey_cache_database = if storage_config.in_memory {
             Database::in_memory()
         } else {
-            storage_config.eth1_database()?
+            storage_config.pubkey_cache_database(
+                None,
+                DatabaseMode::ReadWrite,
+                Some(restart_tx.clone()),
+            )?
         };
 
-        let eth1_chain = Eth1Chain::new(
-            chain_config.clone_arc(),
-            eth1_config.clone_arc(),
-            signer_snapshot.client().clone(),
-            eth1_database,
-            eth1_api_to_metrics_tx.clone(),
-            metrics_config.metrics.clone(),
-        )?;
-
-        eth1_chain.spawn_unfinalized_blocks_tracker_task()?;
+        let pubkey_cache = Arc::new(PubkeyCache::load(pubkey_cache_database));
 
         let anchor_checkpoint_provider = genesis_checkpoint_provider::<P>(
             &chain_config,
+            &eth1_config,
+            &pubkey_cache,
+            &storage_config,
             genesis_state_file,
             predefined_network,
             signer_snapshot.client(),
-            storage_config
-                .directories
-                .store_directory
-                .clone()
-                .unwrap_or_default(),
             genesis_state_download_url,
-            &eth1_chain,
+            &metrics_config,
+            eth1_api_to_metrics_tx.as_ref(),
+            &restart_tx,
         )
         .await?;
 
         if let Some(command) = command {
             return handle_command(
                 chain_config,
+                &pubkey_cache,
                 &storage_config,
                 command,
                 &anchor_checkpoint_provider,
@@ -283,6 +288,7 @@ impl Context {
 
         runtime::run_after_genesis(
             chain_config,
+            pubkey_cache,
             RuntimeConfig {
                 back_sync_enabled,
                 detect_doppelgangers,
@@ -297,7 +303,6 @@ impl Context {
             network_config,
             anchor_checkpoint_provider,
             state_load_strategy,
-            eth1_chain,
             eth1_config,
             storage_config,
             builder_config,
@@ -305,8 +310,13 @@ impl Context {
             slasher_config,
             http_api_config,
             metrics_config,
+            blacklisted_blocks,
+            report_validator_performance,
+            tracing_handle,
             eth1_api_to_metrics_tx,
             eth1_api_to_metrics_rx,
+            restart_tx,
+            restart_rx,
         )
         .await
     }
@@ -319,21 +329,22 @@ enum Error {
     #[error("--eth1-rpc-urls must be specified when validators are present")]
     MissingEth1RpcUrlsWithValidators,
     #[error(
-        "{service} port ({port}) is already in use; \
+        "{service} port ({port}) is unavailable; \
          make sure no other instance of the application is running \
-         or specify a different port with {option}"
+         or specify a different port with {option} (error: {error:?})"
     )]
     PortInUse {
         port: u16,
         service: &'static str,
         option: &'static str,
+        error: anyhow::Error,
     },
 }
 
 fn main() -> ExitCode {
     if let Err(error) = try_main() {
         error.downcast_ref().map(ClapError::exit);
-        error!("{error:?}");
+        error_with_peers!("{error:?}");
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -342,14 +353,24 @@ fn main() -> ExitCode {
 
 #[expect(clippy::too_many_lines)]
 fn try_main() -> Result<()> {
-    binary_utils::initialize_logger(module_path!(), cfg!(feature = "logger-always-write-style"))?;
+    let parsed_args = GrandineArgs::try_parse()?;
+    let data_dir = parsed_args.data_dir();
+
+    let log_handle = binary_utils::initialize_tracing_logger(
+        module_path!(),
+        data_dir.as_deref(),
+        parsed_args.telemetry_config(),
+        cfg!(feature = "logger-always-write-style"),
+    )?;
+
     binary_utils::initialize_rayon()?;
 
-    let config = GrandineArgs::try_parse()?
+    let config = parsed_args
         .try_into_config()
         .map_err(GrandineArgs::clap_error)?;
 
-    info!("starting beacon node");
+    info_with_peers!("starting beacon node");
+
     config.report();
 
     let GrandineConfig {
@@ -365,9 +386,11 @@ fn try_main() -> Result<()> {
         data_dir,
         validators,
         keystore_storage_password_file,
+        disable_blockprint_graffiti,
         graffiti,
         max_empty_slots,
         suggested_fee_recipient,
+        default_builder_boost_factor,
         default_gas_limit,
         network_config,
         storage_config,
@@ -378,7 +401,6 @@ fn try_main() -> Result<()> {
         command,
         slashing_enabled,
         slashing_history_limit,
-        features,
         state_slot,
         auth_options,
         builder_config,
@@ -393,9 +415,14 @@ fn try_main() -> Result<()> {
         in_memory,
         validator_api_config,
         kzg_backend,
+        blacklisted_blocks,
+        report_validator_performance,
+        withhold_data_columns_publishing,
+        backfill_custody_groups,
+        disable_engine_getblobs,
+        sync_without_reconstruction,
+        ..
     } = config;
-
-    features.into_iter().for_each(Feature::enable);
 
     PEER_LOG_METRICS.set_target_peer_count(network_config.target_peers);
 
@@ -410,7 +437,7 @@ fn try_main() -> Result<()> {
     // The ports could in theory be freed or taken between restarts, but it's not likely.
     if command.is_none() {
         ensure_ports_not_in_use(
-            http_api_config.address,
+            http_api_config.as_ref().map(|config| config.address),
             &network_config,
             metrics_server_config.as_ref(),
             validator_api_config.as_ref(),
@@ -423,11 +450,15 @@ fn try_main() -> Result<()> {
     }
 
     let validator_config = Arc::new(ValidatorConfig {
+        disable_blockprint_graffiti,
         graffiti,
         max_empty_slots,
         suggested_fee_recipient,
+        default_builder_boost_factor,
         default_gas_limit,
         keystore_storage_password_file,
+        withhold_data_columns_publishing,
+        backfill_custody_groups,
     });
 
     let store_config = StoreConfig {
@@ -436,6 +467,8 @@ fn try_main() -> Result<()> {
         state_cache_lock_timeout,
         unfinalized_states_in_memory,
         kzg_backend,
+        disable_engine_getblobs,
+        sync_without_reconstruction,
     };
 
     let eth1_auth = Arc::new(Auth::new(auth_options)?);
@@ -445,7 +478,7 @@ fn try_main() -> Result<()> {
     // Create a single one for the whole application and reuse it through `Signer::client`.
     let client = ClientBuilder::new()
         .timeout(request_timeout)
-        .user_agent(APPLICATION_VERSION_WITH_PLATFORM)
+        .user_agent(APPLICATION_VERSION_WITH_COMMIT_AND_PLATFORM)
         .connection_verbose(true)
         .build()?;
 
@@ -482,7 +515,7 @@ fn try_main() -> Result<()> {
         || validator_config.keystore_storage_password_file.is_some();
 
     if validator_enabled {
-        info!("started loading validator keys");
+        info_with_peers!("started loading validator keys");
     }
 
     let mut validator_keys = validators
@@ -508,8 +541,8 @@ fn try_main() -> Result<()> {
 
     if let Some(cache) = cache {
         if let Err(error) = cache.save() {
-            warn!("Unable to save validator key cache: {error:?}");
-        };
+            warn_with_peers!("Unable to save validator key cache: {error:?}");
+        }
     }
 
     let slasher_config = slashing_enabled.then_some(SlasherConfig {
@@ -541,9 +574,12 @@ fn try_main() -> Result<()> {
         max_events,
         metrics_config,
         track_liveness,
+        tracing_handle: Some(log_handle),
         detect_doppelgangers,
         slashing_protection_history_limit,
         validator_enabled,
+        blacklisted_blocks,
+        report_validator_performance,
     };
 
     match context.chain_config.preset_base {
@@ -558,16 +594,19 @@ fn try_main() -> Result<()> {
 // Ports are checked before binding them for actual use.
 // This is a TOCTOU race condition, but the only consequence of it is slightly worse error messages.
 fn ensure_ports_not_in_use(
-    http_address: SocketAddr,
+    http_address: Option<SocketAddr>,
     network_config: &NetworkConfig,
     metrics_server_config: Option<&MetricsServerConfig>,
     validator_api_config: Option<&ValidatorApiConfig>,
 ) -> Result<()> {
-    TcpListener::bind(http_address).context(Error::PortInUse {
-        port: http_address.port(),
-        service: "HTTP API",
-        option: "--http-port",
-    })?;
+    if let Some(http_address) = http_address {
+        TcpListener::bind(http_address).map_err(|error| Error::PortInUse {
+            port: http_address.port(),
+            service: "HTTP API",
+            option: "--http-port",
+            error: error.into(),
+        })?;
+    }
 
     if let Some(listen_addr) = network_config.listen_addrs().v4() {
         let ListenAddr {
@@ -577,25 +616,28 @@ fn ensure_ports_not_in_use(
             tcp_port,
         } = listen_addr.clone();
 
-        TcpListener::bind((addr, tcp_port)).context(Error::PortInUse {
+        TcpListener::bind((addr, tcp_port)).map_err(|error| Error::PortInUse {
             port: tcp_port,
             service: "libp2p",
             option: "--libp2p-port",
+            error: error.into(),
         })?;
 
         if !network_config.disable_discovery {
-            UdpSocket::bind((addr, disc_port)).context(Error::PortInUse {
+            UdpSocket::bind((addr, disc_port)).map_err(|error| Error::PortInUse {
                 port: disc_port,
                 service: "discv5",
                 option: "--discovery-port",
+                error: error.into(),
             })?;
         }
 
         if !network_config.disable_quic_support {
-            UdpSocket::bind((addr, quic_port)).context(Error::PortInUse {
+            UdpSocket::bind((addr, quic_port)).map_err(|error| Error::PortInUse {
                 port: quic_port,
                 service: "quic",
                 option: "--quic-port",
+                error: error.into(),
             })?;
         }
     }
@@ -608,25 +650,28 @@ fn ensure_ports_not_in_use(
             tcp_port,
         } = listen_addr.clone();
 
-        TcpListener::bind((addr, tcp_port)).context(Error::PortInUse {
+        TcpListener::bind((addr, tcp_port)).map_err(|error| Error::PortInUse {
             port: tcp_port,
             service: "libp2p",
-            option: "--libp2p-port-v6",
+            option: "--libp2p-port-ipv6",
+            error: error.into(),
         })?;
 
         if !network_config.disable_discovery {
-            UdpSocket::bind((addr, disc_port)).context(Error::PortInUse {
+            UdpSocket::bind((addr, disc_port)).map_err(|error| Error::PortInUse {
                 port: disc_port,
                 service: "discv5",
-                option: "--discovery-port-v6",
+                option: "--discovery-port-ipv6",
+                error: error.into(),
             })?;
         }
 
         if !network_config.disable_quic_support {
-            UdpSocket::bind((addr, quic_port)).context(Error::PortInUse {
+            UdpSocket::bind((addr, quic_port)).map_err(|error| Error::PortInUse {
                 port: quic_port,
                 service: "libp2p",
-                option: "--quic-port-v6",
+                option: "--quic-port-ipv6",
+                error: error.into(),
             })?;
         }
     }
@@ -636,18 +681,20 @@ fn ensure_ports_not_in_use(
     if let Some(config) = metrics_server_config {
         let metrics_port = config.metrics_port;
 
-        TcpListener::bind(SocketAddr::from(config)).context(Error::PortInUse {
+        TcpListener::bind(SocketAddr::from(config)).map_err(|error| Error::PortInUse {
             port: metrics_port,
             service: "Metrics",
             option: "--metrics-port",
+            error: error.into(),
         })?;
     }
 
     if let Some(config) = validator_api_config {
-        TcpListener::bind(config.address).context(Error::PortInUse {
+        TcpListener::bind(config.address).map_err(|error| Error::PortInUse {
             port: config.address.port(),
             service: "Validator",
             option: "--validator-api-port",
+            error: error.into(),
         })?;
     }
 
@@ -657,6 +704,7 @@ fn ensure_ports_not_in_use(
 #[expect(clippy::too_many_lines)]
 fn handle_command<P: Preset>(
     chain_config: Arc<ChainConfig>,
+    pubkey_cache: &Arc<PubkeyCache>,
     storage_config: &StorageConfig,
     command: GrandineCommand,
     anchor_checkpoint_provider: &AnchorCheckpointProvider<P>,
@@ -681,10 +729,11 @@ fn handle_command<P: Preset>(
             output_dir,
         } => {
             let storage_database =
-                storage_config.beacon_fork_choice_database(None, DatabaseMode::ReadOnly)?;
+                storage_config.beacon_fork_choice_database(None, DatabaseMode::ReadOnly, None)?;
 
             let storage = Storage::new(
                 chain_config,
+                pubkey_cache.clone_arc(),
                 storage_database,
                 *archival_epoch_interval,
                 *storage_mode,
@@ -693,6 +742,7 @@ fn handle_command<P: Preset>(
             let output_dir = output_dir.unwrap_or(std::env::current_dir()?);
 
             fork_choice_control::export_state_and_blocks(
+                pubkey_cache,
                 &storage,
                 from,
                 to,
@@ -700,7 +750,7 @@ fn handle_command<P: Preset>(
                 anchor_checkpoint_provider,
             )?;
 
-            info!("state and blocks exported to {output_dir:?}");
+            info_with_peers!("state and blocks exported to {}", output_dir.display());
         }
         GrandineCommand::Replay {
             from,
@@ -708,7 +758,13 @@ fn handle_command<P: Preset>(
             input_dir,
         } => {
             let input_dir = input_dir.unwrap_or(std::env::current_dir()?);
-            fork_choice_control::replay_blocks::<P>(&chain_config, &input_dir, from, to)?;
+            fork_choice_control::replay_blocks::<P>(
+                &chain_config,
+                pubkey_cache,
+                &input_dir,
+                from,
+                to,
+            )?;
         }
         GrandineCommand::Interchange(interchange_command) => {
             let genesis_validators_root = anchor_checkpoint_provider
@@ -739,7 +795,7 @@ fn handle_command<P: Preset>(
                     let import_report = slashing_protector
                         .import_interchange_file(&file_path, genesis_validators_root)?;
 
-                    info!(
+                    info_with_peers!(
                         "interchange file imported (imported records: {}, failed records: {})",
                         import_report.imported_records(),
                         import_report.failed_records(),
@@ -750,7 +806,7 @@ fn handle_command<P: Preset>(
                         .export_to_interchange_file(&file_path, genesis_validators_root)?;
 
                     if interchange.is_empty() {
-                        warn!(
+                        warn_with_peers!(
                             "no records were exported. \
                             This may indicate an issue if active validators are present. \
                             Please verify your configuration settings.",
@@ -763,14 +819,14 @@ fn handle_command<P: Preset>(
                                 signed_blocks,
                             } = data;
 
-                            info!(
+                            info_with_peers!(
                                 "exported {} records for {pubkey:?}",
                                 signed_attestations.len() + signed_blocks.len(),
                             );
                         }
                     }
 
-                    info!("interchange file exported to {file_path:?}");
+                    info_with_peers!("interchange file exported to {}", file_path.display());
                 }
             }
         }
@@ -779,20 +835,31 @@ fn handle_command<P: Preset>(
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn genesis_checkpoint_provider<P: Preset>(
-    chain_config: &ChainConfig,
+    chain_config: &Arc<ChainConfig>,
+    eth1_config: &Arc<Eth1Config>,
+    pubkey_cache: &PubkeyCache,
+    storage_config: &StorageConfig,
     genesis_state_file: Option<PathBuf>,
     predefined_network: Option<PredefinedNetwork>,
     client: &Client,
-    store_directory: PathBuf,
     genesis_state_download_url: Option<RedactingUrl>,
-    eth1_chain: &Eth1Chain,
+    metrics_config: &MetricsConfig,
+    eth1_api_to_metrics_tx: Option<&UnboundedSender<Eth1ApiToMetrics>>,
+    restart_tx: &UnboundedSender<RestartMessage>,
 ) -> Result<AnchorCheckpointProvider<P>> {
     if let Some(file_path) = genesis_state_file {
         let bytes = fs_err::read(file_path)?;
-        let genesis_state = Arc::from_ssz(chain_config, bytes)?;
+        let genesis_state = Arc::from_ssz(chain_config.as_ref(), bytes)?;
         return Ok(AnchorCheckpointProvider::custom_from_genesis(genesis_state));
     }
+
+    let store_directory = storage_config
+        .directories
+        .store_directory
+        .clone()
+        .unwrap_or_default();
 
     if let Some(predefined_network) = predefined_network {
         return predefined_network
@@ -804,11 +871,34 @@ async fn genesis_checkpoint_provider<P: Preset>(
             .await;
     }
 
+    // Code that waits for genesis by tracking deposits starts here
+    // (may be removed in the future)
+
+    let eth1_database = if storage_config.in_memory {
+        Database::in_memory()
+    } else {
+        storage_config.eth1_database(restart_tx.clone())?
+    };
+
+    let eth1_chain = Eth1Chain::new(
+        chain_config.clone_arc(),
+        eth1_config.clone_arc(),
+        client.clone(),
+        eth1_database,
+        eth1_api_to_metrics_tx.cloned(),
+        metrics_config.metrics.clone(),
+    )?;
+
     let eth1_block_stream = pin!(eth1_chain.stream_blocks()?);
 
-    let genesis_state =
-        eth1::wait_for_genesis(chain_config, store_directory, eth1_block_stream, eth1_chain)
-            .await?;
+    let genesis_state = eth1::wait_for_genesis(
+        chain_config,
+        pubkey_cache,
+        store_directory,
+        eth1_block_stream,
+        &eth1_chain,
+    )
+    .await?;
 
     Ok(AnchorCheckpointProvider::custom_from_genesis(Arc::new(
         genesis_state,

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
-use bls::traits::CachedPublicKey as _;
 use eth1_api::ApiController;
 use fork_choice_control::Wait;
 use futures::channel::mpsc::UnboundedSender;
@@ -12,8 +11,10 @@ use helper_functions::{
     signing::{SignForSingleFork as _, SignForSingleForkAtSlot as _},
     verifier::{MultiVerifier, Verifier as _},
 };
-use log::{debug, warn};
+use logging::{debug_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
+use std_ext::ArcExt as _;
 use typenum::Unsigned as _;
 use types::{
     altair::{
@@ -65,7 +66,7 @@ impl<P: Preset> PoolTask for AddOwnContributionTask<P> {
             .add_sync_committee_contribution(aggregator_index, contribution, &beacon_state)
             .await
         {
-            warn!(
+            warn_with_peers!(
                 "failed to add own contribution to sync committee pool ({error}, contribution: {contribution:?}",
             );
         }
@@ -104,7 +105,7 @@ impl<P: Preset, W: Send + 'static> PoolTask for AggregateOwnMessagesTask<P, W> {
             .aggregate_messages(contribution_data, messages.iter().copied(), &beacon_state)
             .await
         {
-            warn!(
+            warn_with_peers!(
                 "failed to aggregate subcommittee {} sync committee messages: {error}",
                 contribution_data.subcommittee_index,
             );
@@ -153,7 +154,7 @@ impl<P: Preset, W: Wait> PoolTask for HandleExternalContributionTask<P, W> {
                 Ok(ValidationOutcome::Accept) => PoolToP2pMessage::Accept(gossip_id),
                 Ok(ValidationOutcome::Ignore(_)) => PoolToP2pMessage::Ignore(gossip_id),
                 Err(error) => {
-                    debug!(
+                    debug_with_peers!(
                         "gossip contribution and proof rejected \
                         (error: {error}, contribution and proof: {signed_contribution_and_proof:?})",
                     );
@@ -183,7 +184,7 @@ impl<P: Preset, W: Wait> HandleExternalContributionTask<P, W> {
         let contribution_and_proof = signed_contribution_and_proof.message;
 
         if pool.is_subset(contribution_and_proof.contribution).await {
-            debug!(
+            debug_with_peers!(
                 "sync committee contribution is a known subset: {signed_contribution_and_proof:?}"
             );
 
@@ -198,10 +199,10 @@ impl<P: Preset, W: Wait> HandleExternalContributionTask<P, W> {
             return Ok(ValidationOutcome::Ignore(false));
         }
 
-        let beacon_state = match controller.preprocessed_state_at_current_slot() {
+        let beacon_state = match controller.preprocessed_state_at_current_slot_blocking() {
             Ok(beacon_state) => beacon_state,
             Err(error) => {
-                debug!("cannot validate sync committee contribution: {error:?}");
+                debug_with_peers!("cannot validate sync committee contribution: {error:?}");
                 return Ok(ValidationOutcome::Ignore(false));
             }
         };
@@ -210,6 +211,7 @@ impl<P: Preset, W: Wait> HandleExternalContributionTask<P, W> {
             controller.chain_config(),
             signed_contribution_and_proof,
             &beacon_state,
+            controller.pubkey_cache(),
         )?;
 
         if is_valid {
@@ -270,7 +272,7 @@ impl<P: Preset, W: Wait> PoolTask for HandleExternalMessageTask<P, W> {
                 }
                 Ok(ValidationOutcome::Ignore(_)) => PoolToP2pMessage::Ignore(gossip_id),
                 Err(error) => {
-                    debug!(
+                    debug_with_peers!(
                         "gossip sync committee message rejected \
                          (error: {error}, message: {message:?}, subnet_id: {subnet_id})",
                     );
@@ -308,10 +310,10 @@ impl<P: Preset, W: Wait> HandleExternalMessageTask<P, W> {
             return Ok(ValidationOutcome::Ignore(false));
         }
 
-        let beacon_state = match controller.preprocessed_state_at_current_slot() {
+        let beacon_state = match controller.preprocessed_state_at_current_slot_blocking() {
             Ok(beacon_state) => beacon_state,
             Err(error) => {
-                debug!("cannot validate sync committee message: {error:?}");
+                debug_with_peers!("cannot validate sync committee message: {error:?}");
                 return Ok(ValidationOutcome::Ignore(false));
             }
         };
@@ -321,6 +323,7 @@ impl<P: Preset, W: Wait> HandleExternalMessageTask<P, W> {
             message,
             subnet_id,
             &beacon_state,
+            controller.pubkey_cache(),
         )?;
 
         if is_valid {
@@ -365,6 +368,7 @@ fn validate_external_contribution_and_proof<P: Preset>(
     config: &Config,
     signed_contribution_and_proof: SignedContributionAndProof<P>,
     beacon_state: &BeaconState<P>,
+    pubkey_cache: &PubkeyCache,
 ) -> Result<bool> {
     if signed_contribution_and_proof.message.contribution.slot != beacon_state.slot() {
         return Ok(false);
@@ -374,7 +378,7 @@ fn validate_external_contribution_and_proof<P: Preset>(
         // Publishing sync committee contributions in Phase 0 is unusual but allowed.
         // It may be done in the last slot of Phase 0.
         // The Altair Honest Validator specification says it's not expected (i.e., optional).
-        warn!(
+        warn_with_peers!(
             "sync committee contribution received during a Phase 0 slot \
              (signed_contribution_and_proof: {:?}, slot: {})",
             signed_contribution_and_proof,
@@ -414,6 +418,8 @@ fn validate_external_contribution_and_proof<P: Preset>(
 
     let mut verifier = MultiVerifier::default();
 
+    let pubkey = pubkey_cache.get_or_insert(aggregator.pubkey)?;
+
     verifier.verify_singular(
         SyncAggregatorSelectionData {
             slot: contribution.slot,
@@ -421,14 +427,14 @@ fn validate_external_contribution_and_proof<P: Preset>(
         }
         .signing_root(config, beacon_state),
         contribution_and_proof.selection_proof,
-        &aggregator.pubkey,
+        pubkey.clone_arc(),
         SignatureKind::SyncCommitteeSelectionProof,
     )?;
 
     verifier.verify_singular(
         contribution_and_proof.signing_root(config, beacon_state),
         signed_contribution_and_proof.signature,
-        &aggregator.pubkey,
+        pubkey,
         SignatureKind::ContributionAndProof,
     )?;
 
@@ -436,7 +442,7 @@ fn validate_external_contribution_and_proof<P: Preset>(
         .iter()
         .zip(contribution.aggregation_bits)
         .filter(|(_, bit)| *bit)
-        .map(|(pubkey, _)| pubkey.decompress());
+        .map(|(pubkey, _)| pubkey_cache.get_or_insert(*pubkey));
 
     let signing_root =
         contribution
@@ -462,6 +468,7 @@ fn validate_external_message<P: Preset>(
     message: SyncCommitteeMessage,
     subnet_id: SubnetId,
     beacon_state: &BeaconState<P>,
+    pubkey_cache: &PubkeyCache,
 ) -> Result<bool> {
     if message.slot != beacon_state.slot() {
         return Ok(false);
@@ -471,7 +478,7 @@ fn validate_external_message<P: Preset>(
         // Publishing sync committee messages in Phase 0 is unusual but allowed.
         // It may be done in the last slot of Phase 0.
         // The Altair Honest Validator specification says it's not expected (i.e., optional).
-        warn!(
+        warn_with_peers!(
             "sync committee message received during a Phase 0 slot \
              (message: {message:?}, slot: {})",
             beacon_state.slot(),
@@ -488,7 +495,8 @@ fn validate_external_message<P: Preset>(
         "subnet ID is invalid",
     );
 
-    let validator_pubkey = &state.validators().get(validator_index)?.pubkey;
+    let validator_pubkey =
+        pubkey_cache.get_or_insert(state.validators().get(validator_index)?.pubkey)?;
 
     message.beacon_block_root.verify(
         config,

@@ -3,7 +3,7 @@ use core::ops::{Add as _, Index as _, Rem as _};
 use anyhow::{ensure, Result};
 use arithmetic::U64Ext as _;
 use bit_field::BitField as _;
-use bls::{traits::CachedPublicKey as _, CachedPublicKey};
+use bls::PublicKeyBytes;
 use execution_engine::{ExecutionEngine, NullExecutionEngine};
 use helper_functions::{
     accessors::{
@@ -35,7 +35,9 @@ use helper_functions::{
     verifier::{SingleVerifier, Triple, Verifier},
 };
 use itertools::izip;
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use pubkey_cache::PubkeyCache;
+#[cfg(not(target_os = "zkvm"))]
+use rayon::iter::ParallelIterator as _;
 use ssz::{PersistentList, SszHash as _};
 use tap::Pipe as _;
 use try_from_iterator::TryFromIterator as _;
@@ -66,8 +68,8 @@ use types::{
     },
     preset::Preset,
     traits::{
-        AttesterSlashing, BeaconState, PostCapellaExecutionPayload, PostElectraBeaconBlockBody,
-        PostElectraBeaconState,
+        AttesterSlashing, BeaconState, BlockBodyWithBlsToExecutionChanges,
+        BlockBodyWithElectraAttestations, PostCapellaExecutionPayload, PostElectraBeaconState,
     },
 };
 
@@ -92,6 +94,7 @@ use prometheus_metrics::METRICS;
 /// [lost]:                            https://github.com/ethereum/consensus-specs/commit/2dbc33327084d2814958f92eb0a838b9bc161903#diff-e96c612010477fc9536e3ff1ef1a1d5dR343-R346
 pub fn process_block<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut ElectraBeaconState<P>,
     block: &BeaconBlock<P>,
     mut verifier: impl Verifier,
@@ -106,6 +109,7 @@ pub fn process_block<P: Preset>(
 
     custom_process_block(
         config,
+        pubkey_cache,
         state,
         block,
         NullExecutionEngine,
@@ -118,19 +122,22 @@ pub fn process_block<P: Preset>(
 
 pub fn process_block_for_gossip<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &ElectraBeaconState<P>,
     block: &SignedBeaconBlock<P>,
 ) -> Result<()> {
     debug_assert_eq!(state.slot, block.message.slot);
 
-    unphased::process_block_header_for_gossip(state, &block.message)?;
+    unphased::process_block_header_for_gossip(config, state, &block.message)?;
 
     process_execution_payload_for_gossip(config, state, &block.message.body)?;
+
+    let public_key = accessors::public_key(state, block.message.proposer_index)?;
 
     SingleVerifier.verify_singular(
         block.message.signing_root(config, state),
         block.signature,
-        accessors::public_key(state, block.message.proposer_index)?,
+        pubkey_cache.get_or_insert(*public_key)?,
         SignatureKind::Block,
     )?;
 
@@ -144,6 +151,7 @@ pub fn count_required_signatures<P: Preset>(block: &BeaconBlock<P>) -> usize {
 
 pub fn custom_process_block<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut ElectraBeaconState<P>,
     block: &BeaconBlock<P>,
     execution_engine: impl ExecutionEngine<P>,
@@ -152,7 +160,7 @@ pub fn custom_process_block<P: Preset>(
 ) -> Result<()> {
     debug_assert_eq!(state.slot, block.slot);
 
-    unphased::process_block_header(state, block)?;
+    unphased::process_block_header(config, state, block)?;
 
     // > [Modified in Electra:EIP7251]
     process_withdrawals(state, &block.body.execution_payload)?;
@@ -170,11 +178,18 @@ pub fn custom_process_block<P: Preset>(
         execution_engine,
     )?;
 
-    unphased::process_randao(config, state, &block.body, &mut verifier)?;
+    unphased::process_randao(config, pubkey_cache, state, &block.body, &mut verifier)?;
     unphased::process_eth1_data(state, &block.body)?;
 
     // > [Modified in Electra:EIP6110:EIP7002:EIP7549:EIP7251]
-    process_operations(config, state, &block.body, &mut verifier, &mut slot_report)?;
+    process_operations(
+        config,
+        pubkey_cache,
+        state,
+        &block.body,
+        &mut verifier,
+        &mut slot_report,
+    )?;
 
     // > [New in Electra:EIP6110]
     for deposit_request in &block.body.execution_requests.deposits {
@@ -193,6 +208,7 @@ pub fn custom_process_block<P: Preset>(
 
     altair::process_sync_aggregate(
         config,
+        pubkey_cache,
         state,
         block.body.sync_aggregate,
         verifier,
@@ -228,7 +244,8 @@ fn process_execution_payload_for_gossip<P: Preset>(
     Ok(())
 }
 
-fn process_withdrawals<P: Preset>(
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
+pub fn process_withdrawals<P: Preset>(
     state: &mut impl PostElectraBeaconState<P>,
     execution_payload: &impl PostCapellaExecutionPayload<P>,
 ) -> Result<()>
@@ -306,6 +323,7 @@ where
 }
 
 /// [`get_expected_withdrawals`](https://github.com/ethereum/consensus-specs/blob/dc17b1e2b6a4ec3a2104c277a33abae75a43b0fa/specs/capella/beacon-chain.md#new-get_expected_withdrawals)
+#[expect(clippy::too_many_lines)]
 pub fn get_expected_withdrawals<P: Preset>(
     state: &(impl PostElectraBeaconState<P> + ?Sized),
 ) -> Result<(Vec<Withdrawal>, usize)> {
@@ -317,7 +335,7 @@ pub fn get_expected_withdrawals<P: Preset>(
 
     let mut withdrawal_index = state.next_withdrawal_index();
     let mut validator_index = state.next_withdrawal_validator_index();
-    let mut withdrawals = vec![];
+    let mut withdrawals: Vec<Withdrawal> = vec![];
     let mut processed_partial_withdrawals_count = 0;
 
     // > [New in Electra:EIP7251] Consume pending partial withdrawals
@@ -328,10 +346,19 @@ pub fn get_expected_withdrawals<P: Preset>(
             break;
         }
 
-        let validator_balance = state.balances().get(withdrawal.validator_index).copied()?;
         let validator = state.validators().get(withdrawal.validator_index)?;
         let has_sufficient_effective_balance =
             validator.effective_balance >= P::MIN_ACTIVATION_BALANCE;
+        let total_withdrawn = withdrawals
+            .iter()
+            .filter(|w| w.validator_index == withdrawal.validator_index)
+            .map(|w| w.amount)
+            .sum();
+        let validator_balance = state
+            .balances()
+            .get(withdrawal.validator_index)
+            .copied()?
+            .saturating_sub(total_withdrawn);
         let has_excess_balance = validator_balance > P::MIN_ACTIVATION_BALANCE;
 
         if validator.exit_epoch == FAR_FUTURE_EPOCH
@@ -479,13 +506,18 @@ fn process_execution_payload<P: Preset>(
     Ok(())
 }
 
-pub fn process_operations<P: Preset, V: Verifier>(
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
+pub fn process_operations<P: Preset, V: Verifier, B>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl PostElectraBeaconState<P>,
-    body: &impl PostElectraBeaconBlockBody<P>,
+    body: &B,
     mut verifier: V,
     mut slot_report: impl SlotReport,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: BlockBodyWithElectraAttestations<P> + BlockBodyWithBlsToExecutionChanges<P>,
+{
     // > [Modified in Electra:EIP6110]
     // > Disable former deposit mechanism once all prior deposits are processed
     let eth1_deposit_index_limit = state
@@ -516,6 +548,7 @@ pub fn process_operations<P: Preset, V: Verifier>(
     for proposer_slashing in body.proposer_slashings().iter().copied() {
         process_proposer_slashing(
             config,
+            pubkey_cache,
             state,
             proposer_slashing,
             &mut verifier,
@@ -526,6 +559,7 @@ pub fn process_operations<P: Preset, V: Verifier>(
     for attester_slashing in body.attester_slashings() {
         process_attester_slashing(
             config,
+            pubkey_cache,
             state,
             attester_slashing,
             &mut verifier,
@@ -542,18 +576,28 @@ pub fn process_operations<P: Preset, V: Verifier>(
     // amount of time, so we can avoid the issue by running them sequentially.
     if V::IS_NULL {
         for attestation in body.attestations() {
-            validate_attestation_with_verifier(config, state, attestation, &mut verifier)?;
+            validate_attestation_with_verifier(
+                config,
+                pubkey_cache,
+                state,
+                attestation,
+                &mut verifier,
+            )?;
         }
     } else {
         initialize_shuffled_indices(state, body.attestations().iter())?;
 
-        let triples = body
-            .attestations()
-            .par_iter()
+        let triples = helper_functions::par_iter!(body.attestations())
             .map(|attestation| {
                 let mut triple = Triple::default();
 
-                validate_attestation_with_verifier(config, state, attestation, &mut triple)?;
+                validate_attestation_with_verifier(
+                    config,
+                    pubkey_cache,
+                    state,
+                    attestation,
+                    &mut triple,
+                )?;
 
                 Ok(triple)
             })
@@ -563,14 +607,18 @@ pub fn process_operations<P: Preset, V: Verifier>(
     }
 
     for attestation in body.attestations() {
-        apply_attestation(state, attestation, &mut slot_report)?;
+        apply_attestation(config, state, attestation, &mut slot_report)?;
     }
 
     // The conditional is not needed for correctness.
     // It only serves to avoid overhead when processing blocks with no deposits.
     if !body.deposits().is_empty() {
-        let combined_deposits =
-            unphased::validate_deposits(config, state, body.deposits().iter().copied())?;
+        let combined_deposits = unphased::validate_deposits(
+            config,
+            pubkey_cache,
+            state,
+            body.deposits().iter().copied(),
+        )?;
 
         let deposit_count = body.deposits().len();
 
@@ -581,12 +629,13 @@ pub fn process_operations<P: Preset, V: Verifier>(
     }
 
     for voluntary_exit in body.voluntary_exits().iter().copied() {
-        process_voluntary_exit(config, state, voluntary_exit, &mut verifier)?;
+        process_voluntary_exit(config, pubkey_cache, state, voluntary_exit, &mut verifier)?;
     }
 
     for bls_to_execution_change in body.bls_to_execution_changes().iter().copied() {
         capella::process_bls_to_execution_change(
             config,
+            pubkey_cache,
             state,
             bls_to_execution_change,
             &mut verifier,
@@ -596,14 +645,22 @@ pub fn process_operations<P: Preset, V: Verifier>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_proposer_slashing<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl PostElectraBeaconState<P>,
     proposer_slashing: ProposerSlashing,
     verifier: impl Verifier,
     slot_report: impl SlotReport,
 ) -> Result<()> {
-    unphased::validate_proposer_slashing_with_verifier(config, state, proposer_slashing, verifier)?;
+    unphased::validate_proposer_slashing_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        proposer_slashing,
+        verifier,
+    )?;
 
     let index = proposer_slashing.signed_header_1.message.proposer_index;
 
@@ -617,8 +674,10 @@ pub fn process_proposer_slashing<P: Preset>(
     )
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_attester_slashing<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl PostElectraBeaconState<P>,
     attester_slashing: &impl AttesterSlashing<P>,
     verifier: impl Verifier,
@@ -626,6 +685,7 @@ pub fn process_attester_slashing<P: Preset>(
 ) -> Result<()> {
     let slashable_indices = unphased::validate_attester_slashing_with_verifier(
         config,
+        pubkey_cache,
         state,
         attester_slashing,
         verifier,
@@ -645,7 +705,9 @@ pub fn process_attester_slashing<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn apply_attestation<P: Preset>(
+    config: &Config,
     state: &mut impl PostElectraBeaconState<P>,
     attestation: &Attestation<P>,
     mut slot_report: impl SlotReport,
@@ -686,7 +748,7 @@ pub fn apply_attestation<P: Preset>(
     }
 
     // > Reward proposer
-    let proposer_index = get_beacon_proposer_index(state)?;
+    let proposer_index = get_beacon_proposer_index(config, state)?;
     let proposer_reward_denominator =
         (WEIGHT_DENOMINATOR.get() - PROPOSER_WEIGHT) * WEIGHT_DENOMINATOR.get() / PROPOSER_WEIGHT;
     let proposer_reward = proposer_reward_numerator / proposer_reward_denominator;
@@ -703,8 +765,10 @@ pub fn apply_attestation<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn validate_attestation_with_verifier<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl BeaconState<P>,
     attestation: &Attestation<P>,
     verifier: impl Verifier,
@@ -764,7 +828,13 @@ pub fn validate_attestation_with_verifier<P: Preset>(
     let indexed_attestation = get_indexed_attestation(state, attestation)?;
 
     // > Verify signature
-    validate_constructed_indexed_attestation(config, state, &indexed_attestation, verifier)
+    validate_constructed_indexed_attestation(
+        config,
+        pubkey_cache,
+        state,
+        &indexed_attestation,
+        verifier,
+    )
 }
 
 // This is used to compute the genesis state.
@@ -776,6 +846,7 @@ pub fn validate_attestation_with_verifier<P: Preset>(
 // enough to slow down genesis by over 50%.
 pub fn process_deposit_data<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl PostElectraBeaconState<P>,
     deposit_data: DepositData,
 ) -> Result<Option<ValidatorIndex>> {
@@ -788,7 +859,7 @@ pub fn process_deposit_data<P: Preset>(
 
     *state.eth1_deposit_index_mut() += 1;
 
-    if let Some(validator_index) = index_of_public_key(state, pubkey) {
+    if let Some(validator_index) = index_of_public_key(state, &pubkey) {
         let combined_deposit = CombinedDeposit::TopUp {
             validator_index,
             withdrawal_credentials: vec![withdrawal_credentials],
@@ -806,23 +877,26 @@ pub fn process_deposit_data<P: Preset>(
     // > which is not checked by the deposit contract
     let deposit_message = DepositMessage::from(deposit_data);
 
-    let pubkey = pubkey.into();
-
     // > Fork-agnostic domain since deposits are valid across forks
-    if deposit_message.verify(config, signature, &pubkey).is_ok() {
-        let validator_index = state.validators().len_u64();
+    if let Ok(decompressed) = pubkey_cache.get_or_insert(pubkey) {
+        if deposit_message
+            .verify(config, signature, decompressed)
+            .is_ok()
+        {
+            let validator_index = state.validators().len_u64();
 
-        let combined_deposit = CombinedDeposit::NewValidator {
-            pubkey,
-            withdrawal_credentials: vec![withdrawal_credentials],
-            amounts: smallvec![amount],
-            signatures: vec![signature],
-            positions: smallvec![0],
-        };
+            let combined_deposit = CombinedDeposit::NewValidator {
+                pubkey,
+                withdrawal_credentials: vec![withdrawal_credentials],
+                amounts: smallvec![amount],
+                signatures: vec![signature],
+                positions: smallvec![0],
+            };
 
-        apply_deposits(state, core::iter::once(combined_deposit), NullSlotReport)?;
+            apply_deposits(state, core::iter::once(combined_deposit), NullSlotReport)?;
 
-        return Ok(Some(validator_index));
+            return Ok(Some(validator_index));
+        }
     }
 
     Ok(None)
@@ -830,11 +904,10 @@ pub fn process_deposit_data<P: Preset>(
 
 pub fn add_validator_to_registry<P: Preset>(
     state: &mut impl PostElectraBeaconState<P>,
-    pubkey: CachedPublicKey,
+    pubkey: PublicKeyBytes,
     withdrawal_credentials: H256,
     amount: Gwei,
 ) -> Result<()> {
-    let public_key_bytes = pubkey.to_bytes();
     let validator_index = state.validators().len_u64();
 
     let mut validator = Validator {
@@ -868,12 +941,12 @@ pub fn add_validator_to_registry<P: Preset>(
             "state.cache.validator_indices is initialized by \
                 index_of_public_key, which is called before apply_deposits",
         )
-        .insert(public_key_bytes, validator_index);
+        .insert(pubkey, validator_index);
 
     Ok(())
 }
 
-fn apply_deposits<P: Preset>(
+pub fn apply_deposits<P: Preset>(
     state: &mut impl PostElectraBeaconState<P>,
     combined_deposits: impl IntoIterator<Item = CombinedDeposit>,
     mut slot_report: impl SlotReport,
@@ -892,7 +965,6 @@ fn apply_deposits<P: Preset>(
             } => {
                 let first_withdrawal_credentials = withdrawal_credentials[0];
                 let validator_index = state.validators().len_u64();
-                let public_key_bytes = pubkey.to_bytes();
 
                 add_validator_to_registry(state, pubkey, first_withdrawal_credentials, 0)?;
 
@@ -901,7 +973,7 @@ fn apply_deposits<P: Preset>(
                 {
                     pending_deposits_with_positions.push((
                         PendingDeposit {
-                            pubkey: public_key_bytes,
+                            pubkey,
                             withdrawal_credentials,
                             amount,
                             signature,
@@ -922,14 +994,14 @@ fn apply_deposits<P: Preset>(
                 signatures,
                 positions,
             } => {
-                let pubkey = accessors::public_key(state, validator_index)?.to_bytes();
+                let pubkey = accessors::public_key(state, validator_index)?;
 
                 for (withdrawal_credentials, amount, signature, position) in
                     izip!(withdrawal_credentials, amounts, signatures, positions)
                 {
                     pending_deposits_with_positions.push((
                         PendingDeposit {
-                            pubkey,
+                            pubkey: *pubkey,
                             withdrawal_credentials,
                             amount,
                             signature,
@@ -953,13 +1025,21 @@ fn apply_deposits<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_voluntary_exit<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &mut impl PostElectraBeaconState<P>,
     signed_voluntary_exit: SignedVoluntaryExit,
     verifier: impl Verifier,
 ) -> Result<()> {
-    validate_voluntary_exit_with_verifier(config, state, signed_voluntary_exit, verifier)?;
+    validate_voluntary_exit_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        signed_voluntary_exit,
+        verifier,
+    )?;
 
     // > Initiate exit
     initiate_validator_exit(config, state, signed_voluntary_exit.message.validator_index)
@@ -967,20 +1047,29 @@ pub fn process_voluntary_exit<P: Preset>(
 
 pub fn validate_voluntary_exit<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl PostElectraBeaconState<P>,
     signed_voluntary_exit: SignedVoluntaryExit,
 ) -> Result<()> {
-    validate_voluntary_exit_with_verifier(config, state, signed_voluntary_exit, SingleVerifier)
+    validate_voluntary_exit_with_verifier(
+        config,
+        pubkey_cache,
+        state,
+        signed_voluntary_exit,
+        SingleVerifier,
+    )
 }
 
-fn validate_voluntary_exit_with_verifier<P: Preset>(
+pub fn validate_voluntary_exit_with_verifier<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     state: &impl PostElectraBeaconState<P>,
     signed_voluntary_exit: SignedVoluntaryExit,
     verifier: impl Verifier,
 ) -> Result<()> {
     unphased::validate_voluntary_exit_with_verifier(
         config,
+        pubkey_cache,
         state,
         signed_voluntary_exit,
         verifier,
@@ -995,6 +1084,7 @@ fn validate_voluntary_exit_with_verifier<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_withdrawal_request<P: Preset>(
     config: &Config,
     state: &mut impl PostElectraBeaconState<P>,
@@ -1012,7 +1102,7 @@ pub fn process_withdrawal_request<P: Preset>(
 
     // > Verify pubkey exists
     let request_pubkey = withdrawal_request.validator_pubkey;
-    let Some(validator_index) = index_of_public_key(state, request_pubkey) else {
+    let Some(validator_index) = index_of_public_key(state, &request_pubkey) else {
         return Ok(());
     };
     let validator_balance = *balance(state, validator_index)?;
@@ -1084,6 +1174,7 @@ pub fn process_withdrawal_request<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_deposit_request<P: Preset>(
     state: &mut impl PostElectraBeaconState<P>,
     deposit_request: DepositRequest,
@@ -1114,6 +1205,7 @@ pub fn process_deposit_request<P: Preset>(
     Ok(())
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "debug", skip_all))]
 pub fn process_consolidation_request<P: Preset>(
     config: &Config,
     state: &mut impl PostElectraBeaconState<P>,
@@ -1126,7 +1218,7 @@ pub fn process_consolidation_request<P: Preset>(
     } = consolidation_request;
 
     if is_valid_switch_to_compounding_request(state, consolidation_request)? {
-        let Some(source_index) = index_of_public_key(state, source_pubkey) else {
+        let Some(source_index) = index_of_public_key(state, &source_pubkey) else {
             return Ok(());
         };
 
@@ -1149,10 +1241,10 @@ pub fn process_consolidation_request<P: Preset>(
     }
 
     // > Verify pubkeys exists
-    let Some(source_index) = index_of_public_key(state, source_pubkey) else {
+    let Some(source_index) = index_of_public_key(state, &source_pubkey) else {
         return Ok(());
     };
-    let Some(target_index) = index_of_public_key(state, target_pubkey) else {
+    let Some(target_index) = index_of_public_key(state, &target_pubkey) else {
         return Ok(());
     };
 
@@ -1240,7 +1332,7 @@ fn is_valid_switch_to_compounding_request<P: Preset>(
     }
 
     // > Verify pubkey exists
-    let Some(source_index) = index_of_public_key(state, source_pubkey) else {
+    let Some(source_index) = index_of_public_key(state, &source_pubkey) else {
         return Ok(false);
     };
 
@@ -1361,7 +1453,7 @@ mod spec_tests {
     // Test files for `process_block_header` are named `block.*` and contain `BeaconBlock`s.
     processing_tests! {
         process_block_header,
-        |_, state, block: BeaconBlock<_>, _| unphased::process_block_header(state, &block),
+        |config, _, state, block: BeaconBlock<_>, _| unphased::process_block_header(config, state, &block),
         "block",
         "consensus-spec-tests/tests/mainnet/electra/operations/block_header/*/*",
         "consensus-spec-tests/tests/minimal/electra/operations/block_header/*/*",
@@ -1369,7 +1461,7 @@ mod spec_tests {
 
     processing_tests! {
         process_consolidation_request,
-        |config, state, consolidation_request, _| process_consolidation_request(config, state, consolidation_request),
+        |config, _, state, consolidation_request, _| process_consolidation_request(config, state, consolidation_request),
         "consolidation_request",
         "consensus-spec-tests/tests/mainnet/electra/operations/consolidation_request/*/*",
         "consensus-spec-tests/tests/minimal/electra/operations/consolidation_request/*/*",
@@ -1377,9 +1469,10 @@ mod spec_tests {
 
     processing_tests! {
         process_proposer_slashing,
-        |config, state, proposer_slashing, _| {
+        |config, pubkey_cache, state, proposer_slashing, _| {
             process_proposer_slashing(
                 config,
+                pubkey_cache,
                 state,
                 proposer_slashing,
                 SingleVerifier,
@@ -1393,9 +1486,10 @@ mod spec_tests {
 
     processing_tests! {
         process_attester_slashing,
-        |config, state, attester_slashing: AttesterSlashing<P>, _| {
+        |config, pubkey_cache, state, attester_slashing: AttesterSlashing<P>, _| {
             process_attester_slashing(
                 config,
+                pubkey_cache,
                 state,
                 &attester_slashing,
                 SingleVerifier,
@@ -1409,9 +1503,10 @@ mod spec_tests {
 
     processing_tests! {
         process_attestation,
-        |config, state, attestation, bls_setting| {
+        |config, pubkey_cache, state, attestation, bls_setting| {
             process_attestation(
                 config,
+                pubkey_cache,
                 state,
                 &attestation,
                 bls_setting,
@@ -1424,9 +1519,10 @@ mod spec_tests {
 
     processing_tests! {
         process_bls_to_execution_change,
-        |config, state, bls_to_execution_change, _| {
+        |config, pubkey_cache, state, bls_to_execution_change, _| {
             capella::process_bls_to_execution_change(
                 config,
+                pubkey_cache,
                 state,
                 bls_to_execution_change,
                 SingleVerifier,
@@ -1439,7 +1535,7 @@ mod spec_tests {
 
     processing_tests! {
         process_deposit,
-        |config, state, deposit, _| process_deposit(config, state, deposit),
+        |config, pubkey_cache, state, deposit, _| process_deposit(config, pubkey_cache, state, deposit),
         "deposit",
         "consensus-spec-tests/tests/mainnet/electra/operations/deposit/*/*",
         "consensus-spec-tests/tests/minimal/electra/operations/deposit/*/*",
@@ -1449,9 +1545,9 @@ mod spec_tests {
     // so we need to test it separately.
     processing_tests! {
         process_deposit_data,
-        |config, state, deposit, _| {
+        |config, pubkey_cache, state, deposit, _| {
             unphased::verify_deposit_merkle_branch(state, state.eth1_deposit_index, deposit)?;
-            process_deposit_data(config, state, deposit.data)?;
+            process_deposit_data(config, pubkey_cache, state, deposit.data)?;
             Ok(())
         },
         "deposit",
@@ -1461,9 +1557,10 @@ mod spec_tests {
 
     processing_tests! {
         process_voluntary_exit,
-        |config, state, voluntary_exit, _| {
+        |config, pubkey_cache, state, voluntary_exit, _| {
             process_voluntary_exit(
                 config,
+                pubkey_cache,
                 state,
                 voluntary_exit,
                 SingleVerifier,
@@ -1476,9 +1573,10 @@ mod spec_tests {
 
     processing_tests! {
         process_sync_aggregate,
-        |config, state, sync_aggregate, _| {
+        |config, pubkey_cache, state, sync_aggregate, _| {
             altair::process_sync_aggregate(
                 config,
+                pubkey_cache,
                 state,
                 sync_aggregate,
                 SingleVerifier,
@@ -1492,7 +1590,7 @@ mod spec_tests {
 
     processing_tests! {
         process_deposit_request,
-        |_, state, deposit_request, _| process_deposit_request(state, deposit_request),
+        |_, _, state, deposit_request, _| process_deposit_request(state, deposit_request),
         "deposit_request",
         "consensus-spec-tests/tests/mainnet/electra/operations/deposit_request/*/*",
         "consensus-spec-tests/tests/minimal/electra/operations/deposit_request/*/*",
@@ -1500,7 +1598,7 @@ mod spec_tests {
 
     processing_tests! {
         process_withdrawal_request,
-        |config, state, withdrawal_request, _| process_withdrawal_request(config, state, withdrawal_request),
+        |config, _, state, withdrawal_request, _| process_withdrawal_request(config, state, withdrawal_request),
         "withdrawal_request",
         "consensus-spec-tests/tests/mainnet/electra/operations/withdrawal_request/*/*",
         "consensus-spec-tests/tests/minimal/electra/operations/withdrawal_request/*/*",
@@ -1508,8 +1606,8 @@ mod spec_tests {
 
     validation_tests! {
         validate_proposer_slashing,
-        |config, state, proposer_slashing| {
-            unphased::validate_proposer_slashing(config, state, proposer_slashing)
+        |config, pubkey_cache, state, proposer_slashing| {
+            unphased::validate_proposer_slashing(config, pubkey_cache, state, proposer_slashing)
         },
         "proposer_slashing",
         "consensus-spec-tests/tests/mainnet/electra/operations/proposer_slashing/*/*",
@@ -1518,8 +1616,8 @@ mod spec_tests {
 
     validation_tests! {
         validate_attester_slashing,
-        |config, state, attester_slashing: AttesterSlashing<P>| {
-            unphased::validate_attester_slashing(config, state, &attester_slashing)
+        |config, pubkey_cache, state, attester_slashing: AttesterSlashing<P>| {
+            unphased::validate_attester_slashing(config, pubkey_cache, state, &attester_slashing)
         },
         "attester_slashing",
         "consensus-spec-tests/tests/mainnet/electra/operations/attester_slashing/*/*",
@@ -1528,8 +1626,8 @@ mod spec_tests {
 
     validation_tests! {
         validate_voluntary_exit,
-        |config, state, voluntary_exit| {
-            validate_voluntary_exit_with_verifier(config, state, voluntary_exit, SingleVerifier)
+        |config, pubkey_cache, state, voluntary_exit| {
+            validate_voluntary_exit_with_verifier(config, pubkey_cache, state, voluntary_exit, SingleVerifier)
         },
         "voluntary_exit",
         "consensus-spec-tests/tests/mainnet/electra/operations/voluntary_exit/*/*",
@@ -1539,8 +1637,8 @@ mod spec_tests {
     // TODO(feature/electra): comment this & run missing test script
     validation_tests! {
         validate_bls_to_execution_change,
-        |config, state, bls_to_execution_change| {
-            capella::validate_bls_to_execution_change(config, state, bls_to_execution_change)
+        |config, pubkey_cache, state, bls_to_execution_change| {
+            capella::validate_bls_to_execution_change(config, pubkey_cache, state, bls_to_execution_change)
         },
         "address_change",
         "consensus-spec-tests/tests/mainnet/electra/operations/bls_to_execution_change/*/*",
@@ -1572,18 +1670,26 @@ mod spec_tests {
         operation_name: &str,
         processing_function: impl FnOnce(
             &Config,
+            &PubkeyCache,
             &mut ElectraBeaconState<P>,
             O,
             BlsSetting,
         ) -> Result<()>,
     ) {
+        let pubkey_cache = PubkeyCache::default();
         let mut state = case.ssz_default("pre");
         let operation = case.ssz_default(operation_name);
         let post_option = case.try_ssz_default("post");
         let bls_setting = case.meta().bls_setting;
 
-        let result = processing_function(&P::default_config(), &mut state, operation, bls_setting)
-            .map(|()| state);
+        let result = processing_function(
+            &P::default_config(),
+            &pubkey_cache,
+            &mut state,
+            operation,
+            bls_setting,
+        )
+        .map(|()| state);
 
         if let Some(expected_post) = post_option {
             let actual_post = result.expect("operation processing should succeed");
@@ -1596,13 +1702,20 @@ mod spec_tests {
     fn run_validation_case<P: Preset, O: SszReadDefault, R: Debug>(
         case: Case,
         operation_name: &str,
-        validation_function: impl FnOnce(&Config, &mut ElectraBeaconState<P>, O) -> Result<R>,
+        validation_function: impl FnOnce(
+            &Config,
+            &PubkeyCache,
+            &mut ElectraBeaconState<P>,
+            O,
+        ) -> Result<R>,
     ) {
+        let pubkey_cache = PubkeyCache::default();
         let mut state = case.ssz_default("pre");
         let operation = case.ssz_default(operation_name);
         let post_exists = case.exists("post");
 
-        let result = validation_function(&P::default_config(), &mut state, operation);
+        let result =
+            validation_function(&P::default_config(), &pubkey_cache, &mut state, operation);
 
         if post_exists {
             result.expect("validation should succeed");
@@ -1652,29 +1765,39 @@ mod spec_tests {
 
     fn process_attestation<P: Preset>(
         config: &Config,
+        pubkey_cache: &PubkeyCache,
         state: &mut ElectraBeaconState<P>,
         attestation: &Attestation<P>,
         bls_setting: BlsSetting,
     ) -> Result<()> {
         match bls_setting {
-            BlsSetting::Optional | BlsSetting::Required => {
-                validate_attestation_with_verifier(config, state, attestation, SingleVerifier)?
-            }
-            BlsSetting::Ignored => {
-                validate_attestation_with_verifier(config, state, attestation, NullVerifier)?
-            }
+            BlsSetting::Optional | BlsSetting::Required => validate_attestation_with_verifier(
+                config,
+                pubkey_cache,
+                state,
+                attestation,
+                SingleVerifier,
+            )?,
+            BlsSetting::Ignored => validate_attestation_with_verifier(
+                config,
+                pubkey_cache,
+                state,
+                attestation,
+                NullVerifier,
+            )?,
         }
 
-        apply_attestation(state, attestation, NullSlotReport)
+        apply_attestation(config, state, attestation, NullSlotReport)
     }
 
     fn process_deposit<P: Preset>(
         config: &Config,
+        pubkey_cache: &PubkeyCache,
         state: &mut ElectraBeaconState<P>,
         deposit: Deposit,
     ) -> Result<()> {
         let combined_deposits =
-            unphased::validate_deposits(config, state, core::iter::once(deposit))?;
+            unphased::validate_deposits(config, pubkey_cache, state, core::iter::once(deposit))?;
 
         // > Deposits must be processed in order
         *state.eth1_deposit_index_mut() += 1;

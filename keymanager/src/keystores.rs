@@ -9,7 +9,7 @@ use bls::{traits::SecretKey as _, PublicKeyBytes, SecretKey};
 use eip_2335::Keystore;
 use futures::lock::{MappedMutexGuard, Mutex, MutexGuard};
 use itertools::Itertools as _;
-use log::{info, warn};
+use logging::{info_with_peers, warn_with_peers};
 use serde::Serialize;
 use signer::{KeyOrigin, Signer};
 use slashing_protection::{interchange_format::InterchangeFormat, SlashingProtector};
@@ -185,7 +185,7 @@ impl KeystoreManager {
                 }
             },
             None => {
-                warn!("keystore import: slashing protection data is not provided!");
+                warn_with_peers!("keystore import: slashing protection data is not provided!");
             }
         }
 
@@ -249,7 +249,7 @@ impl KeystoreManager {
             .await
             .import(slashing_protection)?;
 
-        info!(
+        info_with_peers!(
             "slashing protection data imported (imported records: {}, failed records: {})",
             import_report.imported_records(),
             import_report.failed_records(),
@@ -274,7 +274,7 @@ impl KeystoreManager {
 
     async fn key_storage_mut(
         &self,
-    ) -> Result<MappedMutexGuard<Option<ValidatorKeyCache>, ValidatorKeyCache>> {
+    ) -> Result<MappedMutexGuard<'_, Option<ValidatorKeyCache>, ValidatorKeyCache>> {
         let storage_guard = self.storage.lock().await;
 
         let loaded_or_default_storage = match &self.persistence_config {

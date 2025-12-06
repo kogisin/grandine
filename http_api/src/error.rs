@@ -1,22 +1,27 @@
-use core::error::Error as StdError;
+use core::{error::Error as StdError, ops::Range};
 use std::sync::Arc;
 
 use anyhow::Error as AnyhowError;
 use axum::{
-    extract::rejection::JsonRejection,
+    extract::rejection::{BytesRejection, JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use axum_extra::extract::QueryRejection;
+use axum_extra::{extract::QueryRejection, typed_header::TypedHeaderRejection};
 use bls::{traits::SignatureBytes as _, SignatureBytes};
 use futures::channel::oneshot::Canceled;
 use http_api_utils::{ApiError, PhaseHeaderError};
 use serde::{Serialize, Serializer};
-use ssz::H256;
+use ssz::{ReadError, H256};
 use thiserror::Error;
 use tokio::task::JoinError;
-use types::{deneb::primitives::BlobIndex, phase0::primitives::Slot};
+use types::{
+    altair::primitives::SubcommitteeIndex,
+    deneb::primitives::{BlobIndex, VersionedHash},
+    fulu::primitives::ColumnIndex,
+    phase0::primitives::Slot,
+};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -26,8 +31,12 @@ pub enum Error {
     BlockNotValidatedForAggregation { block_root: H256 },
     #[error("block not found")]
     BlockNotFound,
+    #[error("pre-fulu block has no data column sidecars")]
+    BlockPreFulu,
     #[error(transparent)]
     Canceled(#[from] Canceled),
+    #[error("Content-Type header invalid")]
+    ContentTypeHeaderInvalid(#[source] TypedHeaderRejection),
     #[error(transparent)]
     InvalidRequestConsensusHeader(#[from] PhaseHeaderError),
     #[error(
@@ -67,16 +76,28 @@ pub enum Error {
     InvalidAttesterSlashing(#[source] AnyhowError),
     #[error("invalid blob index {0}")]
     InvalidBlobIndex(BlobIndex),
+    #[error("invalid blob sidecar")]
+    InvalidBlobSidecar(#[source] AnyhowError),
     #[error("invalid block ID")]
     InvalidBlockId(#[source] AnyhowError),
     #[error("invalid block")]
     InvalidBlock(#[source] AnyhowError),
+    #[error("invalid bytes body")]
+    InvalidBytesBody(#[source] BytesRejection),
+    #[error("invalid data column sidecar")]
+    InvalidDataColumnSidecar(#[source] AnyhowError),
+    #[error("invalid ssz bytes")]
+    InvalidSszBody(#[source] ReadError),
+    #[error("invalid column index {0}")]
+    InvalidColumnIndex(ColumnIndex),
     #[error("invalid contribution and proofs")]
     InvalidContributionAndProofs(Vec<IndexedError>),
     #[error("invalid epoch")]
     InvalidEpoch(#[source] AnyhowError),
     #[error("invalid JSON body")]
     InvalidJsonBody(#[source] JsonRejection),
+    #[error("invalid JSON body")]
+    InvalidJsonValue(#[source] serde_json::Error),
     #[error("invalid peer ID")]
     InvalidPeerId(#[source] AnyhowError),
     #[error(
@@ -122,6 +143,13 @@ pub enum Error {
     StatePreCapella,
     #[error("state is pre-Electra")]
     StatePreElectra,
+    #[error("state is pre-Fulu")]
+    StatePreFulu,
+    #[error("subcommittee index: {subcommittee_index} is not in allowed range: {range:?}")]
+    SubcommitteeIndexNotInRange {
+        subcommittee_index: SubcommitteeIndex,
+        range: Range<SubcommitteeIndex>,
+    },
     #[error("target state not found")]
     TargetStateNotFound,
     #[error(transparent)]
@@ -136,6 +164,8 @@ pub enum Error {
     UnableToProduceBlindedBlock,
     #[error("validator not found")]
     ValidatorNotFound,
+    #[error("versioned hash not in block: {versioned_hash:?}")]
+    VersionedHashNotInBlock { versioned_hash: VersionedHash },
     // TODO(Grandine Team): Some API clients do not set `validator_index`.
     //                      See <https://github.com/attestantio/vouch/issues/75>.
     // #[error("validator not in committee: {validator_index}")]
@@ -180,6 +210,7 @@ impl Error {
         match self {
             Self::InvalidJsonBody(json_rejection)
             | Self::InvalidValidatorIndices(json_rejection) => json_rejection.status(),
+            Self::InvalidBytesBody(rejection) => rejection.status(),
             Self::AttestationNotFound
             | Self::BlockNotFound
             | Self::MatchingAttestationHeadBlockNotFound
@@ -187,7 +218,9 @@ impl Error {
             | Self::StateNotFound
             | Self::TargetStateNotFound
             | Self::ValidatorNotFound => StatusCode::NOT_FOUND,
-            Self::CommitteesAtSlotMismatch { .. }
+            Self::BlockPreFulu
+            | Self::CommitteesAtSlotMismatch { .. }
+            | Self::ContentTypeHeaderInvalid(_)
             | Self::CurrentSlotHasNoSyncCommittee
             | Self::EpochBeforePrevious { .. }
             | Self::EpochNotInSyncCommitteePeriod
@@ -196,18 +229,23 @@ impl Error {
             | Self::InvalidAggregatesAndProofs(_)
             | Self::InvalidAttestations(_)
             | Self::InvalidAttesterSlashing(_)
+            | Self::InvalidBlobSidecar(_)
             | Self::InvalidBlock(_)
             | Self::InvalidBlobIndex(_)
             | Self::InvalidBlockId(_)
+            | Self::InvalidColumnIndex(_)
+            | Self::InvalidDataColumnSidecar(_)
             | Self::InvalidRequestConsensusHeader(_)
             | Self::InvalidContributionAndProofs(_)
             | Self::InvalidEpoch(_)
+            | Self::InvalidJsonValue(_)
             | Self::InvalidQuery(_)
             | Self::InvalidPeerId(_)
             | Self::InvalidProposerSlashing(_)
             | Self::InvalidSignedVoluntaryExit(_)
             | Self::InvalidStateId(_)
             | Self::InvalidSignedBlsToExecutionChanges(_)
+            | Self::InvalidSszBody(_)
             | Self::InvalidSyncCommitteeMessages(_)
             | Self::InvalidRandaoReveal
             | Self::InvalidValidatorId(_)
@@ -216,7 +254,10 @@ impl Error {
             | Self::SlotNotInEpoch
             | Self::StatePreCapella
             | Self::StatePreElectra
-            | Self::UnableToPublishBlock => StatusCode::BAD_REQUEST,
+            | Self::StatePreFulu
+            | Self::SubcommitteeIndexNotInRange { .. }
+            | Self::UnableToPublishBlock
+            | Self::VersionedHashNotInBlock { .. } => StatusCode::BAD_REQUEST,
             // | Self::ValidatorNotInCommittee { .. }
             Self::Internal(_)
             | Self::Canceled(_)
@@ -235,7 +276,7 @@ impl Error {
         }
     }
 
-    fn body(&self) -> EthErrorResponse {
+    fn body(&self) -> EthErrorResponse<'_> {
         EthErrorResponse {
             code: self.status_code().as_u16(),
             message: self,
@@ -256,7 +297,6 @@ impl Error {
     }
 }
 
-#[expect(clippy::module_name_repetitions)]
 #[derive(Debug, Serialize)]
 pub struct IndexedError {
     pub index: usize,

@@ -1,16 +1,17 @@
 use core::{net::SocketAddr, time::Duration};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
+use binary_utils::TelemetryConfig;
 use builder_api::BuilderConfig;
 use eth1_api::AuthOptions;
-use features::Feature;
 use http_api::HttpApiConfig;
 use itertools::Itertools as _;
 use kzg_utils::KzgBackend;
-use log::info;
 use p2p::NetworkConfig;
 use runtime::{MetricsConfig, StorageConfig};
 use signer::Web3SignerConfig;
+use ssz::Uint256;
+use tracing::info;
 use types::{
     bellatrix::primitives::Gas,
     config::Config as ChainConfig,
@@ -41,9 +42,11 @@ pub struct GrandineConfig {
     pub data_dir: PathBuf,
     pub validators: Option<Validators>,
     pub keystore_storage_password_file: Option<PathBuf>,
+    pub disable_blockprint_graffiti: bool,
     pub graffiti: Vec<H256>,
     pub max_empty_slots: u64,
     pub suggested_fee_recipient: ExecutionAddress,
+    pub default_builder_boost_factor: Uint256,
     pub default_gas_limit: Gas,
     pub network_config: NetworkConfig,
     pub storage_config: StorageConfig,
@@ -54,14 +57,14 @@ pub struct GrandineConfig {
     pub command: Option<GrandineCommand>,
     pub slashing_enabled: bool,
     pub slashing_history_limit: u64,
-    pub features: Vec<Feature>,
     pub state_slot: Option<Slot>,
     pub auth_options: AuthOptions,
     pub builder_config: Option<BuilderConfig>,
     pub web3signer_config: Web3SignerConfig,
-    pub http_api_config: HttpApiConfig,
+    pub http_api_config: Option<HttpApiConfig>,
     pub max_events: usize,
     pub metrics_config: MetricsConfig,
+    pub telemetry_config: Option<TelemetryConfig>,
     pub track_liveness: bool,
     pub detect_doppelgangers: bool,
     pub use_validator_key_cache: bool,
@@ -69,10 +72,17 @@ pub struct GrandineConfig {
     pub in_memory: bool,
     pub validator_api_config: Option<ValidatorApiConfig>,
     pub kzg_backend: KzgBackend,
+    pub blacklisted_blocks: HashSet<H256>,
+    pub report_validator_performance: bool,
+    pub withhold_data_columns_publishing: bool,
+    pub backfill_custody_groups: bool,
+    pub disable_engine_getblobs: bool,
+    pub sync_without_reconstruction: bool,
 }
 
 impl GrandineConfig {
     #[expect(clippy::cognitive_complexity)]
+    #[expect(clippy::too_many_lines)]
     pub fn report(&self) {
         let Self {
             predefined_network,
@@ -80,8 +90,10 @@ impl GrandineConfig {
             back_sync_enabled,
             eth1_rpc_urls,
             data_dir,
+            disable_blockprint_graffiti,
             graffiti,
             suggested_fee_recipient,
+            default_builder_boost_factor,
             network_config,
             storage_config,
             slashing_enabled,
@@ -91,9 +103,13 @@ impl GrandineConfig {
             web3signer_config,
             http_api_config,
             metrics_config,
+            telemetry_config,
             checkpoint_sync_url,
             use_validator_key_cache,
             validator_api_config,
+            withhold_data_columns_publishing,
+            disable_engine_getblobs,
+            sync_without_reconstruction,
             ..
         } = self;
 
@@ -111,13 +127,22 @@ impl GrandineConfig {
         }
 
         info!("storage mode: {:?}", storage_config.storage_mode);
-        info!("data directory: {data_dir:?}");
+        info!("data directory: {}", data_dir.display());
 
         self.storage_config.print_db_sizes();
 
         info!("Eth1 RPC URLs: [{}]", eth1_rpc_urls.iter().format(", "));
         info!("graffiti: {graffiti:?}");
-        info!("HTTP API address: {}", http_api_config.address);
+
+        if *disable_blockprint_graffiti {
+            info!("blockprint graffiti disabled");
+        }
+
+        if let Some(http_api_config) = http_api_config {
+            info!("HTTP API address: {}", http_api_config.address);
+        } else {
+            info!("HTTP API disabled");
+        }
 
         if let Some(metrics_server_config) = &metrics_config.metrics_server_config {
             info!(
@@ -133,6 +158,12 @@ impl GrandineConfig {
             );
         }
 
+        if let Some(config) = telemetry_config {
+            info!("telemetry export configured with: {config:?}");
+        } else {
+            info!("telemetry metrics data export disabled");
+        }
+
         if let Some(validator_api_config) = validator_api_config.as_ref() {
             info!("validator API address: {}", validator_api_config.address);
         } else {
@@ -146,13 +177,18 @@ impl GrandineConfig {
             info!("client version: {client_version}");
         }
 
+        if !network_config.trusted_peers.is_empty() {
+            info!("trusted peers: {:?}", network_config.trusted_peers);
+        }
+
         if let Some(slot) = state_slot {
             info!("force state slot: {slot}");
         }
 
         if let Some(builder_config) = builder_config {
             info!(
-                "using external block builder (API URL: {}, format: {})",
+                "using external block builder (API URL: {}, format: {}, \
+                default_builder_boost_factor: {default_builder_boost_factor})",
                 builder_config.builder_api_url, builder_config.builder_api_format,
             );
         }
@@ -177,6 +213,18 @@ impl GrandineConfig {
 
         if *use_validator_key_cache {
             info!("using validator key cache");
+        }
+
+        if *withhold_data_columns_publishing {
+            info!("withholding data column sidecars publishing");
+        }
+
+        if *disable_engine_getblobs {
+            info!("running without engine_getBlobs integration");
+        }
+
+        if *sync_without_reconstruction {
+            info!("sync with reconstruction disabled");
         }
     }
 }

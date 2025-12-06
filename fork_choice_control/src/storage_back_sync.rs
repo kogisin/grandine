@@ -2,17 +2,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Error as AnyhowError, Result};
-use arithmetic::U64Ext as _;
 use database::Database;
 use genesis::AnchorCheckpointProvider;
 use helper_functions::misc;
-use log::{debug, info, warn};
+use logging::{debug_with_peers, info_with_peers, warn_with_peers};
 use ssz::SszHash as _;
 use std_ext::ArcExt as _;
 use transition_functions::combined;
 use types::{
     combined::SignedBeaconBlock,
     deneb::containers::BlobSidecar,
+    fulu::containers::DataColumnSidecar,
     nonstandard::{FinalizedCheckpoint, WithOrigin},
     phase0::primitives::Slot,
     preset::Preset,
@@ -57,13 +57,13 @@ impl<P: Preset> Storage<P> {
         if let Some(slot) = get_latest_archived_slot(&self.database)? {
             if self.stored_state(slot)?.is_some() && slot > start_slot && slot <= end_slot {
                 start_slot = slot;
-                info!("resuming back-sync archival from {slot} slot");
+                info_with_peers!("resuming back-sync archival from {slot} slot");
             }
         }
 
         let mut state = if start_slot == anchor_block_slot {
             if origin.is_checkpoint_sync() {
-                warn!("unable to back-sync to genesis state as it not available");
+                warn_with_peers!("unable to back-sync to genesis state as it not available");
             }
 
             anchor_state
@@ -87,21 +87,26 @@ impl<P: Preset> Storage<P> {
             }
 
             if let Some((block, _)) = self.finalized_block_by_slot(slot)? {
-                combined::untrusted_state_transition(self.config(), state.make_mut(), &block)?;
+                combined::untrusted_state_transition(
+                    self.config(),
+                    &self.pubkey_cache,
+                    state.make_mut(),
+                    &block,
+                )?;
                 previous_block = Some(block);
             } else {
-                combined::process_slots(self.config(), state.make_mut(), slot)?;
+                combined::process_slots(self.config(), &self.pubkey_cache, state.make_mut(), slot)?;
             }
 
             batch.push(serialize(SlotByStateRoot(state.hash_tree_root()), slot)?);
 
             let state_epoch = Self::epoch_at_slot(slot);
             let append_state = misc::is_epoch_start::<P>(slot)
-                && state_epoch.is_multiple_of(self.archival_epoch_interval);
+                && state_epoch.is_multiple_of(self.archival_epoch_interval.into());
 
             if let Some(block) = previous_block.as_ref() {
                 if append_state {
-                    debug!("back-synced state in {slot} is ready for storage");
+                    debug_with_peers!("back-synced state in {slot} is ready for storage");
 
                     let block_root = block.message().hash_tree_root();
 
@@ -111,7 +116,7 @@ impl<P: Preset> Storage<P> {
                     states_in_batch += 1;
 
                     if states_in_batch == ARCHIVED_STATES_BEFORE_FLUSH {
-                        info!("archiving back-sync data up to {slot} slot");
+                        info_with_peers!("archiving back-sync data up to {slot} slot");
 
                         self.database.put_batch(batch)?;
 
@@ -124,7 +129,7 @@ impl<P: Preset> Storage<P> {
 
         self.database.put_batch(batch)?;
 
-        info!(
+        info_with_peers!(
             "back-synced state archival completed (start_slot: {start_slot}, end_slot: {end_slot})",
         );
 
@@ -136,6 +141,14 @@ impl<P: Preset> Storage<P> {
         blob_sidecars: impl IntoIterator<Item = Arc<BlobSidecar<P>>>,
     ) -> Result<()> {
         self.append_blob_sidecars(blob_sidecars.into_iter().map(Into::into))?;
+        Ok(())
+    }
+
+    pub(crate) fn store_back_sync_data_column_sidecars(
+        &self,
+        data_column_sidecars: impl IntoIterator<Item = Arc<DataColumnSidecar<P>>>,
+    ) -> Result<()> {
+        self.append_data_column_sidecars(data_column_sidecars.into_iter().map(Into::into))?;
         Ok(())
     }
 
@@ -170,6 +183,7 @@ mod tests {
     use database::Database;
     use eth2_cache_utils::mainnet;
     use itertools::{EitherOrBoth, Itertools as _};
+    use pubkey_cache::PubkeyCache;
     use types::phase0::consts::GENESIS_SLOT;
 
     use crate::StorageMode;
@@ -260,6 +274,7 @@ mod tests {
     fn build_test_storage<P: Preset>() -> Storage<P> {
         Storage::new(
             Arc::new(P::default_config()),
+            Arc::new(PubkeyCache::default()),
             Database::in_memory(),
             NonZeroU64::MIN,
             StorageMode::Standard,

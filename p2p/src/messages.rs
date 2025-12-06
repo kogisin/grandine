@@ -1,21 +1,30 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use bls::PublicKeyBytes;
 use eth2_libp2p::{
-    rpc::{GoodbyeReason, RequestId as IncomingRequestId, RequestType, StatusMessage},
+    rpc::{GoodbyeReason, InboundRequestId, RequestType, RpcErrorResponse, StatusMessage},
+    service::api_types::AppRequestId,
     types::{EnrForkId, GossipKind},
-    GossipId, GossipTopic, MessageAcceptance, NetworkEvent, PeerAction, PeerId, PeerRequestId,
-    PubsubMessage, ReportSource, Response, Subnet, SubnetDiscovery,
+    GossipId, GossipTopic, MessageAcceptance, NetworkEvent, PeerAction, PeerId, PubsubMessage,
+    ReportSource, Response, Subnet, SubnetDiscovery,
 };
 use futures::channel::{mpsc::UnboundedSender, oneshot::Sender};
-use log::debug;
+use logging::debug_with_peers;
 use operation_pools::PoolRejectionReason;
 use serde::Serialize;
+use ssz::ContiguousList;
 use types::{
     altair::containers::{SignedContributionAndProof, SyncCommitteeMessage},
     combined::{Attestation, AttesterSlashing, SignedAggregateAndProof, SignedBeaconBlock},
     deneb::containers::{BlobIdentifier, BlobSidecar},
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar, DataColumnsByRootIdentifier},
+        primitives::ColumnIndex,
+    },
     nonstandard::Phase,
     phase0::{
         containers::{Checkpoint, ProposerSlashing, SignedVoluntaryExit},
@@ -27,7 +36,7 @@ use types::{
 use crate::{
     misc::{
         AttestationSubnetActions, BeaconCommitteeSubscription, PeerReportReason, RPCRequestType,
-        RequestId, SyncCommitteeSubnetAction, SyncCommitteeSubscription,
+        SyncCommitteeSubnetAction, SyncCommitteeSubscription,
     },
     network_api::{NodeIdentity, NodePeer, NodePeerCount, NodePeersQuery},
 };
@@ -39,31 +48,49 @@ pub enum P2pToSync<P: Preset> {
     StatusPeer(PeerId),
     BlobsNeeded(Vec<BlobIdentifier>, Slot, Option<PeerId>),
     BlockNeeded(H256, Option<PeerId>),
-    RequestedBlobSidecar(Arc<BlobSidecar<P>>, PeerId, RequestId, RPCRequestType),
-    RequestedBlock(Arc<SignedBeaconBlock<P>>, PeerId, RequestId, RPCRequestType),
-    BlobsByRangeRequestFinished(RequestId),
-    BlocksByRangeRequestFinished(PeerId, RequestId),
+    DataColumnsNeeded(DataColumnsByRootIdentifier<P>, Slot),
+    RequestedBlobSidecar(Arc<BlobSidecar<P>>, PeerId, AppRequestId, RPCRequestType),
+    RequestedBlock(
+        Arc<SignedBeaconBlock<P>>,
+        PeerId,
+        AppRequestId,
+        RPCRequestType,
+    ),
+    RequestedDataColumnSidecar(
+        Arc<DataColumnSidecar<P>>,
+        PeerId,
+        AppRequestId,
+        RPCRequestType,
+    ),
+    BlobsByRangeRequestFinished(AppRequestId),
+    BlocksByRangeRequestFinished(PeerId, AppRequestId),
+    DataColumnsByRangeRequestFinished(AppRequestId),
     RequestFailed(PeerId),
     FinalizedCheckpoint(Checkpoint),
     GossipBlobSidecar(Arc<BlobSidecar<P>>, SubnetId, GossipId),
     GossipBlock(Arc<SignedBeaconBlock<P>>, PeerId, GossipId),
+    GossipDataColumnSidecar(Arc<DataColumnSidecar<P>>, SubnetId, GossipId),
     BlobSidecarRejected(BlobIdentifier),
+    DataColumnSidecarRejected(DataColumnIdentifier),
+    PeerCgcUpdated(PeerId),
+    RequestCustodyGroupBackfill(HashSet<u64>, Slot),
     Stop,
 }
 
 impl<P: Preset> P2pToSync<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to block sync service failed because the receiver was dropped");
+            debug_with_peers!("send to block sync service failed because the receiver was dropped");
         }
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(bound = "")]
 pub enum ApiToP2p<P: Preset> {
     PublishBeaconBlock(Arc<SignedBeaconBlock<P>>),
     PublishBlobSidecar(Arc<BlobSidecar<P>>),
+    PublishDataColumnSidecar(Arc<DataColumnSidecar<P>>),
     PublishSingularAttestation(Arc<Attestation<P>>, SubnetId),
     PublishAggregateAndProof(Arc<SignedAggregateAndProof<P>>),
     PublishSyncCommitteeMessage(Box<(SubnetId, SyncCommitteeMessage)>),
@@ -82,7 +109,7 @@ pub enum ApiToP2p<P: Preset> {
 impl<P: Preset> ApiToP2p<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to p2p failed because the receiver was dropped");
+            debug_with_peers!("send to p2p failed because the receiver was dropped");
         }
     }
 }
@@ -95,7 +122,7 @@ pub enum SyncToApi {
 impl SyncToApi {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to HTTP API failed because the receiver was dropped");
+            debug_with_peers!("send to HTTP API failed because the receiver was dropped");
         }
     }
 }
@@ -108,25 +135,35 @@ pub enum SyncToMetrics {
 impl SyncToMetrics {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to metrics failed because the receiver was dropped");
+            debug_with_peers!("send to metrics failed because the receiver was dropped");
         }
     }
 }
 
-pub enum SyncToP2p {
+#[derive(Debug)]
+pub enum SyncToP2p<P: Preset> {
     ReportPeer(PeerId, PeerAction, ReportSource, PeerReportReason),
-    RequestBlobsByRange(RequestId, PeerId, Slot, u64),
-    RequestBlobsByRoot(RequestId, PeerId, Vec<BlobIdentifier>),
-    RequestBlocksByRange(RequestId, PeerId, Slot, u64),
-    RequestBlockByRoot(RequestId, PeerId, H256),
-    RequestPeerStatus(RequestId, PeerId),
+    RequestBlobsByRange(AppRequestId, PeerId, Slot, u64),
+    RequestBlobsByRoot(AppRequestId, PeerId, Vec<BlobIdentifier>),
+    RequestBlocksByRange(AppRequestId, PeerId, Slot, u64),
+    RequestBlockByRoot(AppRequestId, PeerId, H256),
+    RequestDataColumnsByRange(
+        AppRequestId,
+        PeerId,
+        Slot,
+        u64,
+        Arc<ContiguousList<ColumnIndex, P::NumberOfColumns>>,
+    ),
+    RequestDataColumnsByRoot(AppRequestId, PeerId, Vec<DataColumnsByRootIdentifier<P>>),
+    RequestPeerStatus(AppRequestId, PeerId),
     SubscribeToCoreTopics,
+    UpdateEarliestAvailableSlot(Slot),
 }
 
-impl SyncToP2p {
+impl<P: Preset> SyncToP2p<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to p2p failed because the receiver was dropped");
+            debug_with_peers!("send to p2p failed because the receiver was dropped");
         }
     }
 }
@@ -138,12 +175,24 @@ pub enum ArchiverToSync {
 impl ArchiverToSync {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to block sync service failed because the receiver was dropped");
+            debug_with_peers!("send to block sync service failed because the receiver was dropped");
         }
     }
 }
 
-#[derive(Serialize)]
+pub enum BlockSyncServiceMessage {
+    RequestData,
+}
+
+impl BlockSyncServiceMessage {
+    pub fn send(self, tx: &UnboundedSender<Self>) {
+        if tx.unbounded_send(self).is_err() {
+            debug_with_peers!("send to block sync service failed because the receiver was dropped");
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 #[serde(bound = "")]
 pub enum ValidatorToP2p<P: Preset> {
     Accept(GossipId),
@@ -151,16 +200,18 @@ pub enum ValidatorToP2p<P: Preset> {
     Reject(GossipId, PoolRejectionReason),
     PublishBeaconBlock(Arc<SignedBeaconBlock<P>>),
     PublishBlobSidecar(Arc<BlobSidecar<P>>),
+    PublishDataColumnSidecar(Arc<DataColumnSidecar<P>>),
     PublishSingularAttestation(Arc<Attestation<P>>, SubnetId),
     PublishAggregateAndProof(Arc<SignedAggregateAndProof<P>>),
     PublishSyncCommitteeMessage(Box<(SubnetId, SyncCommitteeMessage)>),
     PublishContributionAndProof(Box<SignedContributionAndProof<P>>),
+    UpdateDataColumnSubnets(u64),
 }
 
 impl<P: Preset> ValidatorToP2p<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to p2p failed because the receiver was dropped");
+            debug_with_peers!("send to p2p failed because the receiver was dropped");
         }
     }
 }
@@ -174,7 +225,7 @@ pub enum P2pToValidator<P: Preset> {
 impl<P: Preset> P2pToValidator<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to validator failed because the receiver was dropped");
+            debug_with_peers!("send to validator failed because the receiver was dropped");
         }
     }
 }
@@ -187,27 +238,32 @@ pub enum P2pToSlasher<P: Preset> {
 impl<P: Preset> P2pToSlasher<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to slasher failed because the receiver was dropped");
+            debug_with_peers!("send to slasher failed because the receiver was dropped");
         }
     }
 }
 
+#[derive(Debug)]
 pub enum ServiceInboundMessage<P: Preset> {
     DiscoverSubnetPeers(Vec<SubnetDiscovery>),
     GoodbyePeer(PeerId, GoodbyeReason, ReportSource),
     Publish(PubsubMessage<P>),
     ReportPeer(PeerId, PeerAction, ReportSource, &'static str),
     ReportMessageValidationResult(GossipId, MessageAcceptance),
-    SendRequest(PeerId, RequestId, RequestType<P>),
-    SendResponse(PeerId, PeerRequestId, IncomingRequestId, Box<Response<P>>),
+    SendErrorResponse(PeerId, InboundRequestId, RpcErrorResponse, &'static str),
+    SendRequest(PeerId, AppRequestId, RequestType<P>),
+    SendResponse(PeerId, InboundRequestId, Box<Response<P>>),
     Subscribe(GossipTopic),
     SubscribeKind(GossipKind),
     SubscribeNewForkTopics(Phase, ForkDigest),
     Unsubscribe(GossipTopic),
     UnsubscribeFromForkTopicsExcept(ForkDigest),
+    UpdateDataColumnSubnets(u64),
+    UpdateEnrCgc(u64),
     UpdateEnrSubnet(Subnet, bool),
     UpdateFork(EnrForkId),
     UpdateGossipsubParameters(u64, Slot),
+    UpdateNextForkDigest(ForkDigest),
     Stop,
 }
 
@@ -219,19 +275,20 @@ impl<P: Preset> ServiceInboundMessage<P> {
     }
 }
 
+#[derive(Debug)]
 pub enum ServiceOutboundMessage<P: Preset> {
-    NetworkEvent(NetworkEvent<RequestId, P>),
+    NetworkEvent(NetworkEvent<P>),
 }
 
 impl<P: Preset> ServiceOutboundMessage<P> {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send from network service failed because the receiver was dropped");
+            debug_with_peers!("send from network service failed because the receiver was dropped");
         }
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub enum SubnetServiceToP2p {
     // Use `BTreeMap` to make serialization deterministic for snapshot testing.
     // `Vec` would work too and would be slightly faster.
@@ -242,7 +299,7 @@ pub enum SubnetServiceToP2p {
 impl SubnetServiceToP2p {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to p2p failed because the receiver was dropped");
+            debug_with_peers!("send to p2p failed because the receiver was dropped");
         }
     }
 }
@@ -256,7 +313,7 @@ pub enum ToSubnetService {
 impl ToSubnetService {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if tx.unbounded_send(self).is_err() {
-            debug!("send to subnet service failed because the receiver was dropped");
+            debug_with_peers!("send to subnet service failed because the receiver was dropped");
         }
     }
 }

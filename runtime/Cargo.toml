@@ -9,11 +9,13 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 attestation_verifier = { workspace = true }
+binary_utils ={ workspace = true }
 block_producer = { workspace = true }
 builder_api = { workspace = true }
 bytesize = { workspace = true }
 clock = { workspace = true }
 dashmap = { workspace = true }
+data_dumper = { workspace = true }
 database = { workspace = true }
 dedicated_executor = { workspace = true }
 directories = { workspace = true }
@@ -26,11 +28,11 @@ fs-err = { workspace = true }
 futures = { workspace = true }
 genesis = { workspace = true }
 grandine_version = { workspace = true }
+helper_functions = { workspace = true }
 http_api = { workspace = true }
-http_api_utils = { workspace = true }
 keymanager = { workspace = true }
 liveness_tracker = { workspace = true }
-log = { workspace = true }
+logging = { workspace = true }
 metrics = { workspace = true }
 nonzero_ext = { workspace = true }
 num_cpus = { workspace = true }
@@ -38,6 +40,7 @@ operation_pools = { workspace = true }
 p2p = { workspace = true }
 prometheus_metrics = { workspace = true }
 prometheus-client = { workspace = true }
+pubkey_cache = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,5 +50,7 @@ slashing_protection = { workspace = true }
 std_ext = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 types = { workspace = true }
 validator = { workspace = true }
+validator_statistics = { workspace = true }

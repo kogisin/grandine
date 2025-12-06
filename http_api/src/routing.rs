@@ -6,14 +6,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use binary_utils::TracingHandle;
 use block_producer::BlockProducer;
 use bls::PublicKeyBytes;
 use eth1_api::{ApiController, Eth1Api};
 use features::Feature;
-use fork_choice_control::Wait;
+use fork_choice_control::{EventChannels, Wait};
 use futures::channel::mpsc::UnboundedSender;
 use genesis::AnchorCheckpointProvider;
-use http_api_utils::EventChannels;
 use liveness_tracker::ApiToLiveness;
 use operation_pools::{AttestationAggPool, BlsToExecutionChangePool, SyncCommitteeAggPool};
 use p2p::{ApiToP2p, NetworkConfig, ToSubnetService};
@@ -28,29 +28,32 @@ use crate::{
     gui, middleware,
     misc::SyncedStatus,
     standard::{
-        beacon_events, beacon_heads, beacon_state, blob_sidecars, block, block_attestations,
-        block_attestations_v2, block_headers, block_id_headers, block_rewards, block_root,
-        config_spec, debug_fork_choice, deposit_contract, expected_withdrawals, fork_schedule,
-        genesis, get_state_validators, node_health, node_identity, node_peer, node_peer_count,
-        node_peers, node_syncing_status, node_version, pool_attestations, pool_attestations_v2,
-        pool_attester_slashings, pool_attester_slashings_v2, pool_bls_to_execution_changes,
-        pool_proposer_slashings, pool_voluntary_exits, post_state_validators,
+        beacon_events, beacon_heads, beacon_state, blinded_block, blob_sidecars, blobs, block,
+        block_attestations, block_attestations_v2, block_headers, block_id_headers, block_rewards,
+        block_root, config_spec, debug_beacon_data_column_sidecars, debug_fork_choice,
+        deposit_contract, expected_withdrawals, fork_schedule, genesis,
+        get_state_validator_balances, get_state_validators, node_health, node_identity, node_peer,
+        node_peer_count, node_peers, node_syncing_status, node_version, pool_attestations,
+        pool_attestations_v2, pool_attester_slashings, pool_attester_slashings_v2,
+        pool_bls_to_execution_changes, pool_proposer_slashings, pool_voluntary_exits,
+        post_log_level, post_state_validator_balances, post_state_validators, post_trace_level,
         publish_blinded_block, publish_blinded_block_v2, publish_block, publish_block_v2,
-        state_committees, state_finality_checkpoints, state_fork, state_pending_deposits,
-        state_pending_partial_withdrawals, state_randao, state_root, state_sync_committees,
-        state_validator, state_validator_balances, state_validator_identities,
-        submit_pool_attestations, submit_pool_attestations_v2, submit_pool_attester_slashing,
-        submit_pool_attester_slashing_v2, submit_pool_bls_to_execution_change,
-        submit_pool_proposer_slashing, submit_pool_sync_committees, submit_pool_voluntary_exit,
-        sync_committee_rewards, validator_aggregate_attestation,
-        validator_aggregate_attestation_v2, validator_attestation_data, validator_attester_duties,
+        state_committees, state_finality_checkpoints, state_fork, state_pending_consolidations,
+        state_pending_deposits, state_pending_partial_withdrawals, state_proposer_lookahead,
+        state_randao, state_root, state_sync_committees, state_validator,
+        state_validator_identities, submit_pool_attestations, submit_pool_attestations_v2,
+        submit_pool_attester_slashing, submit_pool_attester_slashing_v2,
+        submit_pool_bls_to_execution_change, submit_pool_proposer_slashing,
+        submit_pool_sync_committees, submit_pool_voluntary_exit, sync_committee_rewards,
+        validator_aggregate_attestation, validator_aggregate_attestation_v2,
+        validator_attestation_data, validator_attester_duties,
         validator_beacon_committee_selections, validator_blinded_block, validator_block,
         validator_block_v3, validator_liveness, validator_prepare_beacon_proposer,
-        validator_proposer_duties, validator_publish_aggregate_and_proofs,
-        validator_publish_contributions_and_proofs, validator_register_validator,
-        validator_subscribe_to_beacon_committee, validator_subscribe_to_sync_committees,
-        validator_sync_committee_contribution, validator_sync_committee_duties,
-        validator_sync_committee_selections,
+        validator_proposer_duties, validator_publish_aggregate_and_proofs_v1,
+        validator_publish_aggregate_and_proofs_v2, validator_publish_contributions_and_proofs,
+        validator_register_validator, validator_subscribe_to_beacon_committee,
+        validator_subscribe_to_sync_committees, validator_sync_committee_contribution,
+        validator_sync_committee_duties, validator_sync_committee_selections,
     },
 };
 
@@ -80,11 +83,12 @@ pub struct NormalState<P: Preset, W: Wait> {
     pub sync_committee_agg_pool: Arc<SyncCommitteeAggPool<P, W>>,
     pub bls_to_execution_change_pool: Arc<BlsToExecutionChangePool>,
     pub is_synced: Arc<SyncedStatus>,
-    pub event_channels: Arc<EventChannels>,
+    pub event_channels: Arc<EventChannels<P>>,
     pub api_to_liveness_tx: Option<UnboundedSender<ApiToLiveness>>,
     pub api_to_p2p_tx: UnboundedSender<ApiToP2p<P>>,
     pub api_to_validator_tx: UnboundedSender<ApiToValidator<P>>,
     pub subnet_service_tx: UnboundedSender<ToSubnetService>,
+    pub tracing_handle: Option<TracingHandle>,
 }
 
 // The `FromRef` derive macro cannot handle type parameters as of `axum` version 0.6.7.
@@ -161,7 +165,7 @@ impl<P: Preset, W: Wait> FromRef<NormalState<P, W>> for Arc<SyncedStatus> {
     }
 }
 
-impl<P: Preset, W: Wait> FromRef<NormalState<P, W>> for Arc<EventChannels> {
+impl<P: Preset, W: Wait> FromRef<NormalState<P, W>> for Arc<EventChannels<P>> {
     fn from_ref(state: &NormalState<P, W>) -> Self {
         state.event_channels.clone_arc()
     }
@@ -197,6 +201,12 @@ impl<P: Preset, W: Wait> FromRef<NormalState<P, W>> for Option<Arc<Metrics>> {
     }
 }
 
+impl<P: Preset, W: Wait> FromRef<NormalState<P, W>> for Option<TracingHandle> {
+    fn from_ref(state: &NormalState<P, W>) -> Self {
+        state.tracing_handle.clone()
+    }
+}
+
 #[expect(clippy::struct_field_names)]
 #[cfg(test)]
 #[derive(Clone)]
@@ -210,8 +220,8 @@ pub struct TestState<P: Preset> {
 
 pub fn normal_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router {
     gui_routes()
-        .merge(eth_v1_beacon_routes(state.clone()))
-        .merge(eth_v2_beacon_routes(state.clone()))
+        .merge(eth_v1_beacon_routes())
+        .merge(eth_v2_beacon_routes())
         .merge(eth_v1_builder_routes())
         .merge(eth_v1_config_routes())
         .merge(eth_v1_debug_routes())
@@ -219,8 +229,9 @@ pub fn normal_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router {
         .route("/eth/v1/events", get(beacon_events))
         .merge(eth_v1_node_routes())
         .merge(eth_v1_validator_routes(state.clone()))
+        .merge(eth_v1_validator_routes_no_sync_check())
         .merge(eth_v2_validator_routes(state.clone()))
-        .merge(eth_v3_validator_routes(state.clone()))
+        .merge(eth_v3_validator_routes_no_sync_check())
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
@@ -312,7 +323,7 @@ fn gui_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
 //                      `PATCH /features` requires special attention because it's more dangerous.
 
 #[expect(clippy::too_many_lines)]
-fn eth_v1_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<NormalState<P, W>> {
+fn eth_v1_beacon_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
     let state_routes = Router::new()
         .route("/eth/v1/beacon/states/{state_id}/root", get(state_root))
         .route("/eth/v1/beacon/states/{state_id}/fork", get(state_fork))
@@ -338,7 +349,7 @@ fn eth_v1_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<
         )
         .route(
             "/eth/v1/beacon/states/{state_id}/validator_balances",
-            get(state_validator_balances),
+            get(get_state_validator_balances).post(post_state_validator_balances),
         )
         .route(
             "/eth/v1/beacon/states/{state_id}/committees",
@@ -349,12 +360,20 @@ fn eth_v1_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<
             get(state_sync_committees),
         )
         .route(
+            "/eth/v1/beacon/states/{state_id}/pending_consolidations",
+            get(state_pending_consolidations),
+        )
+        .route(
             "/eth/v1/beacon/states/{state_id}/pending_deposits",
             get(state_pending_deposits),
         )
         .route(
             "/eth/v1/beacon/states/{state_id}/pending_partial_withdrawals",
             get(state_pending_partial_withdrawals),
+        )
+        .route(
+            "/eth/v1/beacon/states/{state_id}/proposer_lookahead",
+            get(state_proposer_lookahead),
         )
         .route("/eth/v1/beacon/states/{state_id}/randao", get(state_randao));
 
@@ -368,13 +387,7 @@ fn eth_v1_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<
             "/eth/v1/beacon/blocks/{block_id}/attestations",
             get(block_attestations),
         )
-        .route(
-            "/eth/v1/beacon/blocks",
-            post(publish_block).route_layer(axum::middleware::map_request_with_state(
-                state.clone(),
-                middleware::is_synced,
-            )),
-        );
+        .route("/eth/v1/beacon/blocks", post(publish_block));
 
     let block_v2_routes = Router::new().route(
         "/eth/v2/beacon/blocks/{block_id}/attestations",
@@ -429,16 +442,15 @@ fn eth_v1_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<
 
     Router::new()
         .route(
-            "/eth/v1/beacon/blinded_blocks",
-            post(publish_blinded_block).route_layer(axum::middleware::map_request_with_state(
-                state,
-                middleware::is_synced,
-            )),
+            "/eth/v1/beacon/blinded_blocks/{block_id}",
+            get(blinded_block),
         )
+        .route("/eth/v1/beacon/blinded_blocks", post(publish_blinded_block))
         .route(
             "/eth/v1/beacon/blob_sidecars/{block_id}",
             get(blob_sidecars),
         )
+        .route("/eth/v1/beacon/blobs/{block_id}", get(blobs))
         .route("/eth/v1/beacon/genesis", get(genesis))
         .merge(state_routes)
         .merge(header_routes)
@@ -449,22 +461,13 @@ fn eth_v1_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<
         .merge(reward_routes)
 }
 
-fn eth_v2_beacon_routes<P: Preset, W: Wait>(state: NormalState<P, W>) -> Router<NormalState<P, W>> {
+fn eth_v2_beacon_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
     Router::new()
         .route("/eth/v2/beacon/blocks/{block_id}", get(block))
-        .route(
-            "/eth/v2/beacon/blocks",
-            post(publish_block_v2).route_layer(axum::middleware::map_request_with_state(
-                state.clone(),
-                middleware::is_synced,
-            )),
-        )
+        .route("/eth/v2/beacon/blocks", post(publish_block_v2))
         .route(
             "/eth/v2/beacon/blinded_blocks",
-            post(publish_blinded_block_v2).route_layer(axum::middleware::map_request_with_state(
-                state,
-                middleware::is_synced,
-            )),
+            post(publish_blinded_block_v2),
         )
 }
 
@@ -483,13 +486,20 @@ fn eth_v1_config_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
 }
 
 fn eth_v1_debug_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
-    Router::new().route("/eth/v1/debug/fork_choice", get(debug_fork_choice))
+    Router::new()
+        .route("/eth/v1/debug/fork_choice", get(debug_fork_choice))
+        .route(
+            "/eth/v1/debug/beacon/data_column_sidecars/{block_id}",
+            get(debug_beacon_data_column_sidecars),
+        )
 }
 
 fn eth_v2_debug_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
     Router::new()
         .route("/eth/v2/debug/beacon/states/{state_id}", get(beacon_state))
         .route("/eth/v2/debug/beacon/heads", get(beacon_heads))
+        .route("/eth/v2/debug/tracing/log_level", post(post_log_level))
+        .route("/eth/v2/debug/tracing/trace_level", post(post_trace_level))
 }
 
 fn eth_v1_node_routes<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
@@ -512,10 +522,6 @@ fn eth_v1_validator_routes<P: Preset, W: Wait>(
             post(validator_attester_duties),
         )
         .route(
-            "/eth/v1/validator/duties/proposer/{epoch}",
-            get(validator_proposer_duties),
-        )
-        .route(
             "/eth/v1/validator/duties/sync/{epoch}",
             post(validator_sync_committee_duties),
         )
@@ -533,7 +539,7 @@ fn eth_v1_validator_routes<P: Preset, W: Wait>(
         )
         .route(
             "/eth/v1/validator/aggregate_and_proofs",
-            post(validator_publish_aggregate_and_proofs),
+            post(validator_publish_aggregate_and_proofs_v1),
         )
         .route(
             "/eth/v1/validator/beacon_committee_subscriptions",
@@ -550,10 +556,6 @@ fn eth_v1_validator_routes<P: Preset, W: Wait>(
         .route(
             "/eth/v1/validator/contribution_and_proofs",
             post(validator_publish_contributions_and_proofs),
-        )
-        .route(
-            "/eth/v1/validator/prepare_beacon_proposer",
-            post(validator_prepare_beacon_proposer),
         )
         .route(
             "/eth/v1/validator/register_validator",
@@ -577,6 +579,18 @@ fn eth_v1_validator_routes<P: Preset, W: Wait>(
         ))
 }
 
+fn eth_v1_validator_routes_no_sync_check<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
+    Router::new()
+        .route(
+            "/eth/v1/validator/duties/proposer/{epoch}",
+            get(validator_proposer_duties),
+        )
+        .route(
+            "/eth/v1/validator/prepare_beacon_proposer",
+            post(validator_prepare_beacon_proposer),
+        )
+}
+
 fn eth_v2_validator_routes<P: Preset, W: Wait>(
     state: NormalState<P, W>,
 ) -> Router<NormalState<P, W>> {
@@ -587,7 +601,7 @@ fn eth_v2_validator_routes<P: Preset, W: Wait>(
         )
         .route(
             "/eth/v2/validator/aggregate_and_proofs",
-            post(validator_publish_aggregate_and_proofs),
+            post(validator_publish_aggregate_and_proofs_v2),
         )
         .route("/eth/v2/validator/blocks/{slot}", get(validator_block))
         .layer(axum::middleware::map_request_with_state(
@@ -596,15 +610,8 @@ fn eth_v2_validator_routes<P: Preset, W: Wait>(
         ))
 }
 
-fn eth_v3_validator_routes<P: Preset, W: Wait>(
-    state: NormalState<P, W>,
-) -> Router<NormalState<P, W>> {
-    Router::new()
-        .route("/eth/v3/validator/blocks/{slot}", get(validator_block_v3))
-        .layer(axum::middleware::map_request_with_state(
-            state,
-            middleware::is_synced,
-        ))
+fn eth_v3_validator_routes_no_sync_check<P: Preset, W: Wait>() -> Router<NormalState<P, W>> {
+    Router::new().route("/eth/v3/validator/blocks/{slot}", get(validator_block_v3))
 }
 
 #[cfg(test)]

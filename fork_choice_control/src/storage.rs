@@ -2,15 +2,15 @@ use core::{cell::OnceCell, marker::PhantomData, num::NonZeroU64};
 use std::{borrow::Cow, sync::Arc};
 
 use anyhow::{bail, ensure, Context as _, Error as AnyhowError, Result};
-use arithmetic::U64Ext as _;
-use database::Database;
+use database::{Database, PrefixableKey};
 use derive_more::Display;
 use fork_choice_store::{ChainLink, Store};
 use genesis::AnchorCheckpointProvider;
 use helper_functions::{accessors, misc};
 use itertools::Itertools as _;
-use log::{debug, info, warn};
+use logging::{debug_with_peers, info_with_peers, warn_with_peers};
 use nonzero_ext::nonzero;
+use pubkey_cache::PubkeyCache;
 use reqwest::Client;
 use ssz::{Ssz, SszRead, SszReadDefault, SszWrite};
 use std_ext::ArcExt as _;
@@ -23,7 +23,11 @@ use types::{
         containers::{BlobIdentifier, BlobSidecar},
         primitives::BlobIndex,
     },
-    nonstandard::{BlobSidecarWithId, FinalizedCheckpoint},
+    fulu::{
+        containers::{DataColumnIdentifier, DataColumnSidecar},
+        primitives::ColumnIndex,
+    },
+    nonstandard::{BlobSidecarWithId, DataColumnSidecarWithId, FinalizedCheckpoint},
     phase0::{
         consts::GENESIS_SLOT,
         primitives::{Epoch, Slot, H256},
@@ -53,25 +57,29 @@ pub enum StateLoadStrategy<P: Preset> {
 }
 
 #[expect(clippy::struct_field_names)]
+#[derive(Clone)]
 pub struct Storage<P> {
     config: Arc<Config>,
-    pub(crate) database: Database,
+    pub(crate) database: Arc<Database>,
     pub(crate) archival_epoch_interval: NonZeroU64,
     storage_mode: StorageMode,
+    pub(crate) pubkey_cache: Arc<PubkeyCache>,
     phantom: PhantomData<P>,
 }
 
 impl<P: Preset> Storage<P> {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         config: Arc<Config>,
+        pubkey_cache: Arc<PubkeyCache>,
         database: Database,
         archival_epoch_interval: NonZeroU64,
         storage_mode: StorageMode,
     ) -> Self {
         Self {
             config,
-            database,
+            pubkey_cache,
+            database: Arc::new(database),
             archival_epoch_interval,
             storage_mode,
             phantom: PhantomData,
@@ -98,7 +106,7 @@ impl<P: Preset> Storage<P> {
         &self,
         client: &Client,
         state_load_strategy: StateLoadStrategy<P>,
-    ) -> Result<(StateStorage<P>, bool)> {
+    ) -> Result<(StateStorage<'_, P>, bool)> {
         let anchor_block;
         let anchor_state;
         let unfinalized_blocks: UnfinalizedBlocks<P>;
@@ -121,7 +129,7 @@ impl<P: Preset> Storage<P> {
                         let result = if let Some(checkpoint) =
                             anchor_checkpoint_provider.checkpoint().checkpoint_synced()
                         {
-                            info!("anchor checkpoint is already loaded from remote checkpoint sync server");
+                            info_with_peers!("anchor checkpoint is already loaded from remote checkpoint sync server");
                             Ok(checkpoint)
                         } else {
                             checkpoint_sync::load_finalized_from_remote(&self.config, client, &url)
@@ -137,10 +145,10 @@ impl<P: Preset> Storage<P> {
                                 loaded_from_remote = true;
                                 break 'block;
                             }
-                            Err(error) => warn!("{error:#}"),
+                            Err(error) => warn_with_peers!("{error:#}"),
                         }
                     } else {
-                        warn!(
+                        warn_with_peers!(
                             "skipping checkpoint sync: existing database found; \
                              pass --force-checkpoint-sync to force checkpoint sync",
                         );
@@ -197,11 +205,18 @@ impl<P: Preset> Storage<P> {
             }
         }
 
+        // decompress and load all missing anchor state pubkeys into cache
+        if let Err(error) = self.pubkey_cache.load_and_persist_state_keys(&anchor_state) {
+            warn_with_peers!(
+                "error occurred while loading anchor state keys into pubkey_cache: {error:?}"
+            );
+        }
+
         let anchor_slot = anchor_block.message().slot();
         let anchor_block_root = anchor_block.message().hash_tree_root();
         let anchor_state_root = anchor_block.message().state_root();
 
-        info!("loaded state at slot {anchor_slot}");
+        info_with_peers!("loaded state at slot {anchor_slot}");
 
         self.database.put_batch([
             serialize(FinalizedBlockByRoot(anchor_block_root), &anchor_block)?,
@@ -215,11 +230,11 @@ impl<P: Preset> Storage<P> {
         Ok((state_storage, loaded_from_remote))
     }
 
-    fn load_latest_state(&self) -> Result<OptionalStateStorage<P>> {
+    fn load_latest_state(&self) -> Result<OptionalStateStorage<'_, P>> {
         if let Some((state, block, blocks)) = self.load_state_and_blocks_from_checkpoint()? {
             Ok(OptionalStateStorage::Full((state, block, blocks)))
         } else {
-            info!(
+            info_with_peers!(
                 "latest state checkpoint was not found; \
                  attempting to find stored state by iteration",
             );
@@ -232,7 +247,7 @@ impl<P: Preset> Storage<P> {
         &self,
         unfinalized: impl Iterator<Item = &'cl ChainLink<P>>,
         finalized: impl DoubleEndedIterator<Item = &'cl ChainLink<P>>,
-        store: &Store<P>,
+        store: &Store<P, Self>,
     ) -> Result<AppendedBlockSlots> {
         let mut slots = AppendedBlockSlots::default();
         let mut store_head_slot = 0;
@@ -256,7 +271,7 @@ impl<P: Preset> Storage<P> {
             store_head_slot = chain_link.slot().max(store_head_slot);
         }
 
-        debug!("saving store head slot: {store_head_slot}");
+        debug_with_peers!("saving store head slot: {store_head_slot}");
 
         for (chain_link, finalized) in chain {
             let block_root = chain_link.block_root;
@@ -264,10 +279,10 @@ impl<P: Preset> Storage<P> {
             let state_slot = chain_link.slot();
 
             if !self.prune_storage_enabled() {
-                if finalized {
+                if finalized && !self.contains_finalized_block(block_root)? {
                     slots.finalized.push(state_slot);
                     batch.push(serialize(FinalizedBlockByRoot(block_root), block)?);
-                } else {
+                } else if !self.contains_unfinalized_block(block_root)? {
                     slots.unfinalized.push(state_slot);
                     batch.push(serialize(UnfinalizedBlockByRoot(block_root), block)?);
                 }
@@ -289,7 +304,7 @@ impl<P: Preset> Storage<P> {
                     let append_state = misc::is_epoch_start::<P>(state_slot);
 
                     if append_state {
-                        info!("saving checkpoint block & state in slot {state_slot}");
+                        info_with_peers!("saving checkpoint block & state in slot {state_slot}");
 
                         batch.push(serialize(
                             BlockCheckpoint::<P>::KEY,
@@ -311,13 +326,13 @@ impl<P: Preset> Storage<P> {
                     }
                 }
 
-                if !(archival_state_appended || self.prune_storage_enabled()) {
+                if !archival_state_appended && !self.prune_storage_enabled() {
                     let state_epoch = Self::epoch_at_slot(state_slot);
                     let append_state = misc::is_epoch_start::<P>(state_slot)
-                        && state_epoch.is_multiple_of(self.archival_epoch_interval);
+                        && state_epoch.is_multiple_of(self.archival_epoch_interval.into());
 
                     if append_state {
-                        info!("saving state in slot {state_slot}");
+                        info_with_peers!("saving state in slot {state_slot}");
 
                         batch.push(serialize(
                             StateByBlockRoot(block_root),
@@ -365,6 +380,25 @@ impl<P: Preset> Storage<P> {
         self.database.put_batch(batch)?;
 
         Ok(persisted_blob_ids)
+    }
+
+    pub(crate) fn append_states(
+        &self,
+        states_with_block_roots: impl Iterator<Item = (Arc<BeaconState<P>>, H256)>,
+    ) -> Result<Vec<Slot>> {
+        let mut slots = vec![];
+        let mut batch = vec![];
+
+        for (state, block_root) in states_with_block_roots {
+            if !self.contains_key(StateByBlockRoot(block_root))? {
+                slots.push(state.slot());
+                batch.push(serialize(StateByBlockRoot(block_root), state)?);
+            }
+        }
+
+        self.database.put_batch(batch)?;
+
+        Ok(slots)
     }
 
     pub(crate) fn blob_sidecar_by_id(
@@ -434,9 +468,6 @@ impl<P: Preset> Storage<P> {
             let key = FinalizedBlockByRoot(block_root).to_string();
             self.database.delete(key)?;
 
-            let key = UnfinalizedBlockByRoot(block_root).to_string();
-            self.database.delete(key)?;
-
             let key = StateByBlockRoot(block_root).to_string();
             self.database.delete(key)?;
         }
@@ -476,6 +507,126 @@ impl<P: Preset> Storage<P> {
         Ok(())
     }
 
+    pub(crate) fn prune_unfinalized_blocks(&self, last_finalized_slot: Slot) -> Result<Vec<Slot>> {
+        let mut slots = vec![];
+        let mut keys_to_remove = vec![];
+
+        let results = self
+            .database
+            .iterator_ascending(serialize_key(UnfinalizedBlockByRoot(H256::zero()))..)?;
+
+        for result in results {
+            let (key_bytes, value_bytes) = result?;
+
+            if !UnfinalizedBlockByRoot::has_prefix(&key_bytes) {
+                break;
+            }
+
+            let unfinalized_block = SignedBeaconBlock::<P>::from_ssz(&self.config, value_bytes)?;
+            let block_slot = unfinalized_block.message().slot();
+
+            if block_slot <= last_finalized_slot {
+                slots.push(block_slot);
+                keys_to_remove.push(key_bytes.into_owned());
+            }
+        }
+
+        for slot in &slots {
+            if let Some(block_root) = self.block_root_by_slot(*slot)? {
+                // remove only if slot -> root points to unfinalized block
+                if !self.contains_finalized_block(block_root)? {
+                    keys_to_remove
+                        .push(serialize_key(BlockRootBySlot(*slot)).as_bytes().to_owned());
+                }
+            }
+        }
+
+        for key in keys_to_remove {
+            self.database.delete(key)?;
+        }
+
+        Ok(slots)
+    }
+
+    pub(crate) fn append_data_column_sidecars(
+        &self,
+        data_column_sidecars: impl IntoIterator<Item = DataColumnSidecarWithId<P>>,
+    ) -> Result<Vec<DataColumnIdentifier>> {
+        let mut batch = vec![];
+        let mut persisted_data_column_ids = vec![];
+
+        for data_column_sidecar_with_id in data_column_sidecars {
+            let DataColumnSidecarWithId {
+                data_column_sidecar,
+                data_column_id,
+            } = data_column_sidecar_with_id;
+
+            let DataColumnIdentifier { block_root, index } = data_column_id;
+
+            let slot = data_column_sidecar.signed_block_header.message.slot;
+
+            batch.push(serialize(
+                DataColumnSidecarByColumnId(block_root, index),
+                data_column_sidecar,
+            )?);
+
+            batch.push(serialize(
+                SlotColumnId(slot, block_root, index),
+                data_column_id,
+            )?);
+
+            persisted_data_column_ids.push(data_column_id);
+        }
+
+        self.database.put_batch(batch)?;
+
+        Ok(persisted_data_column_ids)
+    }
+
+    pub(crate) fn data_column_sidecar_by_id(
+        &self,
+        data_column_id: DataColumnIdentifier,
+    ) -> Result<Option<Arc<DataColumnSidecar<P>>>> {
+        let DataColumnIdentifier { block_root, index } = data_column_id;
+
+        self.get(DataColumnSidecarByColumnId(block_root, index))
+    }
+
+    pub(crate) fn prune_old_data_column_sidecars(&self, up_to_slot: Slot) -> Result<()> {
+        let mut columns_to_remove: Vec<DataColumnIdentifier> = vec![];
+        let mut keys_to_remove = vec![];
+
+        let results = self
+            .database
+            .iterator_descending(..=SlotColumnId(up_to_slot, H256::zero(), 0).to_string())?;
+
+        for result in results {
+            let (key_bytes, value_bytes) = result?;
+
+            if !SlotColumnId::has_prefix(&key_bytes) {
+                break;
+            }
+
+            // Deserialize-serialize DataColumnIdentifier as an additional measure
+            // to prevent other types of data getting accidentally deleted.
+            columns_to_remove.push(DataColumnIdentifier::from_ssz_default(value_bytes)?);
+            keys_to_remove.push(key_bytes.into_owned());
+        }
+
+        for column_id in columns_to_remove {
+            let DataColumnIdentifier { block_root, index } = column_id;
+            let key = DataColumnSidecarByColumnId(block_root, index).to_string();
+
+            self.database.delete(key)?;
+        }
+
+        for key in keys_to_remove {
+            self.database.delete(key)?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_state_slot(&self) -> Result<Option<Slot>> {
         if let Some(StateCheckpoint { head_slot, .. }) = self.load_state_checkpoint()? {
             return Ok(Some(head_slot));
@@ -484,7 +635,7 @@ impl<P: Preset> Storage<P> {
         Ok(None)
     }
 
-    pub(crate) fn genesis_block_root(&self, store: &Store<P>) -> Result<H256> {
+    pub(crate) fn genesis_block_root(&self, store: &Store<P, Self>) -> Result<H256> {
         self.block_root_by_slot_with_store(store, GENESIS_SLOT)?
             .ok_or(Error::GenesisBlockRootNotFound)
             .map_err(Into::into)
@@ -527,7 +678,7 @@ impl<P: Preset> Storage<P> {
     // Like `block_root_by_slot`, but looks for the root in `store` first.
     pub(crate) fn block_root_by_slot_with_store(
         &self,
-        store: &Store<P>,
+        store: &Store<P, Self>,
         slot: Slot,
     ) -> Result<Option<H256>> {
         if let Some(chain_link) = store.chain_link_before_or_at(slot) {
@@ -582,11 +733,16 @@ impl<P: Preset> Storage<P> {
         // `blocks` here are needed to transition state closer to `slot`.
         for result in blocks.rev() {
             let block = result?;
-            combined::trusted_state_transition(&self.config, state.make_mut(), &block)?;
+            combined::trusted_state_transition(
+                &self.config,
+                &self.pubkey_cache,
+                state.make_mut(),
+                &block,
+            )?;
         }
 
         if state.slot() < slot {
-            combined::process_slots(&self.config, state.make_mut(), slot)?;
+            combined::process_slots(&self.config, &self.pubkey_cache, state.make_mut(), slot)?;
         }
 
         Ok(Some(state))
@@ -626,7 +782,12 @@ impl<P: Preset> Storage<P> {
         };
 
         for block in blocks.into_iter().rev() {
-            combined::trusted_state_transition(&self.config, state.make_mut(), &block)?;
+            combined::trusted_state_transition(
+                &self.config,
+                &self.pubkey_cache,
+                state.make_mut(),
+                &block,
+            )?;
         }
 
         Ok(Some(state))
@@ -645,7 +806,7 @@ impl<P: Preset> Storage<P> {
 
     pub(crate) fn dependent_root(
         &self,
-        store: &Store<P>,
+        store: &Store<P, Self>,
         state: &BeaconState<P>,
         epoch: Epoch,
     ) -> Result<H256> {
@@ -658,7 +819,7 @@ impl<P: Preset> Storage<P> {
         .context(Error::DependentRootLookupFailed)
     }
 
-    fn load_state_and_blocks_from_checkpoint(&self) -> Result<Option<StateStorage<P>>> {
+    fn load_state_and_blocks_from_checkpoint(&self) -> Result<Option<StateStorage<'_, P>>> {
         if let Some(checkpoint) = self.load_state_checkpoint()? {
             let StateCheckpoint {
                 block_root, state, ..
@@ -707,7 +868,10 @@ impl<P: Preset> Storage<P> {
         Ok(None)
     }
 
-    fn load_state_by_iteration(&self, start_from_slot: Slot) -> Result<OptionalStateStorage<P>> {
+    fn load_state_by_iteration(
+        &self,
+        start_from_slot: Slot,
+    ) -> Result<OptionalStateStorage<'_, P>> {
         let results = self
             .database
             .iterator_descending(..=BlockRootBySlot(start_from_slot).to_string())?;
@@ -763,13 +927,13 @@ impl<P: Preset> Storage<P> {
         self.get(StateCheckpoint::<P>::KEY)
     }
 
-    fn contains_key(&self, key: impl Display) -> Result<bool> {
+    fn contains_key(&self, key: impl core::fmt::Display) -> Result<bool> {
         let key_string = key.to_string();
 
         self.database.contains_key(key_string)
     }
 
-    fn get<V: SszRead<Config>>(&self, key: impl Display) -> Result<Option<V>> {
+    fn get<V: SszRead<Config>>(&self, key: impl core::fmt::Display) -> Result<Option<V>> {
         let key_string = key.to_string();
 
         if let Some(value_bytes) = self.database.get(key_string)? {
@@ -780,7 +944,7 @@ impl<P: Preset> Storage<P> {
         Ok(None)
     }
 
-    fn blocks_by_roots(&self, block_roots: Vec<H256>) -> UnfinalizedBlocks<P> {
+    fn blocks_by_roots(&self, block_roots: Vec<H256>) -> UnfinalizedBlocks<'_, P> {
         Box::new(block_roots.into_iter().map(|block_root| {
             if let Some(block) = self.finalized_block_by_root(block_root)? {
                 return Ok(block);
@@ -887,6 +1051,12 @@ impl<P: Preset> Storage<P> {
     }
 }
 
+impl<P: Preset> fork_choice_store::Storage<P> for Storage<P> {
+    fn stored_state_by_block_root(&self, block_root: H256) -> Result<Option<Arc<BeaconState<P>>>> {
+        self.state_by_block_root(block_root)
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct AppendedBlockSlots {
     pub finalized: Vec<Slot>,
@@ -915,15 +1085,6 @@ type StateStorage<'storage, P> = (
     Arc<SignedBeaconBlock<P>>,
     UnfinalizedBlocks<'storage, P>,
 );
-
-pub trait PrefixableKey {
-    const PREFIX: &'static str;
-
-    #[must_use]
-    fn has_prefix(bytes: &[u8]) -> bool {
-        bytes.starts_with(Self::PREFIX.as_bytes())
-    }
-}
 
 #[derive(Ssz)]
 // A `bound_for_read` attribute like this must be added when deriving `SszRead` for any type that
@@ -1043,6 +1204,27 @@ impl PrefixableKey for SlotBlobId {
     const PREFIX: &'static str = "i";
 }
 
+#[derive(Display)]
+#[display("{}{_0:x}{_1}", Self::PREFIX)]
+pub struct DataColumnSidecarByColumnId(pub H256, pub ColumnIndex);
+
+impl PrefixableKey for DataColumnSidecarByColumnId {
+    const PREFIX: &'static str = "d";
+
+    #[cfg(test)]
+    fn has_prefix(bytes: &[u8]) -> bool {
+        bytes.starts_with(Self::PREFIX.as_bytes())
+    }
+}
+
+#[derive(Display)]
+#[display("{}{_0:020}{_1:x}{_2}", Self::PREFIX)]
+pub struct SlotColumnId(pub Slot, pub H256, pub ColumnIndex);
+
+impl PrefixableKey for SlotColumnId {
+    const PREFIX: &'static str = "c";
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("checkpoint sync failed")]
@@ -1066,11 +1248,14 @@ pub enum Error {
     IncorrectPrefix { bytes: Vec<u8> },
 }
 
-pub fn save(database: &Database, key: impl Display, value: impl SszWrite) -> Result<()> {
+pub fn save(database: &Database, key: impl core::fmt::Display, value: impl SszWrite) -> Result<()> {
     database.put(serialize_key(key), serialize_value(value)?)
 }
 
-pub fn get<V: SszReadDefault>(database: &Database, key: impl Display) -> Result<Option<V>> {
+pub fn get<V: SszReadDefault>(
+    database: &Database,
+    key: impl core::fmt::Display,
+) -> Result<Option<V>> {
     database
         .get(serialize_key(key))?
         .map(V::from_ssz_default)
@@ -1078,7 +1263,7 @@ pub fn get<V: SszReadDefault>(database: &Database, key: impl Display) -> Result<
         .map_err(Into::into)
 }
 
-fn serialize_key(key: impl Display) -> String {
+fn serialize_key(key: impl core::fmt::Display) -> String {
     key.to_string()
 }
 
@@ -1086,7 +1271,7 @@ fn serialize_value(value: impl SszWrite) -> Result<Vec<u8>> {
     value.to_ssz().map_err(Into::into)
 }
 
-pub fn serialize(key: impl Display, value: impl SszWrite) -> Result<(String, Vec<u8>)> {
+pub fn serialize(key: impl core::fmt::Display, value: impl SszWrite) -> Result<(String, Vec<u8>)> {
     Ok((serialize_key(key), serialize_value(value)?))
 }
 
@@ -1096,10 +1281,93 @@ mod tests {
     use database::DatabaseMode;
     use tempfile::TempDir;
     use types::{
-        phase0::containers::SignedBeaconBlock as Phase0SignedBeaconBlock, preset::Mainnet,
+        phase0::containers::{
+            BeaconBlock as Phase0BeaconBlock, SignedBeaconBlock as Phase0SignedBeaconBlock,
+        },
+        preset::Mainnet,
     };
 
     use super::*;
+
+    fn block_with_slot(slot: Slot) -> SignedBeaconBlock<Mainnet> {
+        SignedBeaconBlock::<Mainnet>::Phase0(Phase0SignedBeaconBlock {
+            message: Phase0BeaconBlock {
+                slot,
+                ..Phase0BeaconBlock::default()
+            },
+            ..Phase0SignedBeaconBlock::default()
+        })
+    }
+
+    #[test]
+    fn test_prune_unfinalized_blocks() -> Result<()> {
+        let database = Database::persistent(
+            "test_db",
+            TempDir::new()?,
+            ByteSize::mib(10),
+            DatabaseMode::ReadWrite,
+            None,
+        )?;
+
+        let block_1 = block_with_slot(1);
+        let block_3 = block_with_slot(3);
+        let block_5 = block_with_slot(5);
+        let block_6 = block_with_slot(6);
+        let block_10 = block_with_slot(10);
+
+        database.put_batch(vec![
+            // Slot 1
+            serialize(BlockRootBySlot(1), H256::repeat_byte(1))?,
+            serialize(FinalizedBlockByRoot(H256::repeat_byte(1)), &block_1)?,
+            serialize(SlotByStateRoot(H256::repeat_byte(1)), 1_u64)?,
+            serialize(StateByBlockRoot(H256::repeat_byte(1)), 1_u64)?,
+            // Slot 3
+            serialize(BlockRootBySlot(3), H256::repeat_byte(3))?,
+            serialize(FinalizedBlockByRoot(H256::repeat_byte(3)), &block_3)?,
+            // Slot 5
+            serialize(BlockRootBySlot(5), H256::repeat_byte(5))?,
+            serialize(UnfinalizedBlockByRoot(H256::repeat_byte(5)), &block_5)?,
+            //Slot 6
+            serialize(BlockRootBySlot(6), H256::repeat_byte(6))?,
+            serialize(FinalizedBlockByRoot(H256::repeat_byte(6)), &block_6)?,
+            serialize(UnfinalizedBlockByRoot(H256::repeat_byte(6)), &block_6)?,
+            serialize(SlotByStateRoot(H256::repeat_byte(6)), 6_u64)?,
+            serialize(StateByBlockRoot(H256::repeat_byte(6)), 6_u64)?,
+            // Slot 10, test case that "10" < "3" is not true
+            serialize(BlockRootBySlot(10), H256::repeat_byte(10))?,
+            serialize(UnfinalizedBlockByRoot(H256::repeat_byte(10)), &block_10)?,
+            serialize(SlotByStateRoot(H256::repeat_byte(10)), 10_u64)?,
+            serialize(StateByBlockRoot(H256::repeat_byte(10)), 10_u64)?,
+        ])?;
+
+        let storage = Storage::<Mainnet>::new(
+            Arc::new(Config::mainnet()),
+            Arc::new(PubkeyCache::default()),
+            database,
+            nonzero!(64_u64),
+            StorageMode::Standard,
+        );
+
+        // slots 1, 3, 10
+        assert_eq!(storage.finalized_block_count()?, 3);
+        // slots 1, 3, 5, 6, 10
+        assert_eq!(storage.unfinalized_block_count()?, 3);
+        assert_eq!(storage.block_root_by_slot_count()?, 5);
+        assert_eq!(storage.slot_by_state_root_count()?, 3);
+        assert_eq!(storage.state_count()?, 3);
+
+        storage.prune_unfinalized_blocks(6)?;
+
+        // slots 1, 3, 10
+        assert_eq!(storage.finalized_block_count()?, 3);
+        // slots 10
+        assert_eq!(storage.unfinalized_block_count()?, 1);
+        assert_eq!(storage.block_root_by_slot_count()?, 4);
+        assert_eq!(storage.slot_by_state_root_count()?, 3);
+        assert_eq!(storage.state_count()?, 3);
+
+        Ok(())
+    }
 
     #[test]
     fn test_prune_old_blocks_and_states() -> Result<()> {
@@ -1108,6 +1376,7 @@ mod tests {
             TempDir::new()?,
             ByteSize::mib(10),
             DatabaseMode::ReadWrite,
+            None,
         )?;
 
         let block = SignedBeaconBlock::<Mainnet>::Phase0(Phase0SignedBeaconBlock::default());
@@ -1116,7 +1385,6 @@ mod tests {
             // Slot 1
             serialize(BlockRootBySlot(1), H256::repeat_byte(1))?,
             serialize(FinalizedBlockByRoot(H256::repeat_byte(1)), &block)?,
-            serialize(UnfinalizedBlockByRoot(H256::repeat_byte(1)), &block)?,
             serialize(SlotByStateRoot(H256::repeat_byte(1)), 1_u64)?,
             serialize(StateByBlockRoot(H256::repeat_byte(1)), 1_u64)?,
             // Slot 3
@@ -1139,13 +1407,14 @@ mod tests {
 
         let storage = Storage::<Mainnet>::new(
             Arc::new(Config::mainnet()),
+            Arc::new(PubkeyCache::default()),
             database,
             nonzero!(64_u64),
             StorageMode::Standard,
         );
 
         assert_eq!(storage.finalized_block_count()?, 2);
-        assert_eq!(storage.unfinalized_block_count()?, 4);
+        assert_eq!(storage.unfinalized_block_count()?, 3);
         assert_eq!(storage.block_root_by_slot_count()?, 5);
         assert_eq!(storage.slot_by_state_root_count()?, 3);
         assert_eq!(storage.state_count()?, 3);
@@ -1173,10 +1442,12 @@ mod tests {
             TempDir::new()?,
             ByteSize::mib(10),
             DatabaseMode::ReadWrite,
+            None,
         )?;
 
         let storage = Storage::<Mainnet>::new(
             Arc::new(Config::mainnet()),
+            Arc::new(PubkeyCache::default()),
             database,
             nonzero!(64_u64),
             StorageMode::Standard,
@@ -1245,6 +1516,7 @@ mod tests {
 
         let storage = Storage::<Mainnet>::new(
             Arc::new(Config::mainnet()),
+            Arc::new(PubkeyCache::default()),
             database,
             nonzero!(64_u64),
             StorageMode::Standard,

@@ -10,13 +10,11 @@
 //! - Notifying other components of the application about changes to the fork choice store.
 //! - Testing.
 //!
-//! This crate exists primarily to separate [`fork_choice_store`] from persistence.
-//! [`fork_choice_store`] should never depend on [`storage`] or any other databases.
-//!
 //! [`storage`]: ::storage
 
 pub use crate::{
     controller::Controller,
+    events::{Event, EventChannels, Topic, DEFAULT_MAX_EVENTS},
     messages::{
         AttestationVerifierMessage, P2pMessage, PoolMessage, SubnetMessage, SyncMessage,
         ValidatorMessage,
@@ -27,9 +25,10 @@ pub use crate::{
     queries::{BlockWithRoot, ForkChoiceContext, ForkTip, Snapshot},
     specialized::{AdHocBenchController, BenchController},
     storage::{
-        get, save, BlobSidecarByBlobId, BlockCheckpoint, BlockRootBySlot, FinalizedBlockByRoot,
-        PrefixableKey, SlotBlobId, SlotByStateRoot, StateByBlockRoot, StateCheckpoint,
-        StateLoadStrategy, Storage, UnfinalizedBlockByRoot, DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
+        get, save, BlobSidecarByBlobId, BlockCheckpoint, BlockRootBySlot,
+        DataColumnSidecarByColumnId, FinalizedBlockByRoot, SlotBlobId, SlotByStateRoot,
+        SlotColumnId, StateByBlockRoot, StateCheckpoint, StateLoadStrategy, Storage,
+        UnfinalizedBlockByRoot, DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
     },
     storage_tool::{export_state_and_blocks, replay_blocks},
     wait::Wait,
@@ -39,11 +38,13 @@ pub mod checkpoint_sync;
 
 mod block_processor;
 mod controller;
+mod events;
 mod messages;
 mod misc;
 mod mutator;
 mod queries;
 mod specialized;
+mod state_at_slot_cache;
 mod storage;
 mod storage_back_sync;
 mod storage_tool;

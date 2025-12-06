@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use eth1_api::ApiController;
-use fork_choice_control::Wait;
+use fork_choice_control::{EventChannels, Wait};
 use futures::{
     channel::{
         mpsc::{UnboundedReceiver, UnboundedSender},
@@ -11,9 +11,8 @@ use futures::{
     stream::StreamExt as _,
 };
 use helper_functions::predicates;
-use http_api_utils::EventChannels;
 use itertools::Itertools as _;
-use log::{debug, warn};
+use logging::{debug_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
 use transition_functions::capella;
 use types::{
@@ -34,7 +33,7 @@ impl BlsToExecutionChangePool {
     #[must_use]
     pub fn new<P: Preset, W: Wait>(
         controller: ApiController<P, W>,
-        event_channels: Arc<EventChannels>,
+        event_channels: Arc<EventChannels<P>>,
         pool_to_p2p_tx: UnboundedSender<PoolToP2pMessage>,
         metrics: Option<Arc<Metrics>>,
     ) -> (Arc<Self>, Service<P, W>) {
@@ -102,7 +101,7 @@ impl BlsToExecutionChangePool {
 pub struct Service<P: Preset, W: Wait> {
     controller: ApiController<P, W>,
     bls_to_execution_changes: HashMap<ValidatorIndex, SignedBlsToExecutionChange>,
-    event_channels: Arc<EventChannels>,
+    event_channels: Arc<EventChannels<P>>,
     metrics: Option<Arc<Metrics>>,
     pool_to_p2p_tx: UnboundedSender<PoolToP2pMessage>,
     rx: UnboundedReceiver<PoolMessage>,
@@ -151,7 +150,7 @@ impl<P: Preset, W: Wait> Service<P, W> {
                 };
 
             if !success {
-                warn!("failed to send response because the receiver was dropped");
+                warn_with_peers!("failed to send response because the receiver was dropped");
             }
         }
 
@@ -163,7 +162,11 @@ impl<P: Preset, W: Wait> Service<P, W> {
         signed_bls_to_execution_change: SignedBlsToExecutionChange,
         origin: Origin,
     ) -> PoolAdditionOutcome {
-        match self.validate_signed_bls_to_execution_change(signed_bls_to_execution_change) {
+        let validation_outcome = tokio::task::block_in_place(|| {
+            self.validate_signed_bls_to_execution_change(signed_bls_to_execution_change)
+        });
+
+        match validation_outcome {
             Ok(outcome) => match outcome {
                 ValidationOutcome::Accept => {
                     match origin {
@@ -179,7 +182,7 @@ impl<P: Preset, W: Wait> Service<P, W> {
                     }
 
                     self.event_channels
-                        .send_bls_to_execution_change_event(&signed_bls_to_execution_change);
+                        .send_bls_to_execution_change_event(signed_bls_to_execution_change);
 
                     PoolAdditionOutcome::Accept
                 }
@@ -200,7 +203,7 @@ impl<P: Preset, W: Wait> Service<P, W> {
                     .send(&self.pool_to_p2p_tx);
                 }
 
-                warn!(
+                warn_with_peers!(
                     "external signed BLS to execution change rejected \
                      (error: {error}, message: {signed_bls_to_execution_change:?})",
                 );
@@ -213,10 +216,12 @@ impl<P: Preset, W: Wait> Service<P, W> {
         &mut self,
         signed_bls_to_execution_change: SignedBlsToExecutionChange,
     ) -> Result<ValidationOutcome> {
-        let state = self.controller.preprocessed_state_at_current_slot()?;
+        let state = self
+            .controller
+            .preprocessed_state_at_current_slot_blocking()?;
 
         let Some(state) = state.post_capella() else {
-            warn!(
+            warn_with_peers!(
                 "signed BLS to execution change received before Capella fork \
                  (signed_bls_to_execution_change: {:?}, slot: {})",
                 signed_bls_to_execution_change,
@@ -234,6 +239,7 @@ impl<P: Preset, W: Wait> Service<P, W> {
 
         capella::validate_bls_to_execution_change(
             self.controller.chain_config(),
+            self.controller.pubkey_cache(),
             state,
             signed_bls_to_execution_change,
         )?;
@@ -251,7 +257,7 @@ impl<P: Preset, W: Wait> Service<P, W> {
             let validator = match finalized_state.validators().get(*validator_index) {
                 Ok(validator) => validator,
                 Err(error) => {
-                    debug!("BLS to execution change is too recent to discard: {error}");
+                    debug_with_peers!("BLS to execution change is too recent to discard: {error}");
                     return true;
                 }
             };
@@ -275,7 +281,7 @@ enum PoolMessage {
 impl PoolMessage {
     pub fn send(self, tx: &UnboundedSender<Self>) {
         if let Err(message) = tx.unbounded_send(self) {
-            debug!("internal send failed because the receiver was dropped: {message:?}");
+            debug_with_peers!("internal send failed because the receiver was dropped: {message:?}");
         }
     }
 }

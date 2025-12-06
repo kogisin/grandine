@@ -258,9 +258,11 @@ impl<P: Preset> Pool<P> {
         let attestations_with_slot = self.best_proposable_attestations.lock().await;
         let (attestations, prepared_for_slot) = &*attestations_with_slot;
 
-        (slot == *prepared_for_slot)
-            .then(|| attestations.clone())
-            .unwrap_or_default()
+        if slot == *prepared_for_slot {
+            attestations.clone()
+        } else {
+            ContiguousList::default()
+        }
     }
 
     pub async fn clear_best_proposable_attestations(&self) {
@@ -286,7 +288,7 @@ impl<P: Preset> Pool<P> {
             .map(|slot| {
                 Ok((
                     slot,
-                    accessors::get_beacon_proposer_index_at_slot(state, slot)?,
+                    accessors::get_beacon_proposer_index_at_slot(&self.chain_config, state, slot)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -311,6 +313,17 @@ impl<P: Preset> Pool<P> {
             .await
             .range(range)
             .any(|(_, validator_index)| registered_indices.contains(validator_index))
+    }
+
+    pub async fn is_registered_validator(&self, validator_index: ValidatorIndex) -> bool {
+        self.registered_validator_indices
+            .read()
+            .await
+            .contains(&validator_index)
+    }
+
+    pub async fn registered_validator_indices(&self) -> HashSet<ValidatorIndex> {
+        self.registered_validator_indices.read().await.clone()
     }
 
     pub async fn set_best_proposable_attestations(

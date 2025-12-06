@@ -1,18 +1,23 @@
 #![expect(clippy::module_name_repetitions)]
+use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 use bls::{
-    traits::{CachedPublicKey as _, PublicKey as _, Signature as _, SignatureBytes as _},
-    AggregatePublicKey, AggregateSignature, CachedPublicKey, PublicKey, Signature, SignatureBytes,
+    traits::{PublicKey as _, Signature as _, SignatureBytes as _},
+    AggregatePublicKey, AggregateSignature, PublicKey, Signature, SignatureBytes,
 };
 use derive_more::Constructor;
 use enumset::{EnumSet, EnumSetType};
-use rayon::iter::{IntoParallelRefIterator as _, ParallelBridge as _, ParallelIterator as _};
+#[cfg(not(target_os = "zkvm"))]
+use rayon::iter::{ParallelBridge as _, ParallelIterator as _};
 use static_assertions::assert_not_impl_any;
 use tap::TryConv as _;
 use types::phase0::primitives::H256;
 
-use crate::error::{Error, SignatureKind};
+use crate::{
+    error::{Error, SignatureKind},
+    par_iter,
+};
 
 pub trait Verifier {
     const IS_NULL: bool;
@@ -23,15 +28,15 @@ pub trait Verifier {
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
         signature_kind: SignatureKind,
     ) -> Result<()>;
 
-    fn verify_aggregate<'keys>(
+    fn verify_aggregate(
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         signature_kind: SignatureKind,
     ) -> Result<()>;
 
@@ -39,11 +44,11 @@ pub trait Verifier {
     ///
     /// This used to be inlined in `verify_sync_aggregate_signature`. We factored out the emptiness
     /// check to be able to run `bls/eth_fast_aggregate_verify` test cases.
-    fn verify_aggregate_allowing_empty<'keys>(
+    fn verify_aggregate_allowing_empty(
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         signature_kind: SignatureKind,
     ) -> Result<()> {
         if signature_bytes.is_empty() {
@@ -82,18 +87,18 @@ impl<V: Verifier> Verifier for &mut V {
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
         signature_kind: SignatureKind,
     ) -> Result<()> {
-        (*self).verify_singular(message, signature_bytes, cached_public_key, signature_kind)
+        (*self).verify_singular(message, signature_bytes, public_key, signature_kind)
     }
 
     #[inline]
-    fn verify_aggregate<'keys>(
+    fn verify_aggregate(
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         signature_kind: SignatureKind,
     ) -> Result<()> {
         (*self).verify_aggregate(message, signature_bytes, public_keys, signature_kind)
@@ -132,18 +137,18 @@ impl Verifier for NullVerifier {
         &mut self,
         _message: H256,
         _signature_bytes: SignatureBytes,
-        _cached_public_key: &CachedPublicKey,
+        _public_key: Arc<PublicKey>,
         _signature_kind: SignatureKind,
     ) -> Result<()> {
         Ok(())
     }
 
     #[inline]
-    fn verify_aggregate<'keys>(
+    fn verify_aggregate(
         &mut self,
         _message: H256,
         _signature_bytes: SignatureBytes,
-        _public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        _public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         _signature_kind: SignatureKind,
     ) -> Result<()> {
         Ok(())
@@ -182,20 +187,19 @@ impl Verifier for SingleVerifier {
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
         signature_kind: SignatureKind,
     ) -> Result<()> {
-        let public_key = *cached_public_key.decompress()?;
         let triple = Triple::new(message, signature_bytes, public_key);
         self.extend(core::iter::once(triple), signature_kind)
     }
 
     #[inline]
-    fn verify_aggregate<'keys>(
+    fn verify_aggregate(
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         signature_kind: SignatureKind,
     ) -> Result<()> {
         // `Signature::fast_aggregate_verify` is faster than aggregating public keys with Rayon.
@@ -228,7 +232,7 @@ impl Verifier for SingleVerifier {
             let signature = Signature::try_from(signature_bytes)?;
 
             ensure!(
-                signature.verify(message, public_key),
+                signature.verify(message, &public_key),
                 Error::SignatureInvalid(signature_kind),
             );
         }
@@ -266,21 +270,20 @@ impl Verifier for MultiVerifier {
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        cached_public_key: &CachedPublicKey,
+        public_key: Arc<PublicKey>,
         _signature_kind: SignatureKind,
     ) -> Result<()> {
-        let public_key = *cached_public_key.decompress()?;
         let triple = Triple::new(message, signature_bytes, public_key);
         self.triples.push(triple);
         Ok(())
     }
 
     #[inline]
-    fn verify_aggregate<'keys>(
+    fn verify_aggregate(
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         signature_kind: SignatureKind,
     ) -> Result<()> {
         let mut triple = Triple::default();
@@ -307,13 +310,11 @@ impl Verifier for MultiVerifier {
 
         let messages = self.triples.iter().map(|triple| triple.message.as_bytes());
 
-        let signatures = self
-            .triples
-            .par_iter()
+        let signatures = par_iter!(self.triples)
             .map(|triple| triple.signature_bytes.try_into())
             .collect::<Result<Vec<_>, _>>()?;
 
-        let public_keys = self.triples.iter().map(|triple| &triple.public_key);
+        let public_keys = self.triples.iter().map(|triple| triple.public_key.as_ref());
 
         ensure!(
             Signature::multi_verify(messages, signatures.iter(), public_keys),
@@ -351,7 +352,7 @@ impl MultiVerifier {
 pub struct Triple {
     message: H256,
     signature_bytes: SignatureBytes,
-    public_key: PublicKey,
+    public_key: Arc<PublicKey>,
 }
 
 // `Triple` was originally an alias for a tuple and thus implemented `Copy`.
@@ -378,29 +379,37 @@ impl Verifier for Triple {
         &mut self,
         _message: H256,
         _signature_bytes: SignatureBytes,
-        _cached_public_key: &CachedPublicKey,
+        _public_key: Arc<PublicKey>,
         _signature_kind: SignatureKind,
     ) -> Result<()> {
         unimplemented!("<Triple as Verifier>::verify_singular is not used anywhere")
     }
 
     #[inline]
-    fn verify_aggregate<'keys>(
+    fn verify_aggregate(
         &mut self,
         message: H256,
         signature_bytes: SignatureBytes,
-        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = &'keys PublicKey> + Send>,
+        public_keys: impl IntoIterator<IntoIter = impl Iterator<Item = Arc<PublicKey>> + Send>,
         _signature_kind: SignatureKind,
     ) -> Result<()> {
         // TODO(Grandine Team): This may no longer be true as of Rayon 1.6.1. Benchmark again.
         // The `ParallelBridge::par_bridge` here outperforms "native" parallel iterators.
+        #[cfg(not(target_os = "zkvm"))]
         let public_key = public_keys
             .into_iter()
             .par_bridge()
-            .copied()
-            .reduce(AggregatePublicKey::default, AggregatePublicKey::aggregate);
+            .fold(AggregatePublicKey::default, |a, b| a.aggregate(&b))
+            .reduce(AggregatePublicKey::default, |a, b| a.aggregate(&b));
 
-        *self = Self::new(message, signature_bytes, public_key);
+        #[cfg(target_os = "zkvm")]
+        let public_key = public_keys
+            .into_iter()
+            .fold(AggregatePublicKey::default(), |acc, pubkey| {
+                acc.aggregate(&pubkey)
+            });
+
+        *self = Self::new(message, signature_bytes, Arc::new(public_key));
 
         Ok(())
     }
@@ -452,12 +461,12 @@ mod tests {
     #[test]
     fn multi_verifier_finalize_succeeds_with_1_signature() -> Result<()> {
         let secret_key = secret_key();
-        let public_key = secret_key.to_public_key().into();
+        let public_key = Arc::new(secret_key.to_public_key());
         let message = H256::default();
         let signature = secret_key.sign(message).into();
 
         let mut verifier = MultiVerifier::default();
-        verifier.verify_singular(message, signature, &public_key, SignatureKind::Block)?;
+        verifier.verify_singular(message, signature, public_key, SignatureKind::Block)?;
         verifier.finish()
     }
 

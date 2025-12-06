@@ -6,13 +6,13 @@ use either::Either;
 use enum_iterator::Sequence as _;
 use ethereum_types::H64;
 use execution_engine::{
-    BlobAndProofV1, EngineGetPayloadV1Response, EngineGetPayloadV2Response,
-    EngineGetPayloadV3Response, EngineGetPayloadV4Response, ExecutionPayloadV1, ExecutionPayloadV2,
-    ExecutionPayloadV3, ForkChoiceStateV1, ForkChoiceUpdatedResponse, PayloadAttributes, PayloadId,
-    PayloadStatusV1, RawExecutionRequests,
+    BlobAndProofV1, BlobAndProofV2, EngineGetPayloadV1Response, EngineGetPayloadV2Response,
+    EngineGetPayloadV3Response, EngineGetPayloadV4Response, EngineGetPayloadV5Response,
+    ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3, ForkChoiceStateV1,
+    ForkChoiceUpdatedResponse, PayloadAttributes, PayloadId, PayloadStatusV1, RawExecutionRequests,
 };
 use futures::{channel::mpsc::UnboundedSender, Future};
-use log::warn;
+use logging::warn_with_peers;
 use prometheus_metrics::Metrics;
 use reqwest::{header::HeaderMap, Client};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -42,22 +42,26 @@ use crate::{
     deposit_event::DepositEvent,
     endpoints::{Endpoint, Endpoints},
     eth1_block::Eth1Block,
-    Eth1ApiToMetrics, Eth1ConnectionData,
+    Eth1ApiToMetrics, Eth1ConnectionData, WithClientVersions,
 };
 
 const ENGINE_FORKCHOICE_UPDATED_TIMEOUT: Duration = Duration::from_secs(8);
-const ENGINE_GET_BLOBS_TIMEOUT: Duration = Duration::from_secs(1);
+// In some of our setups 1 second is not enough to get blobs from the execution client
+const ENGINE_GET_BLOBS_TIMEOUT: Duration = Duration::from_secs(2);
 const ENGINE_GET_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(1);
 const ENGINE_NEW_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub const ENGINE_FORKCHOICE_UPDATED_V1: &str = "engine_forkchoiceUpdatedV1";
 pub const ENGINE_FORKCHOICE_UPDATED_V2: &str = "engine_forkchoiceUpdatedV2";
 pub const ENGINE_FORKCHOICE_UPDATED_V3: &str = "engine_forkchoiceUpdatedV3";
+pub const ENGINE_GET_CLIENT_VERSION_V1: &str = "engine_getClientVersionV1";
 pub const ENGINE_GET_EL_BLOBS_V1: &str = "engine_getBlobsV1";
+pub const ENGINE_GET_EL_BLOBS_V2: &str = "engine_getBlobsV2";
 pub const ENGINE_GET_PAYLOAD_V1: &str = "engine_getPayloadV1";
 pub const ENGINE_GET_PAYLOAD_V2: &str = "engine_getPayloadV2";
 pub const ENGINE_GET_PAYLOAD_V3: &str = "engine_getPayloadV3";
 pub const ENGINE_GET_PAYLOAD_V4: &str = "engine_getPayloadV4";
+pub const ENGINE_GET_PAYLOAD_V5: &str = "engine_getPayloadV5";
 pub const ENGINE_NEW_PAYLOAD_V1: &str = "engine_newPayloadV1";
 pub const ENGINE_NEW_PAYLOAD_V2: &str = "engine_newPayloadV2";
 pub const ENGINE_NEW_PAYLOAD_V3: &str = "engine_newPayloadV3";
@@ -67,11 +71,14 @@ pub const CAPABILITIES: &[&str] = &[
     ENGINE_FORKCHOICE_UPDATED_V1,
     ENGINE_FORKCHOICE_UPDATED_V2,
     ENGINE_FORKCHOICE_UPDATED_V3,
+    ENGINE_GET_CLIENT_VERSION_V1,
     ENGINE_GET_EL_BLOBS_V1,
+    ENGINE_GET_EL_BLOBS_V2,
     ENGINE_GET_PAYLOAD_V1,
     ENGINE_GET_PAYLOAD_V2,
     ENGINE_GET_PAYLOAD_V3,
     ENGINE_GET_PAYLOAD_V4,
+    ENGINE_GET_PAYLOAD_V5,
     ENGINE_NEW_PAYLOAD_V1,
     ENGINE_NEW_PAYLOAD_V2,
     ENGINE_NEW_PAYLOAD_V3,
@@ -112,12 +119,14 @@ impl Eth1Api {
         Ok(self
             .request_with_fallback(|(api, headers)| Ok(api.block_number(headers)), None)
             .await?
+            .result
             .as_u64())
     }
 
     pub async fn get_block(&self, block_id: BlockId) -> Result<Option<Eth1Block>> {
         self.request_with_fallback(|(api, headers)| Ok(api.block(block_id, headers)), None)
             .await?
+            .result
             .map(Eth1Block::try_from)
             .transpose()
     }
@@ -151,7 +160,8 @@ impl Eth1Api {
 
         let logs = self
             .request_with_fallback(|(api, headers)| Ok(api.logs(filter.clone(), headers)), None)
-            .await?;
+            .await?
+            .result;
 
         if let Some(log) = logs.first() {
             if let Some(block_number) = log.block_number {
@@ -162,7 +172,7 @@ impl Eth1Api {
         Ok(None)
     }
 
-    pub(crate) async fn get_blobs<P: Preset>(
+    pub(crate) async fn get_blobs_v1<P: Preset>(
         &self,
         versioned_hashes: Vec<VersionedHash>,
     ) -> Result<Vec<Option<BlobAndProofV1<P>>>> {
@@ -175,6 +185,23 @@ impl Eth1Api {
             Some(ENGINE_GET_EL_BLOBS_V1),
         )
         .await
+        .map(WithClientVersions::result)
+    }
+
+    pub(crate) async fn get_blobs_v2<P: Preset>(
+        &self,
+        versioned_hashes: Vec<VersionedHash>,
+    ) -> Result<Option<Vec<BlobAndProofV2<P>>>> {
+        let params = vec![serde_json::to_value(versioned_hashes)?];
+
+        self.execute(
+            ENGINE_GET_EL_BLOBS_V2,
+            params,
+            Some(ENGINE_GET_BLOBS_TIMEOUT),
+            Some(ENGINE_GET_EL_BLOBS_V2),
+        )
+        .await
+        .map(WithClientVersions::result)
     }
 
     pub async fn get_blocks(
@@ -185,16 +212,13 @@ impl Eth1Api {
         let mut blocks = vec![];
 
         for block_number in block_number_range {
-            match self.get_block_by_number(block_number).await? {
-                Some(block) => {
-                    let deposit_events = deposit_data.remove(&block_number).unwrap_or_default();
-                    let eth1_block = Eth1Block {
-                        deposit_events: deposit_events.try_into()?,
-                        ..block
-                    };
-                    blocks.push(eth1_block);
-                }
-                None => continue,
+            if let Some(block) = self.get_block_by_number(block_number).await? {
+                let deposit_events = deposit_data.remove(&block_number).unwrap_or_default();
+                let eth1_block = Eth1Block {
+                    deposit_events: deposit_events.try_into()?,
+                    ..block
+                };
+                blocks.push(eth1_block);
             }
         }
 
@@ -223,6 +247,7 @@ impl Eth1Api {
         for log in self
             .request_with_fallback(|(api, headers)| Ok(api.logs(filter.clone(), headers)), None)
             .await?
+            .result
         {
             let block_number = match log.block_number {
                 Some(block_number) => block_number.as_u64(),
@@ -265,6 +290,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
+                .map(WithClientVersions::result)
             }
             (ExecutionPayload::Capella(payload), None) => {
                 let payload_v2 = ExecutionPayloadV2::from(payload);
@@ -276,6 +302,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
+                .map(WithClientVersions::result)
             }
             (
                 ExecutionPayload::Deneb(payload),
@@ -297,6 +324,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
+                .map(WithClientVersions::result)
             }
             (
                 ExecutionPayload::Deneb(payload),
@@ -323,6 +351,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
+                .map(WithClientVersions::result)
             }
             _ => bail!(Error::InvalidParameters),
         }
@@ -372,6 +401,7 @@ impl Eth1Api {
                     None,
                 )
                 .await?
+                .result
             }
             Phase::Capella => {
                 self.execute(
@@ -381,8 +411,9 @@ impl Eth1Api {
                     None,
                 )
                 .await?
+                .result
             }
-            Phase::Deneb => {
+            Phase::Deneb | Phase::Electra | Phase::Fulu => {
                 self.execute(
                     ENGINE_FORKCHOICE_UPDATED_V3,
                     params,
@@ -390,20 +421,12 @@ impl Eth1Api {
                     None,
                 )
                 .await?
-            }
-            Phase::Electra => {
-                self.execute(
-                    ENGINE_FORKCHOICE_UPDATED_V3,
-                    params,
-                    Some(ENGINE_FORKCHOICE_UPDATED_TIMEOUT),
-                    None,
-                )
-                .await?
+                .result
             }
             _ => {
                 // This match arm will silently match any new phases.
                 // Cause a compilation error if a new phase is added.
-                const_assert_eq!(Phase::CARDINALITY, 6);
+                const_assert_eq!(Phase::CARDINALITY, 7);
 
                 bail!(Error::PhasePreBellatrix)
             }
@@ -414,10 +437,11 @@ impl Eth1Api {
             Phase::Capella => payload_id.map(PayloadId::Capella),
             Phase::Deneb => payload_id.map(PayloadId::Deneb),
             Phase::Electra => payload_id.map(PayloadId::Electra),
+            Phase::Fulu => payload_id.map(PayloadId::Fulu),
             _ => {
                 // This match arm will silently match any new phases.
                 // Cause a compilation error if a new phase is added.
-                const_assert_eq!(Phase::CARDINALITY, 6);
+                const_assert_eq!(Phase::CARDINALITY, 7);
 
                 bail!(Error::PhasePreBellatrix)
             }
@@ -429,7 +453,7 @@ impl Eth1Api {
         })
     }
 
-    /// Calls [`engine_getPayloadV1`] or [`engine_getPayloadV2`] or [`engine_getPayloadV3`] or [`engine_getPayloadV4`] depending on `payload_id`.
+    /// Calls [`engine_getPayloadV1`] or [`engine_getPayloadV2`] or [`engine_getPayloadV3`] or [`engine_getPayloadV4`] or [`engine_getPayloadV5`] depending on `payload_id`.
     ///
     /// Newer versions of the method may be used to request payloads from all prior versions,
     /// but using the old methods allows the application to work with old execution clients.
@@ -438,10 +462,11 @@ impl Eth1Api {
     /// [`engine_getPayloadV2`]: https://github.com/ethereum/execution-apis/blob/b7c5d3420e00648f456744d121ffbd929862924d/src/engine/shanghai.md#engine_getpayloadv2
     /// [`engine_getPayloadV3`]: https://github.com/ethereum/execution-apis/blob/a0d03086564ab1838b462befbc083f873dcf0c0f/src/engine/cancun.md#engine_getpayloadv3
     /// [`engine_getPayloadV4`]: https://github.com/ethereum/execution-apis/blob/4140e528360fea53c34a766d86a000c6c039100e/src/engine/prague.md#engine_getpayloadv4
+    /// [`engine_getPayloadV5`]: https://github.com/ethereum/execution-apis/blob/5d634063ccfd897a6974ea589c00e2c1d889abc9/src/engine/osaka.md#engine_getpayloadv5
     pub async fn get_payload<P: Preset>(
         &self,
         payload_id: PayloadId,
-    ) -> Result<WithBlobsAndMev<ExecutionPayload<P>, P>> {
+    ) -> Result<WithClientVersions<WithBlobsAndMev<ExecutionPayload<P>, P>>> {
         match payload_id {
             PayloadId::Bellatrix(payload_id) => {
                 let params = vec![serde_json::to_value(payload_id)?];
@@ -453,7 +478,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
-                .map(Into::into)
+                .map(|with_client_info| with_client_info.map(Into::into))
             }
             PayloadId::Capella(payload_id) => {
                 let params = vec![serde_json::to_value(payload_id)?];
@@ -465,7 +490,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
-                .map(Into::into)
+                .map(|with_client_info| with_client_info.map(Into::into))
             }
             PayloadId::Deneb(payload_id) => {
                 let params = vec![serde_json::to_value(payload_id)?];
@@ -477,7 +502,7 @@ impl Eth1Api {
                     None,
                 )
                 .await
-                .map(Into::into)
+                .map(|with_client_info| with_client_info.map(Into::into))
             }
             PayloadId::Electra(payload_id) => {
                 let params = vec![serde_json::to_value(payload_id)?];
@@ -489,7 +514,19 @@ impl Eth1Api {
                     None,
                 )
                 .await
-                .map(Into::into)
+                .map(|with_client_info| with_client_info.map(Into::into))
+            }
+            PayloadId::Fulu(payload_id) => {
+                let params = vec![serde_json::to_value(payload_id)?];
+
+                self.execute::<EngineGetPayloadV5Response<P>>(
+                    ENGINE_GET_PAYLOAD_V5,
+                    params,
+                    Some(ENGINE_GET_PAYLOAD_TIMEOUT),
+                    None,
+                )
+                .await
+                .map(|with_client_info| with_client_info.map(Into::into))
             }
         }
     }
@@ -500,7 +537,7 @@ impl Eth1Api {
         params: Vec<Value>,
         timeout: Option<Duration>,
         capability: Option<&str>,
-    ) -> Result<T> {
+    ) -> Result<WithClientVersions<T>> {
         let _timer = self.metrics.as_ref().map(|metrics| {
             prometheus_metrics::start_timer_vec(&metrics.eth1_api_request_times, method)
         });
@@ -528,7 +565,7 @@ impl Eth1Api {
         &self,
         request_from_api: R,
         capability: Option<&str>,
-    ) -> Result<O>
+    ) -> Result<WithClientVersions<O>>
     where
         R: Fn((Eth<Http>, Option<HeaderMap>)) -> Result<CallFuture<O, F>> + Sync + Send,
         O: DeserializeOwned + Send,
@@ -543,18 +580,22 @@ impl Eth1Api {
             match query {
                 Ok(result) => {
                     self.on_ok_response(endpoint);
-                    return Ok(result);
+
+                    return Ok(WithClientVersions {
+                        client_versions: Some(endpoint.get_client_versions()),
+                        result,
+                    });
                 }
                 Err(error) => {
                     self.on_error_response(endpoint);
 
                     match endpoints_for_request.peek() {
-                        Some(next_endpoint) => warn!(
+                        Some(next_endpoint) => warn_with_peers!(
                             "Eth1 RPC endpoint {} returned an error: {error}; switching to {}",
                             endpoint.url(),
                             next_endpoint.url(),
                         ),
-                        None => warn!(
+                        None => warn_with_peers!(
                             "last available Eth1 RPC endpoint {} returned an error: {error}",
                             endpoint.url(),
                         ),
@@ -891,7 +932,7 @@ mod tests {
         ));
 
         let payload_id = PayloadId::Capella(H64(hex!("a5f7426cdca69a73")));
-        let payload = eth1_api.get_payload::<Mainnet>(payload_id).await?;
+        let payload = eth1_api.get_payload::<Mainnet>(payload_id).await?.result;
 
         assert_eq!(payload.value.phase(), Phase::Capella);
 
@@ -968,7 +1009,7 @@ mod tests {
         ));
 
         let payload_id = PayloadId::Electra(H64(hex!("a5f7426cdca69a73")));
-        let payload = eth1_api.get_payload::<Mainnet>(payload_id).await?;
+        let payload = eth1_api.get_payload::<Mainnet>(payload_id).await?.result;
 
         assert_eq!(payload.value.phase(), Phase::Deneb);
         assert_eq!(
@@ -1052,7 +1093,7 @@ mod tests {
         ));
 
         let payload_id = PayloadId::Electra(H64(hex!("a5f7426cdca69a73")));
-        let payload = eth1_api.get_payload::<Mainnet>(payload_id).await?;
+        let payload = eth1_api.get_payload::<Mainnet>(payload_id).await?.result;
 
         assert_eq!(payload.value.phase(), Phase::Deneb);
         assert_eq!(

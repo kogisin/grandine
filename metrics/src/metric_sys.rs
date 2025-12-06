@@ -1,21 +1,31 @@
 use anyhow::Result;
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use {
     anyhow::bail,
     psutil::{cpu, process::Process},
 };
 #[cfg(target_os = "windows")]
 use {
-    log::debug,
+    logging::debug_with_peers,
     winsafe::{self as w, prelude::*},
 };
 
+#[derive(Default)]
 pub struct ProcessCpuMetric {
     pub cpu_process_seconds_total: u64,
     pub memory_process_bytes: u64,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+))]
+pub fn get_process_cpu_metric() -> Result<ProcessCpuMetric> {
+    Ok(ProcessCpuMetric::default())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn get_process_cpu_metric() -> Result<ProcessCpuMetric> {
     #[expect(unused_assignments)]
     let mut cpu_process_seconds_total = 0;
@@ -57,12 +67,12 @@ pub fn get_process_cpu_metric() -> Result<ProcessCpuMetric> {
     let kernel_seconds = filetime_to_seconds(kernel);
     let user_seconds = filetime_to_seconds(user);
     let cpu_process_seconds_total = kernel_seconds + user_seconds;
-    debug!("CPU time: {:.2} seconds", cpu_process_seconds_total);
+    debug_with_peers!("CPU time: {:.2} seconds", cpu_process_seconds_total);
 
     // Get memory info
     let mem_info = proc.GetProcessMemoryInfo()?;
     let memory_process_bytes = mem_info.WorkingSetSize.try_into()?;
-    debug!("memory usage: {} bytes", memory_process_bytes);
+    debug_with_peers!("memory usage: {} bytes", memory_process_bytes);
 
     Ok(ProcessCpuMetric {
         cpu_process_seconds_total,
@@ -70,15 +80,23 @@ pub fn get_process_cpu_metric() -> Result<ProcessCpuMetric> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CpuMetric {
     pub idle_seconds: u64,
     pub system_seconds: u64,
     pub user_seconds: u64,
 }
 
-// TODO maybe work for MacOS or wider Unix?
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+))]
+pub fn get_cpu_metric() -> Result<CpuMetric> {
+    Ok(CpuMetric::default())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn get_cpu_metric() -> Result<CpuMetric> {
     let cpu = cpu::cpu_times()?;
     let system_seconds = cpu.total().as_secs();

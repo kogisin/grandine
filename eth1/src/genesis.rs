@@ -5,7 +5,8 @@ use chrono::{Local, TimeZone as _};
 use eth1_api::{DepositEvent, Eth1Block};
 use futures::stream::{Stream, TryStreamExt as _};
 use genesis::Incremental;
-use log::info;
+use logging::info_with_peers;
+use pubkey_cache::PubkeyCache;
 use ssz::{SszRead as _, SszWrite as _};
 use thiserror::Error;
 use types::{
@@ -31,6 +32,7 @@ enum Error {
 
 pub async fn wait<P: Preset>(
     config: &Config,
+    pubkey_cache: &PubkeyCache,
     store_directory: PathBuf,
     mut blocks: impl Stream<Item = Result<Eth1Block>> + Unpin + Send,
     eth1_chain: &Eth1Chain,
@@ -50,15 +52,16 @@ pub async fn wait<P: Preset>(
         incremental.set_eth1_timestamp(block.timestamp);
 
         for DepositEvent { data, index } in block.deposit_events {
-            incremental.add_deposit_data(data, index)?;
+            incremental.add_deposit_data(pubkey_cache, data, index)?;
         }
 
         if let Err(error) = incremental.validate() {
-            info!("genesis not triggered: {error}");
+            info_with_peers!("genesis not triggered: {error}");
             continue;
         }
 
-        let (genesis_state, mut deposit_tree) = incremental.finish(block.hash, None)?;
+        let (genesis_state, mut deposit_tree) =
+            incremental.finish(pubkey_cache, block.hash, None)?;
 
         let genesis_time = genesis_state.genesis_time();
 
@@ -69,7 +72,7 @@ pub async fn wait<P: Preset>(
             .ok_or(Error::GenesisTimeOutOfRange { genesis_time })?;
 
         // Don't log the whole state. It's huge even with the minimal configuration.
-        info!("genesis triggered with genesis time {genesis_time} ({local_date_time})");
+        info_with_peers!("genesis triggered with genesis time {genesis_time} ({local_date_time})");
 
         persist_genesis_state(store_directory.as_path(), &genesis_state)?;
         deposit_tree.last_added_block_number = block.number;

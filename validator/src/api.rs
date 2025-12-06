@@ -37,7 +37,7 @@ use http_api_utils::{ApiError, ApiMetrics};
 use keymanager::{
     KeyManager, KeymanagerOperationStatus, ListedRemoteKey, RemoteKey, ValidatingPubkey,
 };
-use log::{debug, info};
+use logging::{debug_with_peers, info_with_peers};
 use prometheus_metrics::Metrics;
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use signer::{Signer, SigningMessage};
@@ -138,7 +138,7 @@ impl ApiError for Error {
 }
 
 impl Error {
-    const fn body(&self) -> ErrorResponse {
+    const fn body(&self) -> ErrorResponse<'_> {
         ErrorResponse { message: self }
     }
 
@@ -620,7 +620,7 @@ async fn keymanager_create_voluntary_exit<P: Preset, W: Wait>(
     EthPath(pubkey): EthPath<PublicKeyBytes>,
     EthQuery(query): EthQuery<CreateVoluntaryExitQuery>,
 ) -> Result<EthResponse<SignedVoluntaryExit>, Error> {
-    let state = controller.preprocessed_state_at_current_slot()?;
+    let state = controller.preprocessed_state_at_current_slot().await?;
 
     let epoch = query
         .epoch
@@ -632,7 +632,7 @@ async fn keymanager_create_voluntary_exit<P: Preset, W: Wait>(
         return Err(Error::ValidatorNotOwned { pubkey });
     }
 
-    let validator_index = accessors::index_of_public_key(&state, pubkey)
+    let validator_index = accessors::index_of_public_key(&state, &pubkey)
         .ok_or(Error::ValidatorNotFound { pubkey })?;
 
     let voluntary_exit = VoluntaryExit {
@@ -669,7 +669,6 @@ async fn authorize_token(
     Ok(response)
 }
 
-#[expect(clippy::module_name_repetitions)]
 pub async fn run_validator_api<P: Preset, W: Wait>(
     validator_api_config: ValidatorApiConfig,
     controller: ApiController<P, W>,
@@ -702,7 +701,7 @@ pub async fn run_validator_api<P: Preset, W: Wait>(
         }
     })?;
 
-    info!(
+    info_with_peers!(
         "Validator API is listening on {address}, authorization token: {:?}",
         *Zeroizing::new(hex::encode(&token.bytes)),
     );
@@ -807,8 +806,8 @@ enum TokenFilePath {
 impl Debug for TokenFilePath {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         match self {
-            Self::Default(path) => write!(f, "{path:?}"),
-            Self::User(path) => write!(f, "User specified token file: {path:?}"),
+            Self::Default(path) => write!(f, "{}", path.display()),
+            Self::User(path) => write!(f, "User specified token file: {}", path.display()),
         }
     }
 }
@@ -825,7 +824,9 @@ impl ApiToken {
                 match Self::load(token_file_path.as_path()) {
                     Ok(auth) => Ok(auth),
                     Err(error) => {
-                        debug!("unable to read Validator API token from default path: {error:?}");
+                        debug_with_peers!(
+                            "unable to read Validator API token from default path: {error:?}"
+                        );
 
                         let token = Self::new();
                         token.store(token_file_path.as_path())?;
@@ -853,7 +854,7 @@ impl ApiToken {
     fn load(token_file_path: &Path) -> Result<Self> {
         let token = fs_err::read_to_string(token_file_path)?;
 
-        ensure!(token.bytes().len() >= 32, TokenLoadError::TokenTooShort);
+        ensure!(token.len() >= 32, TokenLoadError::TokenTooShort);
 
         let bytes = Zeroizing::new(hex::decode(token)?);
 
@@ -910,12 +911,10 @@ mod tests {
 
     #[test]
     fn test_api_token_load_non_existing_file() {
-        assert_eq!(
-            ApiToken::load(Path::new("nonexisting-token.txt"))
-                .expect_err("opening non-existing file should fail")
-                .to_string(),
-            "failed to open file `nonexisting-token.txt`"
-        )
+        assert!(ApiToken::load(Path::new("nonexisting-token.txt"))
+            .expect_err("opening non-existing file should fail")
+            .to_string()
+            .contains("failed to open file `nonexisting-token.txt`"))
     }
 
     #[test]

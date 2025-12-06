@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use clock::Tick;
 use crossbeam_utils::sync::WaitGroup;
+use dashmap::DashMap;
 use database::Database;
 use execution_engine::{ExecutionEngine, NullExecutionEngine};
 use fork_choice_store::StoreConfig;
 use futures::sink::Drain;
-use http_api_utils::EventChannels;
 use prometheus_metrics::Metrics;
+use pubkey_cache::PubkeyCache;
 use std_ext::ArcExt as _;
 use tap::Pipe as _;
 use types::{
@@ -20,6 +21,7 @@ use types::{
 
 use crate::{
     controller::{Controller, MutatorHandle},
+    events::EventChannels,
     messages::{AttestationVerifierMessage, P2pMessage},
     storage::{Storage, DEFAULT_ARCHIVAL_EPOCH_INTERVAL},
     unbounded_sink::UnboundedSink,
@@ -88,11 +90,14 @@ where
     P: Preset,
     E: ExecutionEngine<P> + Clone + Send + Sync + 'static,
 {
+    #[expect(clippy::too_many_arguments)]
     fn new_internal(
         chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
         store_config: StoreConfig,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
+        database: Database,
         execution_engine: E,
         metrics: Option<Arc<Metrics>>,
         p2p_tx: impl UnboundedSink<P2pMessage<P>>,
@@ -101,7 +106,8 @@ where
 
         let storage = Arc::new(Storage::new(
             chain_config.clone_arc(),
-            Database::in_memory(),
+            pubkey_cache.clone_arc(),
+            database,
             DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
             StorageMode::Standard,
         ));
@@ -110,6 +116,7 @@ where
 
         Self::new(
             chain_config,
+            pubkey_cache,
             store_config,
             anchor_block,
             anchor_state,
@@ -126,6 +133,8 @@ where
             storage,
             core::iter::empty(),
             true,
+            [].into(),
+            Arc::new(DashMap::new()),
         )
         .expect("Controller::new should not fail in tests and benchmarks")
     }
@@ -134,16 +143,20 @@ where
 impl<P: Preset> AdHocBenchController<P> {
     pub fn with_p2p_tx(
         chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
         store_config: StoreConfig,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
+        database: Database,
         p2p_tx: impl UnboundedSink<P2pMessage<P>>,
     ) -> (Arc<Self>, MutatorHandle<P, WaitGroup>) {
         Self::new_internal(
             chain_config,
+            pubkey_cache,
             store_config,
             anchor_block,
             anchor_state,
+            database,
             NullExecutionEngine,
             None,
             p2p_tx,
@@ -155,14 +168,17 @@ impl<P: Preset> BenchController<P> {
     #[must_use]
     pub fn quiet(
         chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
     ) -> (Arc<Self>, MutatorHandle<P, WaitGroup>) {
         Self::new_internal(
             chain_config,
+            pubkey_cache,
             StoreConfig::default(),
             anchor_block,
             anchor_state,
+            Database::in_memory(),
             NullExecutionEngine,
             None,
             futures::sink::drain(),
@@ -172,7 +188,6 @@ impl<P: Preset> BenchController<P> {
 
 #[cfg(test)]
 impl<P: Preset> TestController<P> {
-    #[cfg(feature = "eth2-cache")]
     pub(crate) fn quiet(
         chain_config: Arc<ChainConfig>,
         anchor_block: Arc<SignedBeaconBlock<P>>,
@@ -180,6 +195,7 @@ impl<P: Preset> TestController<P> {
     ) -> (Arc<Self>, MutatorHandle<P, WaitGroup>) {
         Self::with_p2p_tx(
             chain_config,
+            Arc::new(PubkeyCache::default()),
             anchor_block,
             anchor_state,
             Arc::new(Mutex::new(MockExecutionEngine::new(true, false, None))),
@@ -189,6 +205,7 @@ impl<P: Preset> TestController<P> {
 
     pub(crate) fn with_p2p_tx(
         chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
         anchor_block: Arc<SignedBeaconBlock<P>>,
         anchor_state: Arc<BeaconState<P>>,
         execution_engine: TestExecutionEngine<P>,
@@ -198,9 +215,11 @@ impl<P: Preset> TestController<P> {
 
         Self::new_internal(
             chain_config,
+            pubkey_cache,
             store_config,
             anchor_block,
             anchor_state,
+            Database::in_memory(),
             execution_engine,
             None,
             p2p_tx,

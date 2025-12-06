@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Error as AnyhowError, Result};
 use arc_swap::{ArcSwap, Guard};
 use bls::{traits::SecretKey as _, PublicKeyBytes, SecretKey, Signature};
 use doppelganger_protection::DoppelgangerProtection;
@@ -14,13 +14,14 @@ use futures::{
 };
 use helper_functions::misc;
 use itertools::{izip, Itertools as _};
-use log::{info, warn};
+use logging::{info_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use reqwest::Client;
 use slashing_protection::{Attestation, BlockProposal, SlashingProtector};
 use std_ext::ArcExt as _;
 use thiserror::Error;
+use tracing::instrument;
 use types::{
     combined::BeaconState,
     phase0::primitives::{Slot, H256},
@@ -107,16 +108,15 @@ impl Signer {
         for (url, remote_keys) in keys {
             match remote_keys {
                 Some(keys) => {
-                    info!(
-                        "loaded {} validator key(s) from Web3Signer at {}",
+                    info_with_peers!(
+                        "loaded {} validator key(s) from Web3Signer at {url}",
                         keys.len(),
-                        url,
                     );
                 }
                 None => {
-                    warn!(
-                        "Web3Signer at {} did not return any validator keys. It will retry to fetch keys again in the next epoch.",
-                        url,
+                    warn_with_peers!(
+                        "Web3Signer at {url} did not return any validator keys. \
+                        It will retry to fetch keys again in the next epoch.",
                     );
                 }
             }
@@ -250,9 +250,9 @@ impl Snapshot {
         }
     }
 
-    pub async fn sign_without_slashing_protection<'block, P: Preset>(
+    pub async fn sign_without_slashing_protection<P: Preset>(
         &self,
-        message: SigningMessage<'block, P>,
+        message: SigningMessage<'_, P>,
         signing_root: H256,
         fork_info: Option<ForkInfo<P>>,
         public_key: PublicKeyBytes,
@@ -270,6 +270,7 @@ impl Snapshot {
     }
 
     #[expect(clippy::too_many_lines)]
+    #[instrument(level = "debug", skip_all)]
     pub async fn sign_triples<P: Preset>(
         &self,
         triples: impl IntoIterator<Item = SigningTriple<'_, P>> + Send,
@@ -302,7 +303,7 @@ impl Snapshot {
 
             if let Some(doppelganger_protection) = &doppelganger_protection {
                 if !doppelganger_protection.is_validator_active(public_key) {
-                    warn!(
+                    warn_with_peers!(
                         "Doppelganger protection prevented validator {public_key:?} from signing a message \
                          since not enough time has passed to ensure there are no duplicate validators participating on network",
                     );
@@ -361,44 +362,52 @@ impl Snapshot {
 
         let mut protector = slashing_protector.lock().await;
 
-        let slashing_outcome =
-            protector.validate_and_store_own_attestations(beacon_state, attestations)?;
+        tokio::task::block_in_place(|| {
+            let slashing_outcome =
+                protector.validate_and_store_own_attestations(beacon_state, attestations)?;
 
-        for (outcome, data, index) in izip!(
-            slashing_outcome.iter(),
-            attestation_triples,
-            attestation_indices
-        ) {
-            let (message, signing_root, public_key) = data;
+            for (outcome, data, index) in izip!(
+                slashing_outcome.iter(),
+                attestation_triples,
+                attestation_indices
+            ) {
+                let (message, signing_root, public_key) = data;
 
-            if outcome.is_some() {
-                signable_messages.push(SigningTriple {
-                    message,
-                    signing_root,
-                    public_key,
-                });
-                message_indices.push(index);
+                if outcome.is_some() {
+                    signable_messages.push(SigningTriple {
+                        message,
+                        signing_root,
+                        public_key,
+                    });
+
+                    message_indices.push(index);
+                }
             }
-        }
 
-        for ((proposal, pubkey, current_epoch), (message, signing_root, public_key), index) in izip!(
-            block_proposals.into_iter(),
-            block_messages,
-            block_proposal_indices
-        ) {
-            let control_flow =
-                protector.validate_and_store_own_block_proposal(proposal, pubkey, current_epoch)?;
+            for ((proposal, pubkey, current_epoch), (message, signing_root, public_key), index) in izip!(
+                block_proposals.into_iter(),
+                block_messages,
+                block_proposal_indices
+            ) {
+                let control_flow = protector.validate_and_store_own_block_proposal(
+                    proposal,
+                    pubkey,
+                    current_epoch,
+                )?;
 
-            if control_flow.is_continue() {
-                signable_messages.push(SigningTriple {
-                    message,
-                    signing_root,
-                    public_key,
-                });
+                if control_flow.is_continue() {
+                    signable_messages.push(SigningTriple {
+                        message,
+                        signing_root,
+                        public_key,
+                    });
 
-                message_indices.push(index);
+                    message_indices.push(index);
+                }
             }
-        }
+
+            Ok::<_, AnyhowError>(())
+        })?;
 
         let signed_messages = self
             .sign_triples_without_slashing_protection(signable_messages, Some(fork_info))

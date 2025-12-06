@@ -2,16 +2,19 @@ use core::fmt::Debug;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bls::{traits::CachedPublicKey as _, CachedPublicKey, PublicKeyBytes, SignatureBytes};
+use bls::{PublicKeyBytes, SignatureBytes};
+use eth1_api::ApiController;
+use fork_choice_control::Wait;
 use futures::lock::Mutex;
 use helper_functions::{
     accessors, misc, predicates,
     signing::{SignForSingleFork, SignForSingleForkAtSlot as _},
 };
 use itertools::Itertools as _;
-use log::warn;
+use logging::warn_with_peers;
 use signer::{Signer, SigningMessage, SigningTriple};
 use slashing_protection::SlashingProtector;
+use tap::Pipe as _;
 use types::{
     altair::{
         containers::{SyncAggregatorSelectionData, SyncCommitteeMessage},
@@ -50,7 +53,7 @@ impl<P: Preset> SlotHead<P> {
     }
 
     #[must_use]
-    pub fn public_key(&self, validator_index: ValidatorIndex) -> &CachedPublicKey {
+    pub fn public_key(&self, validator_index: ValidatorIndex) -> &PublicKeyBytes {
         &self
             .beacon_state
             .validators()
@@ -63,16 +66,27 @@ impl<P: Preset> SlotHead<P> {
     }
 
     pub fn proposer_index(&self) -> Result<ValidatorIndex> {
-        accessors::get_beacon_proposer_index(&self.beacon_state)
+        accessors::get_beacon_proposer_index(&self.config, &self.beacon_state)
     }
 
-    pub fn beacon_committee(&self, committee_index: CommitteeIndex) -> Result<IndexSlice> {
+    pub fn beacon_committee(&self, committee_index: CommitteeIndex) -> Result<IndexSlice<'_>> {
         accessors::beacon_committee(&self.beacon_state, self.slot(), committee_index)
     }
 
     #[must_use]
     pub fn has_sync_committee(&self) -> bool {
         self.beacon_state.phase() >= Phase::Altair
+    }
+
+    pub fn is_optimistic<W: Wait>(&self, controller: &ApiController<P, W>) -> Result<bool> {
+        if !self.optimistic {
+            return Ok(false);
+        }
+
+        controller
+            .block_by_root(self.beacon_block_root)?
+            .is_none_or(|block| block.status.is_optimistic())
+            .pipe(Ok)
     }
 
     pub fn subnet_id(&self, slot: Slot, committee_index: CommitteeIndex) -> Result<SubnetId> {
@@ -170,11 +184,9 @@ impl<P: Preset> SlotHead<P> {
         signer: &Signer,
         block: &(impl SignForSingleFork<P> + Debug + Send + Sync),
         message: SigningMessage<'_, P>,
-        cached_public_key: &CachedPublicKey,
+        public_key: PublicKeyBytes,
         slashing_protector: Arc<Mutex<SlashingProtector>>,
     ) -> Option<SignatureBytes> {
-        let public_key = cached_public_key.to_bytes();
-
         match signer
             .load()
             .sign_triples(
@@ -193,7 +205,7 @@ impl<P: Preset> SlotHead<P> {
                     Ok(signature_option) => match signature_option {
                         Some(signature) => Some(signature.into()),
                         None => {
-                            warn!(
+                            warn_with_peers!(
                                 "failed to sign beacon block due to slashing protection \
                                 (block: {block:?}, public_key: {public_key:?})",
                             );
@@ -201,13 +213,13 @@ impl<P: Preset> SlotHead<P> {
                         }
                     },
                     Err(_) => {
-                        warn!("Slashing protection returned iterator with different number of elements",);
+                        warn_with_peers!("Slashing protection returned iterator with different number of elements",);
                         None
                     }
                 }
             }
             Err(error) => {
-                warn!(
+                warn_with_peers!(
                     "error while signing beacon block \
                      (error: {error:?}, block: {block:?}, public_key: {public_key:?})",
                 );

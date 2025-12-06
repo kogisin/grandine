@@ -8,6 +8,7 @@ use arithmetic::{U64Ext as _, UsizeExt as _};
 use bls::PublicKeyBytes;
 use hashing::ZERO_HASHES;
 use itertools::{izip, Itertools as _};
+use sha2::{Digest as _, Sha256};
 use ssz::{BitVector, ContiguousVector, MerkleTree, SszHash};
 use tap::{Pipe as _, TryConv as _};
 use typenum::Unsigned as _;
@@ -23,6 +24,10 @@ use types::{
             Blob, BlobCommitmentInclusionProof, BlobIndex, KzgCommitment, KzgProof, VersionedHash,
         },
     },
+    fulu::{
+        containers::{DataColumnSidecar, MatrixEntry},
+        primitives::{BlobCommitmentsInclusionProof, ColumnIndex},
+    },
     phase0::{
         consts::{
             AttestationSubnetCount, BLS_WITHDRAWAL_PREFIX, ETH1_ADDRESS_WITHDRAWAL_PREFIX,
@@ -36,8 +41,9 @@ use types::{
     },
     preset::{Preset, SyncSubcommitteeSize},
     traits::{
-        BeaconState, PostAltairBeaconState, PostDenebBeaconBlockBody, PostElectraBeaconBlockBody,
-        SignedBeaconBlock as _,
+        BeaconState, BlockBodyWithBlobKzgCommitments, BlockBodyWithBlsToExecutionChanges,
+        BlockBodyWithExecutionPayload, BlockBodyWithExecutionRequests, BlockBodyWithSyncAggregate,
+        PostAltairBeaconState, SignedBeaconBlock as _,
     },
 };
 
@@ -86,7 +92,8 @@ pub fn slots_since_epoch_start<P: Preset>(slot: Slot) -> u64 {
 
 #[must_use]
 pub const fn slots_in_epoch<P: Preset>(epoch: Epoch) -> Range<Slot> {
-    compute_start_slot_at_epoch::<P>(epoch)..compute_start_slot_at_epoch::<P>(epoch + 1)
+    let next_epoch = epoch.saturating_add(1);
+    compute_start_slot_at_epoch::<P>(epoch)..compute_start_slot_at_epoch::<P>(next_epoch)
 }
 
 /// <https://github.com/ethereum/consensus-specs/blob/5a4e568d2dc4cae6c470e0acbe4e48b01351500f/specs/altair/validator.md#sync-committee>
@@ -102,7 +109,7 @@ pub const fn start_of_sync_committee_period<P: Preset>(period: SyncCommitteePeri
 
 #[must_use]
 pub const fn compute_activation_exit_epoch<P: Preset>(epoch: Epoch) -> Epoch {
-    epoch + 1 + P::MAX_SEED_LOOKAHEAD
+    epoch.saturating_add(1 + P::MAX_SEED_LOOKAHEAD)
 }
 
 // > Return the 32-byte fork data root for the ``current_version`` and ``genesis_validators_root``.
@@ -118,10 +125,51 @@ fn compute_fork_data_root(current_version: Version, genesis_validators_root: H25
 // > Return the 4-byte fork digest for the ``current_version`` and ``genesis_validators_root``.
 // > This is a digest primarily used for domain separation on the p2p layer.
 // > 4-bytes suffices for practical separation of forks/chains.
-#[must_use]
-pub fn compute_fork_digest(current_version: Version, genesis_validators_root: H256) -> ForkDigest {
+fn compute_fork_digest_pre_fulu(
+    current_version: Version,
+    genesis_validators_root: H256,
+) -> ForkDigest {
     let root = compute_fork_data_root(current_version, genesis_validators_root);
     ForkDigest::from_slice(&root[..ForkDigest::len_bytes()])
+}
+
+// > Return the 4-byte fork digest for the ``version`` and ``genesis_validators_root``
+// > XOR'd with the hash of the blob parameters for ``epoch``.
+//
+// > This is a digest primarily used for domain separation on the p2p layer.
+// > 4-bytes suffices for practical separation of forks/chains.
+fn compute_fork_digest_post_fulu(
+    config: &Config,
+    genesis_validators_root: H256,
+    epoch: Epoch,
+) -> ForkDigest {
+    let fork_version = config.version_at_epoch(epoch);
+    let blob_entry = config.get_blob_schedule_entry(epoch);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&blob_entry.epoch.to_le_bytes());
+    bytes[8..].copy_from_slice(
+        &u64::try_from(blob_entry.max_blobs_per_block)
+            .expect("number of max blobs should fit in u64")
+            .to_le_bytes(),
+    );
+    let hash = H256::from_slice(&Sha256::digest(bytes));
+    let root = compute_fork_data_root(fork_version, genesis_validators_root);
+    let bitmask_digest = root ^ hash;
+    ForkDigest::from_slice(&bitmask_digest[..ForkDigest::len_bytes()])
+}
+
+#[must_use]
+pub fn compute_fork_digest(
+    config: &Config,
+    genesis_validators_root: H256,
+    epoch: Epoch,
+) -> ForkDigest {
+    if config.phase_at_epoch(epoch).is_peerdas_activated() {
+        compute_fork_digest_post_fulu(config, genesis_validators_root, epoch)
+    } else {
+        let fork_version = config.version_at_epoch(epoch);
+        compute_fork_digest_pre_fulu(fork_version, genesis_validators_root)
+    }
 }
 
 #[must_use]
@@ -250,11 +298,13 @@ fn compute_proposer_index_post_electra<P: Preset>(
 }
 
 pub(crate) fn compute_proposer_index<P: Preset>(
+    config: &Config,
     state: &impl BeaconState<P>,
     indices: &PackedIndices,
     seed: H256,
+    epoch: Epoch,
 ) -> Result<ValidatorIndex> {
-    if state.is_post_electra() {
+    if state.is_post_electra() || epoch >= config.electra_fork_epoch {
         compute_proposer_index_post_electra(state, indices, seed)
     } else {
         compute_proposer_index_pre_electra(state, indices, seed)
@@ -286,6 +336,15 @@ pub fn compute_subnet_for_blob_sidecar<P: Preset>(
     let phase = config.phase_at_slot::<P>(blob_sidecar.signed_block_header.message.slot);
 
     blob_sidecar.index % config.blob_sidecar_subnet_count(phase)
+}
+
+// source: https://github.com/ethereum/consensus-specs/pull/3574/files/cebf78a83e6fc8fa237daf4264b9ca0fe61473f4#diff-96cf4db15bede3d60f04584fb25339507c35755959159cdbe19d760ca92de109R106
+#[must_use]
+pub const fn compute_subnet_for_data_column_sidecar(
+    config: &Config,
+    column_index: ColumnIndex,
+) -> SubnetId {
+    column_index % config.data_column_sidecar_subnet_count
 }
 
 /// <https://github.com/ethereum/consensus-specs/blob/v1.1.0/specs/altair/validator.md#broadcast-sync-committee-message>
@@ -393,7 +452,7 @@ pub fn compute_timestamp_at_slot<P: Preset>(
     slot: Slot,
 ) -> UnixSeconds {
     let slots_since_genesis = slot - GENESIS_SLOT;
-    state.genesis_time() + slots_since_genesis * config.seconds_per_slot.get()
+    state.genesis_time() + slots_since_genesis * config.slot_duration_ms.as_secs()
 }
 
 #[must_use]
@@ -449,10 +508,17 @@ pub fn kzg_commitment_to_versioned_hash(kzg_commitment: KzgCommitment) -> Versio
     versioned_hash
 }
 
-pub fn deneb_kzg_commitment_inclusion_proof<P: Preset>(
-    body: &(impl PostDenebBeaconBlockBody<P> + ?Sized),
+pub fn deneb_kzg_commitment_inclusion_proof<P: Preset, B>(
+    body: &B,
     commitment_index: BlobIndex,
-) -> Result<BlobCommitmentInclusionProof<P>> {
+) -> Result<BlobCommitmentInclusionProof<P>>
+where
+    B: BlockBodyWithBlobKzgCommitments<P>
+        + BlockBodyWithBlsToExecutionChanges<P>
+        + BlockBodyWithSyncAggregate<P>
+        + BlockBodyWithExecutionPayload<P>
+        + ?Sized,
+{
     let depth = P::KzgCommitmentInclusionProofDepth::USIZE;
 
     let mut proof = ContiguousVector::default();
@@ -505,10 +571,18 @@ pub fn deneb_kzg_commitment_inclusion_proof<P: Preset>(
     Ok(proof)
 }
 
-pub fn electra_kzg_commitment_inclusion_proof<P: Preset>(
-    body: &(impl PostElectraBeaconBlockBody<P> + ?Sized),
+pub fn electra_kzg_commitment_inclusion_proof<P: Preset, B>(
+    body: &B,
     commitment_index: BlobIndex,
-) -> Result<BlobCommitmentInclusionProof<P>> {
+) -> Result<BlobCommitmentInclusionProof<P>>
+where
+    B: BlockBodyWithBlobKzgCommitments<P>
+        + BlockBodyWithBlsToExecutionChanges<P>
+        + BlockBodyWithSyncAggregate<P>
+        + BlockBodyWithExecutionPayload<P>
+        + BlockBodyWithExecutionRequests<P>
+        + ?Sized,
+{
     let depth = P::KzgCommitmentInclusionProofDepth::USIZE;
 
     let mut proof = ContiguousVector::default();
@@ -564,6 +638,49 @@ pub fn electra_kzg_commitment_inclusion_proof<P: Preset>(
     Ok(proof)
 }
 
+pub fn kzg_commitments_inclusion_proof<P: Preset, B>(body: &B) -> BlobCommitmentsInclusionProof<P>
+where
+    B: BlockBodyWithSyncAggregate<P>
+        + BlockBodyWithBlsToExecutionChanges<P>
+        + BlockBodyWithExecutionPayload<P>
+        + BlockBodyWithExecutionRequests<P>
+        + ?Sized,
+{
+    let depth = P::KzgCommitmentsInclusionProofDepth::USIZE;
+    let mut proof = BlobCommitmentsInclusionProof::<P>::default();
+
+    proof[depth - 4] = body.bls_to_execution_changes().hash_tree_root();
+
+    proof[depth - 3] = hashing::hash_256_256(
+        body.sync_aggregate().hash_tree_root(),
+        body.execution_payload().hash_tree_root(),
+    );
+
+    proof[depth - 2] = hashing::hash_256_256(
+        hashing::hash_256_256(body.execution_requests().hash_tree_root(), ZERO_HASHES[0]),
+        ZERO_HASHES[1],
+    );
+
+    proof[depth - 1] = hashing::hash_256_256(
+        hashing::hash_256_256(
+            hashing::hash_256_256(
+                body.randao_reveal().hash_tree_root(),
+                body.eth1_data().hash_tree_root(),
+            ),
+            hashing::hash_256_256(body.graffiti(), body.proposer_slashings().hash_tree_root()),
+        ),
+        hashing::hash_256_256(
+            hashing::hash_256_256(body.attester_slashings_root(), body.attestations_root()),
+            hashing::hash_256_256(
+                body.deposits().hash_tree_root(),
+                body.voluntary_exits().hash_tree_root(),
+            ),
+        ),
+    );
+
+    proof
+}
+
 #[must_use]
 pub fn blob_serve_range_slot<P: Preset>(config: &Config, current_slot: Slot) -> Slot {
     let current_epoch = compute_epoch_at_slot::<P>(current_slot);
@@ -584,19 +701,28 @@ pub fn construct_blob_sidecar<P: Preset>(
     kzg_commitment: KzgCommitment,
     kzg_proof: KzgProof,
 ) -> Result<BlobSidecar<P>> {
-    let message = block.message();
-
-    let Some(body) = message.body().post_deneb() else {
-        return Err(Error::BlobsForPreDenebBlock {
-            root: message.hash_tree_root(),
-            slot: message.slot(),
+    let kzg_commitment_inclusion_proof = match block {
+        SignedBeaconBlock::Deneb(block) => {
+            deneb_kzg_commitment_inclusion_proof(&block.message.body, index)?
         }
-        .into());
-    };
+        SignedBeaconBlock::Electra(block) => {
+            electra_kzg_commitment_inclusion_proof(&block.message.body, index)?
+        }
+        SignedBeaconBlock::Fulu(block) => {
+            electra_kzg_commitment_inclusion_proof(&block.message.body, index)?
+        }
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_) => {
+            let message = block.message();
 
-    let kzg_commitment_inclusion_proof = match message.body().post_electra() {
-        Some(body) => electra_kzg_commitment_inclusion_proof(body, index)?,
-        None => deneb_kzg_commitment_inclusion_proof(body, index)?,
+            return Err(Error::BlobsForPreDenebBlock {
+                root: message.hash_tree_root(),
+                slot: message.slot(),
+            }
+            .into());
+        }
     };
 
     Ok(BlobSidecar {
@@ -614,7 +740,7 @@ pub fn construct_blob_sidecars<P: Preset>(
     blobs: impl IntoIterator<Item = Blob<P>>,
     proofs: impl IntoIterator<Item = KzgProof>,
 ) -> Result<Vec<BlobSidecar<P>>> {
-    let Some(body) = block.message().body().post_deneb() else {
+    let Some(body) = block.message().body().with_blob_kzg_commitments() else {
         return Ok(vec![]);
     };
 
@@ -663,6 +789,65 @@ pub fn get_max_effective_balance<P: Preset>(validator: &Validator) -> Gwei {
     } else {
         P::MIN_ACTIVATION_BALANCE
     }
+}
+
+pub fn parse_graffiti(string: &str) -> Result<H256> {
+    ensure!(string.len() <= H256::len_bytes(), Error::GraffitiTooLong);
+
+    let mut graffiti = H256::zero();
+    graffiti[..string.len()].copy_from_slice(string.as_bytes());
+
+    Ok(graffiti)
+}
+
+#[must_use]
+pub fn data_column_serve_range_slot<P: Preset>(config: &Config, current_slot: Slot) -> Slot {
+    let current_epoch = compute_epoch_at_slot::<P>(current_slot);
+    let epoch = config.fulu_fork_epoch.max(
+        current_epoch
+            .checked_sub(config.min_epochs_for_data_column_sidecars_requests)
+            .unwrap_or(GENESIS_EPOCH),
+    );
+
+    compute_start_slot_at_epoch::<P>(epoch)
+}
+
+pub fn compute_matrix_for_data_column_sidecar<P: Preset>(
+    data_column_sidecar: &DataColumnSidecar<P>,
+) -> Vec<MatrixEntry<P>> {
+    let DataColumnSidecar {
+        index,
+        column,
+        kzg_proofs,
+        ..
+    } = data_column_sidecar;
+
+    let blob_count = column.len() as u64;
+
+    izip!(0..blob_count, column, kzg_proofs)
+        .map(|(row_index, cell, kzg_proof)| MatrixEntry {
+            row_index,
+            column_index: *index,
+            cell: cell.clone(),
+            kzg_proof: *kzg_proof,
+        })
+        .collect()
+}
+
+pub fn compute_proposer_indices<P: Preset>(
+    config: &Config,
+    state: &impl BeaconState<P>,
+    epoch: Epoch,
+    seed: H256,
+    indices: &PackedIndices,
+) -> Result<Vec<ValidatorIndex>> {
+    let start_slot = compute_start_slot_at_epoch::<P>(epoch);
+    (0..P::SlotsPerEpoch::U64)
+        .map(|i| {
+            let seed = hashing::hash_256_64(seed, start_slot.saturating_add(i));
+            compute_proposer_index(config, state, indices, seed, epoch)
+        })
+        .collect::<Result<_>>()
 }
 
 #[cfg(test)]
@@ -738,9 +923,11 @@ mod tests {
         };
 
         let proposer_index = compute_proposer_index(
+            &Config::minimal(),
             &state,
             accessors::active_validator_indices_ordered(&state, RelativeEpoch::Current),
             H256::random(),
+            compute_epoch_at_slot::<Minimal>(state.slot()),
         )?;
 
         assert!(proposer_index < 2);

@@ -5,12 +5,16 @@ use core::{
 use std::sync::Arc;
 
 use ethereum_types::H64;
+use libp2p_identity::PeerId;
 use serde::{
     de::Visitor,
     ser::{Error as _, SerializeSeq as _},
     Deserialize, Deserializer, Serialize,
 };
-use ssz::{ByteList, ByteVector, ContiguousList, SszReadDefault, SszWrite as _};
+use ssz::{
+    ByteList, ByteVector, ContiguousList, ContiguousVector, SszHash as _, SszReadDefault,
+    SszWrite as _,
+};
 use typenum::Unsigned;
 use types::{
     bellatrix::{
@@ -21,20 +25,25 @@ use types::{
         containers::{ExecutionPayload as CapellaExecutionPayload, Withdrawal},
         primitives::WithdrawalIndex,
     },
-    combined::ExecutionPayload,
+    combined::{ExecutionPayload, SignedBeaconBlock},
     deneb::{
-        containers::ExecutionPayload as DenebExecutionPayload,
+        containers::{BlobIdentifier, ExecutionPayload as DenebExecutionPayload},
         primitives::{Blob, KzgCommitment, KzgProof},
     },
     electra::containers::{
         ConsolidationRequest, DepositRequest, ExecutionRequests, WithdrawalRequest,
     },
-    nonstandard::{Phase, WithBlobsAndMev},
-    phase0::primitives::{
-        ExecutionAddress, ExecutionBlockHash, ExecutionBlockNumber, Gwei, UnixSeconds,
-        ValidatorIndex, H256,
+    fulu::containers::{DataColumnIdentifier, DataColumnSidecar},
+    nonstandard::{KzgProofs, Phase, WithBlobsAndMev},
+    phase0::{
+        containers::SignedBeaconBlockHeader,
+        primitives::{
+            ExecutionAddress, ExecutionBlockHash, ExecutionBlockNumber, Gwei, Slot, UnixSeconds,
+            ValidatorIndex, H256,
+        },
     },
     preset::Preset,
+    traits::{BlockBodyWithBlobKzgCommitments, SignedBeaconBlock as _},
 };
 
 const SUPPORTED_REQUEST_TYPES: &[&str; 3] = &[
@@ -402,12 +411,21 @@ impl<P: Preset> From<ExecutionPayloadV3<P>> for DenebExecutionPayload<P> {
     }
 }
 
-/// [`BlobsBundleV1`](https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/experimental/blob-extension.md#blobsbundlev1)
+/// [`BlobsBundleV1`](https://github.com/ethereum/execution-apis/blob/5d634063ccfd897a6974ea589c00e2c1d889abc9/src/engine/cancun.md#blobsbundlev1)
 #[derive(Deserialize, Serialize)]
 #[serde(bound = "", rename_all = "camelCase")]
 pub struct BlobsBundleV1<P: Preset> {
     pub commitments: ContiguousList<KzgCommitment, P::MaxBlobCommitmentsPerBlock>,
     pub proofs: ContiguousList<KzgProof, P::MaxBlobCommitmentsPerBlock>,
+    pub blobs: ContiguousList<Blob<P>, P::MaxBlobCommitmentsPerBlock>,
+}
+
+/// [`BlobsBundleV2`](https://github.com/ethereum/execution-apis/blob/5d634063ccfd897a6974ea589c00e2c1d889abc9/src/engine/osaka.md#blobsbundlev2)
+#[derive(Deserialize, Serialize)]
+#[serde(bound = "", rename_all = "camelCase")]
+pub struct BlobsBundleV2<P: Preset> {
+    pub commitments: ContiguousList<KzgCommitment, P::MaxBlobCommitmentsPerBlock>,
+    pub proofs: ContiguousList<KzgProof, P::MaxCellProofsPerBlock>,
     pub blobs: ContiguousList<Blob<P>, P::MaxBlobCommitmentsPerBlock>,
 }
 
@@ -525,7 +543,7 @@ impl<P: Preset> From<EngineGetPayloadV3Response<P>> for WithBlobsAndMev<Executio
         Self::new(
             execution_payload,
             Some(commitments),
-            Some(proofs),
+            Some(KzgProofs::Deneb(proofs)),
             Some(blobs),
             Some(block_value),
             None,
@@ -565,7 +583,47 @@ impl<P: Preset> From<EngineGetPayloadV4Response<P>> for WithBlobsAndMev<Executio
         Self::new(
             execution_payload,
             Some(commitments),
-            Some(proofs),
+            Some(KzgProofs::Deneb(proofs)),
+            Some(blobs),
+            Some(block_value),
+            Some(execution_requests.into()),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(bound = "", rename_all = "camelCase")]
+pub struct EngineGetPayloadV5Response<P: Preset> {
+    pub execution_payload: ExecutionPayloadV3<P>,
+    #[serde(with = "serde_utils::prefixed_hex_quantity")]
+    pub block_value: Wei,
+    pub blobs_bundle: BlobsBundleV2<P>,
+    pub should_override_builder: bool,
+    pub execution_requests: RawExecutionRequests<P>,
+}
+
+impl<P: Preset> From<EngineGetPayloadV5Response<P>> for WithBlobsAndMev<ExecutionPayload<P>, P> {
+    fn from(response: EngineGetPayloadV5Response<P>) -> Self {
+        let EngineGetPayloadV5Response {
+            execution_payload,
+            block_value,
+            blobs_bundle,
+            execution_requests,
+            ..
+        } = response;
+
+        let execution_payload = ExecutionPayload::Deneb(execution_payload.into());
+
+        let BlobsBundleV2 {
+            commitments,
+            proofs,
+            blobs,
+        } = blobs_bundle;
+
+        Self::new(
+            execution_payload,
+            Some(commitments),
+            Some(KzgProofs::Fulu(proofs)),
             Some(blobs),
             Some(block_value),
             Some(execution_requests.into()),
@@ -580,6 +638,7 @@ pub enum PayloadAttributes<P: Preset> {
     Capella(PayloadAttributesV2<P>),
     Deneb(PayloadAttributesV3<P>),
     Electra(PayloadAttributesV3<P>),
+    Fulu(PayloadAttributesV3<P>),
 }
 
 impl<P: Preset> PayloadAttributes<P> {
@@ -590,6 +649,7 @@ impl<P: Preset> PayloadAttributes<P> {
             Self::Capella(_) => Phase::Capella,
             Self::Deneb(_) => Phase::Deneb,
             Self::Electra(_) => Phase::Electra,
+            Self::Fulu(_) => Phase::Fulu,
         }
     }
 }
@@ -694,6 +754,7 @@ pub enum PayloadId {
     Capella(H64),
     Deneb(H64),
     Electra(H64),
+    Fulu(H64),
 }
 
 #[derive(Deserialize)]
@@ -930,6 +991,97 @@ pub struct BlobAndProofV1<P: Preset> {
     pub proof: KzgProof,
 }
 
+#[derive(Deserialize)]
+#[serde(bound = "", rename_all = "camelCase")]
+pub struct BlobAndProofV2<P: Preset> {
+    pub blob: Blob<P>,
+    pub proofs: ContiguousVector<KzgProof, P::CellsPerExtBlob>,
+}
+
+pub enum EngineGetBlobsParams<P: Preset> {
+    V1(EngineGetBlobsV1Params<P>),
+    V2(EngineGetBlobsV2Params<P>),
+}
+
+pub struct EngineGetBlobsV1Params<P: Preset> {
+    pub block: Arc<SignedBeaconBlock<P>>,
+    pub blob_identifiers: Vec<BlobIdentifier>,
+    pub peer_id: Option<PeerId>,
+}
+
+impl<P: Preset> From<EngineGetBlobsV1Params<P>> for EngineGetBlobsParams<P> {
+    fn from(value: EngineGetBlobsV1Params<P>) -> Self {
+        Self::V1(value)
+    }
+}
+
+pub struct EngineGetBlobsV2Params<P: Preset> {
+    pub block_or_sidecar: BlockOrDataColumnSidecar<P>,
+    pub data_column_identifiers: Vec<DataColumnIdentifier>,
+}
+
+impl<P: Preset> From<EngineGetBlobsV2Params<P>> for EngineGetBlobsParams<P> {
+    fn from(value: EngineGetBlobsV2Params<P>) -> Self {
+        Self::V2(value)
+    }
+}
+
+pub enum BlockOrDataColumnSidecar<P: Preset> {
+    Block(Arc<SignedBeaconBlock<P>>),
+    Sidecar(Arc<DataColumnSidecar<P>>),
+}
+
+impl<P: Preset> BlockOrDataColumnSidecar<P> {
+    #[must_use]
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Block(block) => block.message().slot(),
+            Self::Sidecar(sidecar) => sidecar.signed_block_header.message.slot,
+        }
+    }
+
+    #[must_use]
+    pub fn block_root(&self) -> H256 {
+        match self {
+            Self::Block(block) => block.message().hash_tree_root(),
+            Self::Sidecar(sidecar) => sidecar.signed_block_header.message.hash_tree_root(),
+        }
+    }
+
+    #[must_use]
+    pub fn signed_block_header(&self) -> SignedBeaconBlockHeader {
+        match self {
+            Self::Block(block) => block.to_header(),
+            Self::Sidecar(sidecar) => sidecar.signed_block_header,
+        }
+    }
+
+    pub fn kzg_commitments(
+        &self,
+    ) -> Option<&ContiguousList<KzgCommitment, P::MaxBlobCommitmentsPerBlock>> {
+        match self {
+            Self::Block(block) => block
+                .message()
+                .body()
+                .with_blob_kzg_commitments()
+                .map(BlockBodyWithBlobKzgCommitments::blob_kzg_commitments),
+            Self::Sidecar(sidecar) => Some(&sidecar.kzg_commitments),
+        }
+    }
+}
+
+impl<P: Preset> From<Arc<SignedBeaconBlock<P>>> for BlockOrDataColumnSidecar<P> {
+    fn from(block: Arc<SignedBeaconBlock<P>>) -> Self {
+        Self::Block(block)
+    }
+}
+
+impl<P: Preset> From<Arc<DataColumnSidecar<P>>> for BlockOrDataColumnSidecar<P> {
+    fn from(sidecar: Arc<DataColumnSidecar<P>>) -> Self {
+        Self::Sidecar(sidecar)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -1063,15 +1215,15 @@ mod tests {
         let raw_execution_requests = RawExecutionRequests::from(execution_requests);
         let serialized = serde_json::to_value(raw_execution_requests.clone())?;
 
-        let expected_serialzed = json!([
+        let expected_serialized = json!([
             "0x0092f9fe7570a6650d030bb2227d699c744303d08a887cd2e1592e30906cd8cedf9646c1a1afd902235bb36620180eb68802000000000000000000000065d08a056c17ae13370565b04cf77d2afa1cb9fa0010a5d4e8000000a13741d65b47825c147201cfce3360438d4011fe81b455e86226c95a2669bfde14712ba36d1c2f44371a98bf28ff38370ce7d28c65872bf65ff88d6014468676029e298903c89c51c27ab5f07e178b8b14d3ca191e2ce3b24703629e3994e05b000000000000000090a58546229c585cef35f3afab904411530303d95c371e246a2e9a1ef6beb5db7a98c2fd79a388709a30ec782576a5d602000000000000000000000065d08a056c17ae13370565b04cf77d2afa1cb9fa0010a5d4e8000000b23e205d2fcfc3e9d3ae58c0f78b55b19f97f59eaf43d85113a1960ee2c38f6b4ef705302e46e0593fc41ba5632b047a14d76dc82bb2619d7c73e0d89da2eda2ea11fff9036c2d08f9d457c07f23b1411ecd13ff0e9c00eeb85d851bae2494e00100000000000000",
             "0x010202020202020202020202020202020202020202aaf9fe7570a6650d030bb2227d699c744303d08a887cd2e1592e30906cd8cedf9646c1a1afd902235bb36620180eb68800409452a3030000",
             "0x020303030303030303030303030303030303030303aaf9fe7570a6650d030bb2227d699c744303d08a887cd2e1592e30906cd8cedf9646c1a1afd902235bb36620180eb688abc9fe7570a6650d030bb2227d699c744303d08a887cd2e1592e30906cd8cedf9646c1a1afd902235bb36620180eb688",
         ]);
 
-        assert_eq!(serialized, expected_serialzed);
+        assert_eq!(serialized, expected_serialized);
         assert_eq!(
-            serde_json::from_value::<RawExecutionRequests::<Mainnet>>(expected_serialzed)?,
+            serde_json::from_value::<RawExecutionRequests::<Mainnet>>(expected_serialized)?,
             raw_execution_requests,
         );
 
@@ -1364,7 +1516,7 @@ mod tests {
         WithBlobsAndMev::new(
             payload,
             Some(kzg_commitments),
-            Some(kzg_proofs),
+            Some(KzgProofs::Deneb(kzg_proofs)),
             Some(ContiguousList::default()),
             Some(Wei::MAX),
             None,
